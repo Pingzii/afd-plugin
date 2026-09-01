@@ -50,6 +50,14 @@ from afd_plugin.connectors.metadata import (
     recv_control_payload,
     send_control_payload,
 )
+from afd_plugin.connectors.npu.camp2p_a5 import (
+    attention_peers_for_ffn,
+    attention_token_counts,
+    dst_ffn_for_attention,
+    is_a5,
+    p2p_recv,
+    p2p_send,
+)
 from afd_plugin.distributed import (
     create_hccl_process_group_options,
     init_afd_process_group,
@@ -305,6 +313,21 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         """Return ``True`` after all CAMP2p connections have been created."""
         return self._initialized
 
+    def _get_afd_pg(self, ubatch_idx: int) -> ProcessGroup:
+        """Return the AFD HCCL process group for a ubatch (A5 p2p path)."""
+        if not self.afd_pg_list:
+            raise RuntimeError("CAMP2P connector has no AFD process groups")
+        if ubatch_idx < 0:
+            raise RuntimeError(
+                f"CAMP2P ubatch index must be non-negative: {ubatch_idx}",
+            )
+        if ubatch_idx >= len(self.afd_pg_list):
+            raise RuntimeError(
+                f"CAMP2P ubatch {ubatch_idx} requires "
+                f"{ubatch_idx + 1} AFD process groups",
+            )
+        return self.afd_pg_list[ubatch_idx]
+
     def init_afd_connector(self) -> None:
         """Connect this process to the other Attention and FFN processes.
 
@@ -324,9 +347,13 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             return
         import torch_npu  # noqa: F401
 
-        ensure_cam_p2p_ops_available()
-
-        _register_camp2p_custom_ops()
+        if is_a5():
+            # The a2e/e2a custom ops are 910C-only (not registered for
+            # ascend950); Route B2 on A5 uses plain HCCL p2p instead.
+            logger.info("CAMP2P on A5: using HCCL p2p route (B2), skipping custom ops")
+        else:
+            ensure_cam_p2p_ops_available()
+            _register_camp2p_custom_ops()
 
         num_ubatches = max(1, self.vllm_config.parallel_config.num_ubatches)
         self.afd_pg_list = []
@@ -446,6 +473,20 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 f"hidden_states shape {hidden_states.shape!r} does not match "
                 f"CAMP2P metadata token count {metadata.total_tokens}",
             )
+        if is_a5():
+            # Route B2: plain HCCL p2p send to the mapped FFN rank. The
+            # a2e/e2a custom ops (and native MC2 ops) are unusable on A5.
+            if torch.compiler.is_compiling():
+                return None
+            ubatch_idx = metadata.stage_idx
+            get_forward_context().ubatch_idx = ubatch_idx
+            dst_ffn = dst_ffn_for_attention(
+                self.world_rank - self.ffn_size,
+                self.attn_size,
+                self.ffn_size,
+            )
+            p2p_send(self._get_afd_pg(ubatch_idx), hidden_states, dst_ffn)
+            return None
         transfer_state = CAMP2PTransferState(
             aiv_num=self.aiv_num,
             batch_size=metadata.total_tokens,
@@ -496,6 +537,23 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         """
         if not self._initialized:
             raise RuntimeError("CAMP2P connector is not initialized")
+        if is_a5():
+            # Route B2: recv the FFN result over HCCL p2p from the mapped FFN
+            # rank, sized by the ref tensor (same tokens as this rank sent).
+            if torch.compiler.is_compiling():
+                return ref_tensor
+            src_ffn = dst_ffn_for_attention(
+                self.world_rank - self.ffn_size,
+                self.attn_size,
+                self.ffn_size,
+            )
+            return p2p_recv(
+                self._get_afd_pg(ubatch_idx),
+                tuple(ref_tensor.shape),
+                ref_tensor.dtype,
+                ref_tensor.device,
+                src_ffn,
+            )
         transfer_state = getattr(get_forward_context(), "cam_afdtransfer_state", None)
         if transfer_state is None:
             raise RuntimeError("CAMP2P Attention side is missing connector data")
@@ -548,6 +606,53 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             ffn_size=self.ffn_size,
             fallback=max_num_tokens,
         )
+        if is_a5():
+            # Route B2: recv each mapped Attention peer's token block over
+            # HCCL p2p and concatenate. Per-peer counts come from the DP
+            # metadata control plane (no equal-ratio split like e2a).
+            peers = attention_peers_for_ffn(
+                self.role_rank,
+                self.attn_size,
+                self.ffn_size,
+            )
+            counts = attention_token_counts(
+                self.dp_metadata_list,
+                ubatch_idx,
+                self.attn_size,
+            )
+            if counts is not None:
+                seq_lens = [max(1, counts[peer]) for peer in peers]
+            else:
+                # Metadata missing (e.g. warmup): even split of the total.
+                seq_lens = [max(1, batch_size // len(peers))] * len(peers)
+            dtype = self.vllm_config.model_config.dtype
+            pg = self._get_afd_pg(ubatch_idx)
+            blocks = [
+                p2p_recv(
+                    pg,
+                    (seq_lens[i], self.hidden_size),
+                    dtype,
+                    torch.device("npu"),
+                    self.ffn_size + peer,
+                )
+                for i, peer in enumerate(peers)
+            ]
+            hidden_states = torch.cat(blocks, dim=0)
+            a5_metadata = AFDTransferMetadata.create_ffn_metadata(
+                layer_idx=layer_idx,
+                stage_idx=ubatch_idx,
+                seq_lens=seq_lens,
+            )
+            a5_states = CAMP2PTransferState(
+                aiv_num=self.aiv_num,
+                batch_size=int(sum(seq_lens)),
+                h=self.hidden_size,
+                k=self.num_experts_per_tok,
+            )
+            return AFDA2FTransferPayload(
+                hidden_states=hidden_states,
+                context=AFDTransferContext(metadata=a5_metadata, states=a5_states),
+            )
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=ubatch_idx,
@@ -614,9 +719,31 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         if not self._initialized:
             raise RuntimeError("CAMP2P connector is not initialized")
         states = cast(CAMP2PTransferState, context.states)
+        ubatch_idx = int(kwargs.get("ubatch_idx", context.metadata.stage_idx))
+        if is_a5():
+            # Route B2: send each Attention peer its slice of the result back
+            # over HCCL p2p, split by the per-peer counts captured at recv.
+            if torch.compiler.is_compiling():
+                return None
+            peers = attention_peers_for_ffn(
+                self.role_rank,
+                self.attn_size,
+                self.ffn_size,
+            )
+            split_sizes = list(context.metadata.seq_lens)
+            if sum(split_sizes) != ffn_output.shape[0]:
+                # Inconsistent per-peer counts: fall back to an even split.
+                split_sizes = [ffn_output.shape[0] // len(peers)] * len(peers)
+                for i in range(ffn_output.shape[0] % len(peers)):
+                    split_sizes[i] += 1
+            pg = self._get_afd_pg(ubatch_idx)
+            offset = 0
+            for peer, n in zip(peers, split_sizes, strict=True):
+                p2p_send(pg, ffn_output[offset : offset + n], self.ffn_size + peer)
+                offset += n
+            return None
         if states.atten_batch_size is None:
             raise RuntimeError("CAMP2P FFN side is missing A2E atten_batch_size")
-        ubatch_idx = int(kwargs.get("ubatch_idx", context.metadata.stage_idx))
         group_ep = _get_group_ep(
             ubatch_idx,
             self.hccl_comm_name,
