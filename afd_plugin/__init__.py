@@ -88,6 +88,21 @@ _MODEL_REGISTRATIONS = MappingProxyType(
     }
 )
 
+_NPU_DEEPSEEK_V4_REGISTRATION = (
+    "afd_plugin.model_executor.models.npu.deepseek_v4:AFDNPUDeepseekV4ForCausalLM"
+)
+
+
+def _model_registration_for_device(
+    model_arch: str,
+    model_cls: str,
+    device_type: str,
+) -> str:
+    """Select a backend wrapper while preserving the public AFD alias."""
+    if model_arch == "DeepseekV4ForCausalLM" and device_type == "npu":
+        return _NPU_DEEPSEEK_V4_REGISTRATION
+    return model_cls
+
 
 def register_afd() -> None:
     """Entry point for ``vllm.general_plugins``.
@@ -149,9 +164,15 @@ def register_afd() -> None:
     # worker startup, after vLLM-Ascend completes its platform initialization.
 
     from vllm.model_executor.models import ModelRegistry
+    from vllm.platforms import current_platform
 
     for model_arch, model_cls in _MODEL_REGISTRATIONS.items():
-        ModelRegistry.register_model(f"AFD{model_arch}", model_cls)
+        registration = _model_registration_for_device(
+            model_arch,
+            model_cls,
+            current_platform.device_type,
+        )
+        ModelRegistry.register_model(f"AFD{model_arch}", registration)
 
     _registered = True
 
@@ -168,7 +189,9 @@ __all__ = [
     "__version__",
     "_DEEPSEEK_MODEL_REGISTRATIONS",
     "_MODEL_REGISTRATIONS",
+    "_NPU_DEEPSEEK_V4_REGISTRATION",
     "_QWEN_MODEL_REGISTRATIONS",
     "_QWEN3_5_MODEL_REGISTRATIONS",
+    "_model_registration_for_device",
     "register_afd",
 ]

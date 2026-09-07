@@ -9,6 +9,8 @@ from vllm.models.deepseek_v4.nvidia import model as native  # noqa: E402
 
 from afd_plugin.model_executor.models.deepseek_v4 import (  # noqa: E402
     AFDDeepseekV4ForCausalLM,
+)
+from afd_plugin.model_executor.models.deepseek_v4_common import (  # noqa: E402
     _checkpoint_weight_roles,
 )
 
@@ -31,6 +33,7 @@ class _OneShotWeights:
         "layers.0.ffn.gate.weight",
         "layers.1.ffn.experts.0.w1.weight",
         "model.layers.2.ffn.shared_experts.w2.weight",
+        "model.layers.3.mlp.experts.0.down_proj.weight",
     ],
 )
 def test_v4_raw_checkpoint_ffn_paths_are_ffn_owned(name):

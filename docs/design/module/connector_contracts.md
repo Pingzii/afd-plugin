@@ -109,6 +109,13 @@ synchronous NPU runtime requires both common and connector-local values to be
 | `CAMP2pAFDConnector` | Ascend | FFN ranks, then Attention ranks | `CAMP2pAFDControlPlane`; stage DP metadata over Gloo plus HCCL data groups | `connector.control_plane is not None` |
 | `CAMAsyncAFDConnector` | Ascend | Attention ranks, then FFN ranks | `None`; routing/token metadata travels with CAM dispatch payloads | `connector.control_plane is None` |
 
+On A5, `CAMP2pAFDConnector` has a backend-local blocking HCCL P2P route. It
+always transfers hidden states and can additionally transfer token-aligned
+int32 `input_ids` for DeepSeek-V4 hash routing. The `AFDA2FTransferPayload`
+field is backend-neutral: future A5 A2E/E2A operators must populate the same
+field so the model and FFN runner remain transport-independent. Until then,
+the custom A2E path rejects requests for `input_ids` rather than dropping them.
+
 The CUDA P2P mapping requires
 `num_attention_ranks >= num_ffn_ranks` and an integral A/F ratio. Each FFN rank
 owns a subgroup containing itself and consecutive Attention peers. CAMP2P also

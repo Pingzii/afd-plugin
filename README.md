@@ -43,6 +43,7 @@ Model support:
 | Model family | Registered architectures | Plugin model wrappers | Notes |
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
+| DeepSeekV4 | `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` (CUDA), `AFDNPUDeepseekV4ForCausalLM` (Ascend) | CUDA uses NCCL P2P. The initial Ascend A5 path uses eager HCCL P2P and carries token IDs required by V4 hash routing; hardware E2E validation is still required. |
 | Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA with `compute_gate_on_attention=false`. |
 | Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | Qwen3.5/Qwen3.6 adapter family. Repository CUDA E2E evidence currently covers text-only Qwen3.6-35B-A3B with `--language-model-only`, synchronous `P2pNcclAFDConnector`, native DP4/TP1/EP4 baseline, and AFD 2A1F eager/graph/graph+DBO. |
 
@@ -53,7 +54,7 @@ See the [recipe index](recipe/README.md) for deployment and benchmark examples.
 | Connector | Platform | Recommend Stage | Sync or Async | Graph Support | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | FFN ranks are ordered before Attention ranks. `num_attention_ranks` must be greater than or equal to `num_ffn_ranks` and divisible by it. See the [DeepSeek V2 Lite recipe](recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md). |
-| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | `FULL_DECODE_ONLY` ACL graph | Uses HCCL/CAMP2P custom ops. Ascend ops build by default on NPU platforms. See the [synchronous DeepSeek V3.2 recipe](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md). |
+| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | A2/A3 custom-op graph; A5 V4 eager only | Uses HCCL/CAMP2P custom ops on established platforms. The A5 V4 route uses blocking HCCL P2P pending A2E/E2A operator support. See the [DeepSeek V3.2](recipe/npu/CAMP2pAFDConnector/deepseek_v3_2/README.md) and [A5 DeepSeek V4](recipe/npu/CAMP2pAFDConnector/deepseek_v4/README.md) recipes. |
 | `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental v0.26 DP+TP/SP path with AFD-managed two-stage MoE ubatching; native DBO and PCP are unsupported. Post-fix DeepSeek-V3.2 DP2TP8+EP16 token split reached `0.9522` strict match on the complete GSM8K evaluation. The [legacy PCP8 recipe](recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md) requires `release/v0.19.1rc1`. |
 
 Connector implementations are grouped by backend package:
@@ -66,6 +67,10 @@ Known gaps:
 - vLLM/vLLM-Ascend model runner v2 is not supported.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
+- Ascend A5 DeepSeek-V4 currently requires eager execution, synchronous
+  `CAMP2pAFDConnector`, gate-on-FFN, and HCCL P2P. It has unit coverage but no
+  repository hardware E2E evidence yet; A2E/E2A transport is an explicit
+  follow-up seam.
 - Native DBO is limited to exactly two ubatches and is not supported by
   `CAMAsyncAFDConnector`.
 - Qwen3 MoE currently rejects Attention-side gate placement, sequence-parallel

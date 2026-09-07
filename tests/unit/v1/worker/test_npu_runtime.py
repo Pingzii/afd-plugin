@@ -55,13 +55,14 @@ def _temporarily_reimport_module(module_name: str) -> Iterator[ModuleType]:
             package.__dict__[module_attribute] = original_package_attribute
 
 
-def _ffn_payload(hidden_states, metadata, states=None):
+def _ffn_payload(hidden_states, metadata, states=None, input_ids=None):
     return AFDA2FTransferPayload(
         hidden_states=hidden_states,
         context=AFDTransferContext(
             metadata=metadata,
             states=states if states is not None else AFDTransferState(),
         ),
+        input_ids=input_ids,
     )
 
 
@@ -131,6 +132,7 @@ class _FakeFFNConnector:
             AFDA2FTransferPayload | tuple[object, AFDTransferMetadata]
         ] = deque()
         self.ffn_outputs = []
+        self.recv_calls = []
         self.updates = []
         self.attn_size = attn_size
         self.ffn_size = ffn_size
@@ -154,6 +156,7 @@ class _FakeFFNConnector:
         )
 
     def recv_attn_output(self, ubatch_idx=None, **kwargs):
+        self.recv_calls.append((ubatch_idx, kwargs))
         for item in tuple(self.attn_outputs):
             payload = (
                 item
@@ -184,6 +187,10 @@ class _RecordingFakeModel:
     def compute_ffn_output(self, hidden_states, layer_idx, **kwargs):
         self.calls.append((hidden_states, layer_idx, kwargs))
         return f"npu-ffn({hidden_states}, layer={layer_idx})"
+
+
+class _InputIdRecordingFakeModel(_RecordingFakeModel):
+    afd_requires_input_ids = True
 
 
 class _FakeStructuredFFNModel:
@@ -1379,6 +1386,42 @@ def test_npu_ffn_runner_executes_eager_ffn_step(monkeypatch):
     assert update_flags == {"is_graph_capturing": False, "is_warmup": False}
     assert runner.connector.ffn_outputs == [
         ("npu-ffn(hidden, layer=0)", metadata, {"ubatch_idx": 0}),
+    ]
+
+
+def test_npu_ffn_runner_requests_and_forwards_v4_input_ids(monkeypatch):
+    _patch_ffn_forward_context(monkeypatch)
+    runner = _new_ffn_runner()
+    runner.vllm_config = _vllm_config(role="ffn")
+    runner.connector = _FakeFFNConnector()
+    runner.model = _InputIdRecordingFakeModel()
+    runner.num_layers = 1
+    runner.max_num_tokens = 2
+    runner.use_aclgraph = False
+    runner._acl_graphs = {}
+    metadata = AFDTransferMetadata.create_attention_metadata(
+        layer_idx=0,
+        stage_idx=0,
+        seq_len=2,
+    )
+    runner.connector.attn_outputs.append(
+        _ffn_payload("hidden", metadata, input_ids="token-ids"),
+    )
+
+    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([2])})
+
+    assert runner.connector.recv_calls == [
+        (
+            0,
+            {
+                "layer_idx": 0,
+                "max_num_tokens": 2,
+                "recv_input_ids": True,
+            },
+        ),
+    ]
+    assert runner.model.calls == [
+        ("hidden", 0, {"input_ids": "token-ids"}),
     ]
 
 
