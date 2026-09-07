@@ -456,7 +456,10 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             hidden_states: Model data with shape ``(tokens, hidden_size)``.
             context: Transfer context whose ``metadata`` supplies the layer
                 number, ubatch number, and token count for this transfer.
-            **kwargs: Extra arguments accepted for interface compatibility.
+            **kwargs: May contain token-aligned ``input_ids``. The A5 P2P path
+                transfers these IDs after the hidden-state tensor. The custom
+                A2E path deliberately rejects them until its operator contract
+                supports the additional payload.
 
         Raises:
             RuntimeError: If the communication groups are not ready.
@@ -473,6 +476,20 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 f"hidden_states shape {hidden_states.shape!r} does not match "
                 f"CAMP2P metadata token count {metadata.total_tokens}",
             )
+        input_ids = kwargs.get("input_ids")
+        if input_ids is not None and not torch.compiler.is_compiling():
+            if not isinstance(input_ids, torch.Tensor):
+                raise TypeError("CAMP2P input_ids must be a torch.Tensor")
+            if input_ids.ndim != 1 or input_ids.shape[0] != metadata.total_tokens:
+                raise ValueError(
+                    "CAMP2P input_ids must be one-dimensional and token-aligned",
+                )
+            if input_ids.dtype != torch.int32:
+                raise ValueError("CAMP2P input_ids must use torch.int32")
+            if input_ids.device != hidden_states.device:
+                raise ValueError(
+                    "CAMP2P input_ids and hidden_states must use the same device",
+                )
         if is_a5():
             # Route B2: plain HCCL p2p send to the mapped FFN rank. The
             # a2e/e2a custom ops (and native MC2 ops) are unusable on A5.
@@ -486,7 +503,14 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 self.ffn_size,
             )
             p2p_send(self._get_afd_pg(ubatch_idx), hidden_states, dst_ffn)
+            if input_ids is not None:
+                p2p_send(self._get_afd_pg(ubatch_idx), input_ids, dst_ffn)
             return None
+        if input_ids is not None:
+            raise NotImplementedError(
+                "CAMP2P A2E input_ids transport is not implemented; use the "
+                "A5 HCCL P2P route until the A2E/E2A operator accepts this payload",
+            )
         transfer_state = CAMP2PTransferState(
             aiv_num=self.aiv_num,
             batch_size=metadata.total_tokens,
@@ -583,8 +607,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
 
         Args:
             ubatch_idx: Ubatch number, starting from ``0``.
-            **kwargs: May provide existing transfer information or the layer
-                number needed to create it.
+            **kwargs: May provide existing transfer information, the layer
+                number needed to create it, and ``recv_input_ids=True`` for a
+                model whose FFN requires token IDs.
 
         Returns:
             The received hidden states and the information FFN needs to process
@@ -598,6 +623,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             raise RuntimeError("CAMP2P connector is not initialized")
         layer_idx: int = kwargs.get("layer_idx", 0)
         max_num_tokens: int = kwargs.get("max_num_tokens", 0)
+        recv_input_ids = bool(kwargs.get("recv_input_ids", False))
         batch_size = _num_tokens_for_ffn_rank(
             self.dp_metadata_list,
             ubatch_idx,
@@ -627,17 +653,31 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 seq_lens = [max(1, batch_size // len(peers))] * len(peers)
             dtype = self.vllm_config.model_config.dtype
             pg = self._get_afd_pg(ubatch_idx)
-            blocks = [
-                p2p_recv(
-                    pg,
-                    (seq_lens[i], self.hidden_size),
-                    dtype,
-                    torch.device("npu"),
-                    self.ffn_size + peer,
+            blocks = []
+            input_id_blocks = []
+            for i, peer in enumerate(peers):
+                src_rank = self.ffn_size + peer
+                blocks.append(
+                    p2p_recv(
+                        pg,
+                        (seq_lens[i], self.hidden_size),
+                        dtype,
+                        torch.device("npu"),
+                        src_rank,
+                    ),
                 )
-                for i, peer in enumerate(peers)
-            ]
+                if recv_input_ids:
+                    input_id_blocks.append(
+                        p2p_recv(
+                            pg,
+                            (seq_lens[i],),
+                            torch.int32,
+                            torch.device("npu"),
+                            src_rank,
+                        ),
+                    )
             hidden_states = torch.cat(blocks, dim=0)
+            input_ids = torch.cat(input_id_blocks, dim=0) if recv_input_ids else None
             a5_metadata = AFDTransferMetadata.create_ffn_metadata(
                 layer_idx=layer_idx,
                 stage_idx=ubatch_idx,
@@ -652,6 +692,12 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             return AFDA2FTransferPayload(
                 hidden_states=hidden_states,
                 context=AFDTransferContext(metadata=a5_metadata, states=a5_states),
+                input_ids=input_ids,
+            )
+        if recv_input_ids:
+            raise NotImplementedError(
+                "CAMP2P A2E input_ids transport is not implemented; use the "
+                "A5 HCCL P2P route until the A2E/E2A operator accepts this payload",
             )
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,

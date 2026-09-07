@@ -6,19 +6,20 @@ On Atlas A5 both the a2e/e2a custom ops and the torch_npu native MoE
 dispatch/combine ops fail on the AFD mixed group with ``507035`` (MTE
 out-of-range). This module provides the Route-B2 replacement: plain
 ``torch.distributed.send`` / ``recv`` over the plugin-owned ``afd`` HCCL
-process group, moving hidden states between Attention and FFN ranks. The
-FFN side then runs its MoE internally through the standard vLLM-Ascend EP
-path, where the native ops are proven.
+process group, moving hidden states and optional token IDs between Attention
+and FFN ranks. The FFN side then runs its MoE internally through the standard
+vLLM-Ascend EP path, where the native ops are proven.
 
 Attention<->FFN rank mapping matches ``camp2p._num_tokens_for_ffn_rank``:
 with ``group_size = attention_size // ffn_size``, Attention local rank ``i``
 maps to FFN rank ``i // group_size`` and FFN rank ``j`` receives from the
 consecutive Attention local ranks ``[j*group_size, (j+1)*group_size)``.
 
-Only ``hidden_states`` crosses the wire (CAMP2p enforces gate-on-FFN, so
-``router_logits`` never enters the connector). The per-peer token counts
-come from the DP metadata control plane, so the FFN side can size its
-receive buffers and split results back exactly (no equal-ratio split).
+``hidden_states`` always crosses the wire. DeepSeek-V4 additionally sends its
+token-aligned int32 ``input_ids`` for hash routing. CAMP2p enforces gate-on-FFN,
+so ``router_logits`` never enters this connector. The per-peer token counts
+come from the DP metadata control plane, so the FFN side can size its receive
+buffers and split results back exactly (no equal-ratio split).
 """
 
 from __future__ import annotations

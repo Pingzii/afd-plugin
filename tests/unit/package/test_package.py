@@ -37,6 +37,39 @@ def test_deepseek_afd_model_registration_paths_are_lazy_strings():
     )
 
 
+def test_deepseek_v4_registration_selects_ascend_wrapper_on_npu():
+    gpu_registration = afd_plugin._DEEPSEEK_MODEL_REGISTRATIONS["DeepseekV4ForCausalLM"]
+
+    assert afd_plugin._model_registration_for_device(
+        "DeepseekV4ForCausalLM",
+        gpu_registration,
+        "npu",
+    ) == (
+        "afd_plugin.model_executor.models.npu.deepseek_v4:AFDNPUDeepseekV4ForCausalLM"
+    )
+    assert (
+        afd_plugin._model_registration_for_device(
+            "DeepseekV4ForCausalLM",
+            gpu_registration,
+            "cuda",
+        )
+        == gpu_registration
+    )
+
+
+def test_backend_selection_does_not_change_other_model_registrations():
+    registration = afd_plugin._DEEPSEEK_MODEL_REGISTRATIONS["DeepseekV3ForCausalLM"]
+
+    assert (
+        afd_plugin._model_registration_for_device(
+            "DeepseekV3ForCausalLM",
+            registration,
+            "npu",
+        )
+        == registration
+    )
+
+
 def test_qwen3_moe_afd_model_registration_path_is_lazy_string():
     registrations = afd_plugin._QWEN_MODEL_REGISTRATIONS
 

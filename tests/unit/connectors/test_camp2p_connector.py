@@ -195,6 +195,117 @@ def test_camp2p_a5_attention_token_counts_missing_metadata_returns_none():
     assert attention_token_counts({0: None}, 0, 4) is None
 
 
+def test_camp2p_a5_sends_hidden_states_then_v4_input_ids(monkeypatch):
+    torch = pytest.importorskip("torch")
+    connector = CAMP2pAFDConnector(
+        0,
+        0,
+        _vllm_config(),
+        _afd_config(role="attention"),
+        0,
+    )
+    connector._initialized = True
+    connector.afd_pg_list = [object()]
+    hidden_states = torch.ones((3, 16), dtype=torch.float16)
+    input_ids = torch.tensor([11, 13, 17], dtype=torch.int32)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=2,
+            stage_idx=0,
+            seq_len=3,
+        ),
+    )
+    sent = []
+
+    monkeypatch.setattr(camp2p_module, "is_a5", lambda: True)
+    monkeypatch.setattr(
+        camp2p_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        camp2p_module,
+        "p2p_send",
+        lambda pg, tensor, dst: sent.append((pg, tensor, dst)),
+    )
+
+    connector.send_attn_output(
+        hidden_states,
+        context,
+        input_ids=input_ids,
+    )
+
+    assert sent[0][1] is hidden_states
+    assert sent[1][1] is input_ids
+    assert [item[2] for item in sent] == [0, 0]
+
+
+def test_camp2p_a5_receives_token_aligned_v4_input_ids(monkeypatch):
+    torch = pytest.importorskip("torch")
+    connector = _init_ffn_connector(0, _vllm_config())
+    connector.afd_pg_list = [object()]
+    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+    receives = []
+
+    monkeypatch.setattr(camp2p_module, "is_a5", lambda: True)
+
+    def fake_recv(pg, shape, dtype, device, src_rank):
+        receives.append((pg, shape, dtype, device, src_rank))
+        if len(shape) == 1:
+            return torch.arange(shape[0], dtype=torch.int32) + src_rank * 10
+        return torch.full(shape, float(src_rank), dtype=torch.float16)
+
+    monkeypatch.setattr(camp2p_module, "p2p_recv", fake_recv)
+
+    payload = connector.recv_attn_output(
+        ubatch_idx=0,
+        layer_idx=4,
+        recv_input_ids=True,
+    )
+
+    assert payload.hidden_states.shape == (5, 16)
+    assert payload.input_ids is not None
+    assert payload.input_ids.dtype is torch.int32
+    assert payload.input_ids.tolist() == [20, 21, 30, 31, 32]
+    assert payload.context.metadata.seq_lens == [2, 3]
+    assert [(item[1], item[4]) for item in receives] == [
+        ((2, 16), 2),
+        ((2,), 2),
+        ((3, 16), 3),
+        ((3,), 3),
+    ]
+
+
+def test_camp2p_custom_a2e_explicitly_rejects_v4_input_ids(monkeypatch):
+    torch = pytest.importorskip("torch")
+    connector = CAMP2pAFDConnector(
+        0,
+        0,
+        _vllm_config(),
+        _afd_config(role="attention"),
+        0,
+    )
+    connector._initialized = True
+    hidden_states = torch.ones((2, 16), dtype=torch.float16)
+    input_ids = torch.tensor([1, 2], dtype=torch.int32)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=2,
+        ),
+    )
+
+    monkeypatch.setattr(camp2p_module, "is_a5", lambda: False)
+
+    with pytest.raises(NotImplementedError, match="A2E input_ids transport"):
+        connector.send_attn_output(
+            hidden_states,
+            context,
+            input_ids=input_ids,
+        )
+
+
 def test_camp2p_extra_info_rejects_unknown_mix_placement():
     with pytest.raises(ValueError, match="unknown CAMP2P connector_extra_config"):
         CAMP2PExtraInfo.from_mapping({"mix_placement": True})

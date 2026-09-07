@@ -77,7 +77,7 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `DeepseekV2ForCausalLM` | `AFDDeepseekV2ForCausalLM` | `AFDDeepseekV2ForCausalLM` |
 | `DeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
 | `DeepseekV32ForCausalLM` | `AFDDeepseekV32ForCausalLM` | `AFDDeepseekV3ForCausalLM` |
-| `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` |
+| `DeepseekV4ForCausalLM` | `AFDDeepseekV4ForCausalLM` | CUDA: `AFDDeepseekV4ForCausalLM`; Ascend: `AFDNPUDeepseekV4ForCausalLM` |
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
@@ -139,6 +139,28 @@ sequence-parallel MoE, EPLB, and the `deep_gemm_mega_moe` backend. The P2P
 connector validates one-dimensional `torch.int32` input IDs and preallocates
 their receive buffers for graph execution. This boundary currently has
 focused unit coverage but no repository model or accuracy E2E case.
+
+### DeepSeek V4 Ascend A5 boundary
+
+On Ascend, the same `AFDDeepseekV4ForCausalLM` registry alias resolves to the
+backend-local `AFDNPUDeepseekV4ForCausalLM`. It subclasses vLLM-Ascend's
+native DeepSeek-V4 implementation, retaining DSA Attention, NPU mHC operators,
+and the native `DeepseekV4MoE`. Attention owns all residual-stream and
+normalization state and uses `RemoteNPUDeepseekV4FFN`; FFN owns gate, hash
+router, shared experts, and routed experts.
+
+The A5 P2P payload is hidden states followed by token-aligned int32
+`input_ids`; FFN returns the output hidden states. The NPU FFN runner requests
+the optional IDs only for models declaring `afd_requires_input_ids`, keeping
+other model contracts unchanged. The non-P2P CAMP2P branch currently rejects
+that payload explicitly. Its existing optional payload interface is the seam
+where the planned A5 A2E/E2A operators should be connected.
+
+The first implementation requires A5, `CAMP2pAFDConnector`, gate-on-FFN,
+pipeline/context-parallel size 1, no SP MoE, EPLB/elastic EP, LoRA, or
+speculative decoding, and `--enforce-eager`. It is based on vLLM-Ascend commit
+`4fe7ddbf94bc28bcd2b9f3d2d93f0fe1f0499cf5` and still requires hardware
+accuracy and stability validation.
 
 ### Qwen3 MoE CUDA boundary
 

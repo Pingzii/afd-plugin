@@ -235,6 +235,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         )
         stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         rank_ffn_output = None
+        requires_input_ids = bool(
+            getattr(self.model, "afd_requires_input_ids", False),
+        )
 
         for layer_idx in _ffn_layer_indices(self):
             for stage_idx in stage_ids:
@@ -264,10 +267,14 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     in_profile_run=is_profile,
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                 ) as forward_context:
+                    recv_kwargs: dict[str, Any] = {}
+                    if requires_input_ids:
+                        recv_kwargs["recv_input_ids"] = True
                     payload = self.connector.recv_attn_output(
                         ubatch_idx=stage_idx,
                         layer_idx=layer_idx,
                         max_num_tokens=self.max_num_tokens,
+                        **recv_kwargs,
                     )
                     context = payload.context
                     metadata = context.metadata
@@ -280,9 +287,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     assert states, "Context.states must not be None"
                     _set_moe_layer_index(forward_context, layer_idx)
 
+                    compute_kwargs: dict[str, Any] = {}
+                    if requires_input_ids:
+                        if payload.input_ids is None:
+                            raise RuntimeError(
+                                "AFD model requires input_ids but the connector "
+                                "did not return them",
+                            )
+                        compute_kwargs["input_ids"] = payload.input_ids
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
+                        **compute_kwargs,
                     )
                     _send_ffn_output(
                         self.connector,
