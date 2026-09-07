@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -37,6 +37,32 @@ def test_npu_v4_wrapper_uses_ascend_native_classes():
     registered_model_cls = adapter.AFDNPUDeepseekV4ForCausalLM.model_cls
     assert registered_model_cls is adapter.AFDNPUDeepseekV4Model
     assert adapter.AFDNPUDeepseekV4ForCausalLM.afd_requires_input_ids
+
+
+def test_npu_v4_native_import_supports_flat_module(monkeypatch):
+    flat_module = ModuleType("vllm_ascend.models.deepseek_v4")
+    monkeypatch.setattr(adapter, "import_module", lambda _name: flat_module)
+
+    assert adapter._import_native_deepseek_v4() is flat_module
+
+
+def test_npu_v4_native_import_supports_package_module(monkeypatch):
+    package_module = ModuleType("vllm_ascend.models.deepseek_v4")
+    package_module.__path__ = []
+    model_module = ModuleType("vllm_ascend.models.deepseek_v4.model")
+    imported_names = []
+
+    def fake_import_module(name):
+        imported_names.append(name)
+        return model_module if name.endswith(".model") else package_module
+
+    monkeypatch.setattr(adapter, "import_module", fake_import_module)
+
+    assert adapter._import_native_deepseek_v4() is model_module
+    assert imported_names == [
+        "vllm_ascend.models.deepseek_v4",
+        "vllm_ascend.models.deepseek_v4.model",
+    ]
 
 
 def test_npu_v4_remote_ffn_sends_input_ids(monkeypatch):
