@@ -13,13 +13,14 @@ operators; they can replace the P2P transport without changing this model.
 """
 
 from collections.abc import Iterable
+from importlib import import_module
+from types import ModuleType
 from typing import Any
 
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
-from vllm_ascend.models.deepseek_v4 import model as native
 
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
@@ -27,6 +28,18 @@ from afd_plugin.connectors.npu.camp2p_a5 import is_a5
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.models.deepseek_v4_common import _iter_role_weights
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
+
+
+def _import_native_deepseek_v4() -> ModuleType:
+    """Load DeepSeek-V4 across the flat and package Ascend layouts."""
+    module_name = "vllm_ascend.models.deepseek_v4"
+    deepseek_v4 = import_module(module_name)
+    if hasattr(deepseek_v4, "__path__"):
+        return import_module(f"{module_name}.model")
+    return deepseek_v4
+
+
+native = _import_native_deepseek_v4()
 
 
 class RemoteNPUDeepseekV4FFN(nn.Module):
@@ -350,12 +363,22 @@ class AFDNPUDeepseekV4Model(native.DeepseekV4Model):
                 },
             )
 
-        self.make_empty_intermediate_tensors = (
-            native.make_pp_empty_intermediate_tensors(
+        # ### PATCH START: preserve the pre-module-split Ascend PP contract.
+        make_pp_empty = getattr(
+            native,
+            "make_pp_empty_intermediate_tensors",
+            None,
+        )
+        if make_pp_empty is None:
+            # vLLM-Ascend before the DSV4 module split exposes the factory
+            # directly instead of wrapping it for pipeline-parallel models.
+            self.make_empty_intermediate_tensors = make_empty_intermediate_tensors
+        else:
+            self.make_empty_intermediate_tensors = make_pp_empty(
                 self,
                 make_empty_intermediate_tensors,
             )
-        )
+        # ### PATCH END
 
         self.norm_eps = config.rms_norm_eps
         self.hc_eps = config.hc_eps
