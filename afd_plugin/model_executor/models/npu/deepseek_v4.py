@@ -252,7 +252,8 @@ class AFDNPUDeepseekV4Model(native.DeepseekV4Model):
     """Role-aware Ascend DeepSeek-V4 model for the initial A5 P2P route."""
 
     # Patch reason: native Ascend V4 allocates all decoder stages on every rank.
-    # Patch functionality: construct AFD role-aware layers and resources.
+    # Patch functionality: construct role-aware layers and preserve the
+    # inherited eager compilation contract.
     # Signature: matches upstream; no added parameters.
     # Upstream: vllm-ascend/vllm_ascend/models/deepseek_v4/model.py
     # Commit: 4fe7ddbf94bc28bcd2b9f3d2d93f0fe1f0499cf5
@@ -296,6 +297,14 @@ class AFDNPUDeepseekV4Model(native.DeepseekV4Model):
             raise RuntimeError(
                 "AFD NPU DeepSeek-V4 does not support EPLB or elastic EP",
             )
+        # The native model is decorated with support_torch_compile. Calling
+        # nn.Module.__init__ above avoids constructing the unsplit native
+        # stages, but also bypasses the decorator's initialization wrapper.
+        # This route requires eager execution, so restore the wrapper state
+        # with compilation explicitly disabled.
+        self.vllm_config = vllm_config
+        self.compilation_config = vllm_config.compilation_config
+        self.do_not_compile = True
         # ### PATCH END
 
         config = vllm_config.model_config.hf_config

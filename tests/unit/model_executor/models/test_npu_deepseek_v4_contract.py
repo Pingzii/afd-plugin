@@ -9,9 +9,9 @@ pytest.importorskip("vllm")
 pytest.importorskip("torch_npu")
 pytest.importorskip("vllm_ascend")
 
-from vllm_ascend.models.deepseek_v4 import model as native  # noqa: E402
-
 from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
+
+native = adapter.native
 
 
 class _FakeConnector:
@@ -129,3 +129,83 @@ def test_npu_v4_model_requires_eager_a5_p2p(monkeypatch):
 
     with pytest.raises(RuntimeError, match="requires --enforce-eager"):
         adapter.AFDNPUDeepseekV4Model(vllm_config=vllm_config)
+
+
+def test_npu_v4_model_preserves_eager_compile_contract(monkeypatch):
+    afd_config = SimpleNamespace(
+        compute_gate_on_attention=False,
+        connector="CAMP2pAFDConnector",
+        role="ffn",
+    )
+    compilation_config = SimpleNamespace(mode="none")
+    hf_config = SimpleNamespace(
+        hc_eps=1e-5,
+        hc_mult=1,
+        hidden_size=8,
+        num_hidden_layers=1,
+        rms_norm_eps=1e-5,
+        vocab_size=16,
+    )
+    vllm_config = SimpleNamespace(
+        compilation_config=compilation_config,
+        lora_config=None,
+        model_config=SimpleNamespace(
+            enforce_eager=True,
+            hf_config=hf_config,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            enable_elastic_ep=False,
+            enable_eplb=False,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            use_sequence_parallel_moe=False,
+        ),
+        quant_config=None,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        speculative_config=None,
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "current_platform",
+        SimpleNamespace(device_type="npu"),
+    )
+    monkeypatch.setattr(adapter, "is_a5", lambda: True)
+    monkeypatch.setattr(
+        adapter,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: afd_config,
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=False, is_last_rank=False),
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "make_layers",
+        lambda *_args, **_kwargs: (0, 0, torch.nn.ModuleList()),
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "make_pp_empty_intermediate_tensors",
+        lambda _model, factory: factory,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        adapter.native,
+        "PPMissingLayer",
+        torch.nn.Identity,
+    )
+    monkeypatch.setattr(
+        adapter.AFDNPUDeepseekV4Model,
+        "forward",
+        lambda _self: "eager-forward",
+    )
+
+    model = adapter.AFDNPUDeepseekV4Model(vllm_config=vllm_config)
+
+    assert model.vllm_config is vllm_config
+    assert model.compilation_config is compilation_config
+    assert model.do_not_compile is True
+    assert model() == "eager-forward"
