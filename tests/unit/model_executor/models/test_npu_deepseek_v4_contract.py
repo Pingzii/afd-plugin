@@ -9,7 +9,12 @@ pytest.importorskip("vllm")
 pytest.importorskip("torch_npu")
 pytest.importorskip("vllm_ascend")
 
-from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
+from afd_plugin.model_executor.models.npu import (  # noqa: E402
+    deepseek_v4 as router,
+)
+from afd_plugin.model_executor.models.npu import (  # noqa: E402
+    deepseek_v4_p2p as adapter,
+)
 
 native = adapter.native
 
@@ -25,6 +30,24 @@ class _FakeConnector:
         return ref_tensor * 0.5
 
 
+class _RecordingDecoderLayer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layer_idx = 0
+        self.input_ids = None
+
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        residual,
+        llama_4_scaling=None,
+        input_ids=None,
+    ):
+        self.input_ids = input_ids
+        return hidden_states, residual
+
+
 def test_npu_v4_wrapper_uses_ascend_native_classes():
     assert issubclass(
         adapter.AFDNPUDeepseekV4DecoderLayer,
@@ -37,6 +60,46 @@ def test_npu_v4_wrapper_uses_ascend_native_classes():
     registered_model_cls = adapter.AFDNPUDeepseekV4ForCausalLM.model_cls
     assert registered_model_cls is adapter.AFDNPUDeepseekV4Model
     assert adapter.AFDNPUDeepseekV4ForCausalLM.afd_requires_input_ids
+
+
+@pytest.mark.parametrize(
+    ("connector", "expected_model_cls", "requires_input_ids"),
+    [
+        ("CAMAsyncAFDConnector", router.AFDDeepseekV4Model, False),
+        ("CAMP2pAFDConnector", adapter.AFDNPUDeepseekV4Model, True),
+    ],
+)
+def test_npu_v4_router_selects_model_for_connector(
+    monkeypatch,
+    connector,
+    expected_model_cls,
+    requires_input_ids,
+):
+    afd_config = SimpleNamespace(connector=connector)
+    monkeypatch.setattr(
+        router,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: afd_config,
+    )
+
+    selected = {}
+
+    def fake_async_init(self, *, vllm_config, prefix=""):
+        selected["model_cls"] = self.model_cls
+        selected["requires_input_ids"] = self.afd_requires_input_ids
+
+    monkeypatch.setattr(
+        router.AFDDeepseekV4ForCausalLM,
+        "__init__",
+        fake_async_init,
+    )
+
+    router.AFDNPUDeepseekV4ForCausalLM(vllm_config=SimpleNamespace())
+
+    assert selected == {
+        "model_cls": expected_model_cls,
+        "requires_input_ids": requires_input_ids,
+    }
 
 
 def test_npu_v4_native_import_supports_flat_module(monkeypatch):
@@ -94,6 +157,47 @@ def test_npu_v4_remote_ffn_sends_input_ids(monkeypatch):
     assert connector.sent[1].metadata.stage_idx == 1
     assert connector.sent[2]["input_ids"] is input_ids
     assert torch.equal(output, hidden_states * 0.5)
+
+
+def test_npu_v4_model_forward_preserves_input_ids_without_mtp(monkeypatch):
+    pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    monkeypatch.setattr(adapter.native, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(
+        adapter.AFDNPUDeepseekV4Model,
+        "hc_head",
+        lambda _self, hidden_states, *_args: hidden_states[:, 0, :],
+    )
+
+    model = adapter.AFDNPUDeepseekV4Model.__new__(
+        adapter.AFDNPUDeepseekV4Model,
+    )
+    torch.nn.Module.__init__(model)
+    layer = _RecordingDecoderLayer()
+    model.hc_mult = 1
+    model.start_layer = 0
+    model.end_layer = 1
+    model.layers = torch.nn.ModuleList([layer])
+    model.aux_hidden_state_layers = ()
+    model._mtp_hidden_buffer = None
+    model.hc_head_fn = None
+    model.hc_head_scale = None
+    model.hc_head_base = None
+    model.norm = torch.nn.Identity()
+
+    input_ids = torch.tensor([7, 11], dtype=torch.int32)
+    positions = torch.tensor([0, 1], dtype=torch.int64)
+    inputs_embeds = torch.ones((2, 4), dtype=torch.float16)
+
+    output = adapter.AFDNPUDeepseekV4Model.forward(
+        model,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=inputs_embeds,
+    )
+
+    assert layer.input_ids is input_ids
+    assert torch.equal(output, inputs_embeds)
 
 
 def test_npu_v4_model_requires_eager_a5_p2p(monkeypatch):

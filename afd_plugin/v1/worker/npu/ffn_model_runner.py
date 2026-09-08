@@ -294,6 +294,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                                 "AFD model requires input_ids but the connector "
                                 "did not return them",
                             )
+                        # DeepSeek-V4 hash routing in vLLM-Ascend v0.26 reads
+                        # token IDs from ForwardContext rather than the MoE
+                        # forward argument. Publish the received IDs in both
+                        # places so the model contract remains version-stable.
+                        forward_context.input_ids = payload.input_ids
                         compute_kwargs["input_ids"] = payload.input_ids
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,

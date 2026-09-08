@@ -1418,7 +1418,24 @@ def test_npu_ffn_runner_executes_eager_ffn_step(monkeypatch):
 
 
 def test_npu_ffn_runner_requests_and_forwards_v4_input_ids(monkeypatch):
-    _patch_ffn_forward_context(monkeypatch)
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    forward_context = SimpleNamespace(
+        additional_kwargs={},
+        dp_metadata=None,
+        all_moe_layers={},
+    )
+
+    @contextmanager
+    def fake_ascend_forward_context(**_kwargs):
+        yield forward_context
+
+    monkeypatch.setattr(
+        ffn_model_runner,
+        "ascend_forward_context",
+        fake_ascend_forward_context,
+    )
     runner = _new_ffn_runner()
     runner.vllm_config = _vllm_config(role="ffn")
     runner.connector = _FakeFFNConnector()
@@ -1438,6 +1455,7 @@ def test_npu_ffn_runner_requests_and_forwards_v4_input_ids(monkeypatch):
 
     runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([2])})
 
+    assert forward_context.input_ids == "token-ids"
     assert runner.connector.recv_calls == [
         (
             0,

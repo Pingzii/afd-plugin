@@ -24,12 +24,21 @@ def _afd_config(
     )
 
 
-def test_dsv4_rejects_camp2p_connector() -> None:
-    with pytest.raises(RuntimeError, match="only CAMAsyncAFDConnector"):
+def test_dsv4_accepts_camp2p_connector() -> None:
+    _fail_if_unsupported_dsv4_connector(
+        _afd_config(
+            compute_gate_on_attention=False,
+            connector="CAMP2pAFDConnector",
+        ),
+    )
+
+
+def test_dsv4_rejects_unknown_connector() -> None:
+    with pytest.raises(RuntimeError, match="CAMAsyncAFDConnector or CAMP2p"):
         _fail_if_unsupported_dsv4_connector(
             _afd_config(
                 compute_gate_on_attention=False,
-                connector="CAMP2pAFDConnector",
+                connector="UnknownConnector",
             ),
         )
 

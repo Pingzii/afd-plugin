@@ -130,8 +130,13 @@ def _fail_if_unsupported_dsv4_async_features(
 
 
 def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
-    if afd_config.connector != AFD_ASYNC_CONNECTOR:
-        raise RuntimeError("DSV4 NPU AFD supports only CAMAsyncAFDConnector")
+    if afd_config.connector not in {
+        AFD_ASYNC_CONNECTOR,
+        "CAMP2pAFDConnector",
+    }:
+        raise RuntimeError(
+            "DSV4 NPU AFD supports only CAMAsyncAFDConnector or CAMP2pAFDConnector",
+        )
 
 
 def _fail_if_unsupported_npu_afd_async_features(

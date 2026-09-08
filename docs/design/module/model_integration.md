@@ -143,9 +143,11 @@ focused unit coverage but no repository model or accuracy E2E case.
 ### DeepSeek V4 Ascend A5 boundary
 
 On Ascend, the same `AFDDeepseekV4ForCausalLM` registry alias resolves to the
-backend-local `AFDNPUDeepseekV4ForCausalLM`. It subclasses vLLM-Ascend's
-native DeepSeek-V4 implementation, retaining DSA Attention, NPU mHC operators,
-and the native `DeepseekV4MoE`. Attention owns all residual-stream and
+backend-local `AFDNPUDeepseekV4ForCausalLM`. That wrapper dispatches by
+connector: the upstream `deepseek_v4.py` implementation remains responsible
+for Async CAM, while `deepseek_v4_p2p.py` owns the A5 P2P model split. Both
+paths retain vLLM-Ascend's DSA Attention, NPU mHC operators, and native
+`DeepseekV4MoE`. In the P2P path, Attention owns all residual-stream and
 normalization state and uses `RemoteNPUDeepseekV4FFN`; FFN owns gate, hash
 router, shared experts, and routed experts.
 

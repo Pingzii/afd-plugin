@@ -568,8 +568,52 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         return super().load_weights(_iter_role_weights(weights, role=self.afd_role))
 
 
+class AFDNPUDeepseekV4ForCausalLM(AFDDeepseekV4ForCausalLM):
+    """Select the Async CAM or A5 P2P DSV4 model for the active connector."""
+
+    model_cls = AFDDeepseekV4Model
+    afd_requires_input_ids = False
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        afd_config = parse_afd_config(vllm_config, validate=False)
+        if afd_config.connector == "CAMP2pAFDConnector":
+            from afd_plugin.model_executor.models.npu.deepseek_v4_p2p import (
+                AFDNPUDeepseekV4Model,
+            )
+
+            self.model_cls = AFDNPUDeepseekV4Model
+            self.afd_requires_input_ids = True
+        else:
+            self.model_cls = AFDDeepseekV4Model
+            self.afd_requires_input_ids = False
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        """Return no native expert mappings on a P2P Attention rank."""
+        if (
+            self.afd_config.connector == "CAMP2pAFDConnector"
+            and self.afd_role == _ATTENTION_ROLE
+        ):
+            return []
+        return super().get_expert_mapping()
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self.afd_config.connector != "CAMP2pAFDConnector":
+            return super().load_weights(weights)
+
+        from afd_plugin.model_executor.models.deepseek_v4_common import (
+            _iter_role_weights as iter_p2p_role_weights,
+        )
+
+        return native.AscendDeepseekV4ForCausalLM.load_weights(
+            self,
+            iter_p2p_role_weights(weights, role=self.afd_role),
+        )
+
+
 __all__ = [
     "AFDDeepseekV4DecoderLayer",
     "AFDDeepseekV4ForCausalLM",
     "AFDDeepseekV4Model",
+    "AFDNPUDeepseekV4ForCausalLM",
 ]
