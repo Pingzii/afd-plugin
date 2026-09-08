@@ -14,6 +14,7 @@ operators; they can replace the P2P transport without changing this model.
 
 from collections.abc import Iterable
 from importlib import import_module
+from itertools import islice
 from types import ModuleType
 from typing import Any
 
@@ -418,6 +419,102 @@ class AFDNPUDeepseekV4Model(native.DeepseekV4Model):
             self.hc_norm = native.PPMissingLayer()
         self._mtp_hidden_buffer = None
         # ### PATCH END
+
+    # Patch reason: the v0.26 Ascend model forward drops input_ids when it
+    # invokes decoder layers, so the remote AFD FFN cannot perform hash routing.
+    # Patch functionality: preserve the pinned native forward while forwarding
+    # token IDs to each role-aware layer and guarding the disabled MTP buffer.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vllm-ascend/vllm_ascend/models/deepseek_v4.py
+    # Commit: 80d8c194f7584b17fe08065ea99a130916f6b0e7
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: native.IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | native.IntermediateTensors:
+        if native.get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = None
+
+        llama_4_scaling_config = None
+        llama_4_scaling: torch.Tensor | None
+        if llama_4_scaling_config is not None:
+            llama_4_scaling = native._get_llama_4_scaling(
+                original_max_position_embeddings=llama_4_scaling_config[
+                    "original_max_position_embeddings"
+                ],
+                scaling_beta=llama_4_scaling_config["beta"],
+                positions=positions,
+            )
+        else:
+            llama_4_scaling = None
+
+        if native.get_pp_group().is_first_rank:
+            hidden_states = hidden_states.unsqueeze(1).repeat(
+                1,
+                self.hc_mult,
+                1,
+            )
+        aux_hidden_states: list[torch.Tensor] = []
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            # ### PATCH START: retain token IDs across the AFD layer boundary.
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+                llama_4_scaling,
+                input_ids=input_ids,
+            )
+            # ### PATCH END
+            if layer.layer_idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states.mean(dim=1))
+
+        # ### PATCH START: AFD rejects speculative decoding and owns no MTP buffer.
+        if self._mtp_hidden_buffer is not None:
+            forward_context = get_forward_context()
+            if forward_context is not None and forward_context.flash_comm_v1_enabled:
+                h_states_flat = native.tensor_model_parallel_all_gather(
+                    hidden_states.flatten(1),
+                    dim=0,
+                )
+                pad_size = forward_context.pad_size
+                if pad_size > 0:
+                    h_states_flat = h_states_flat[:-pad_size]
+                num_tokens = h_states_flat.shape[0]
+                self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
+            else:
+                num_tokens = hidden_states.shape[0]
+                self._mtp_hidden_buffer[:num_tokens].copy_(
+                    hidden_states.flatten(1),
+                )
+        # ### PATCH END
+
+        if not native.get_pp_group().is_last_rank:
+            return native.IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                },
+            )
+
+        hidden_states = self.hc_head(
+            hidden_states,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+        )
+        hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
     def compute_ffn_output(
         self,
