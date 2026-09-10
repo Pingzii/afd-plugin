@@ -1971,6 +1971,7 @@ def test_npu_ffn_worker_start_binds_physical_npu_once_before_daemon(
     monkeypatch,
     enable_cpu_binding,
 ):
+    _require_npu_runtime()
     from afd_plugin.v1.worker.npu import ffn_worker
 
     worker = _new_ffn_worker()
@@ -2035,6 +2036,7 @@ def test_npu_ffn_worker_cpu_binding_failure_does_not_abort_daemon_start(
     monkeypatch,
     caplog,
 ):
+    _require_npu_runtime()
     from afd_plugin.v1.worker.npu import ffn_worker
 
     worker = _new_ffn_worker()
