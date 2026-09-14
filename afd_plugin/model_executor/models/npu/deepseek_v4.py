@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
@@ -46,6 +47,13 @@ _ATTENTION_ROLE = "attention"
 _FFN_ROLE = "ffn"
 _BOTH_ROLES = frozenset((_ATTENTION_ROLE, _FFN_ROLE))
 
+logger = init_logger(__name__)
+
+# Set to 1 to keep token ids off the AFD boundary. Transport is the normal path;
+# this exists so the boundary stays inspectable without the operator's ids mode.
+AFD_DSV4_SKIP_INPUT_IDS_ENV = "AFD_DSV4_SKIP_INPUT_IDS"
+AFD_DSV4_PARAM_DUMP_ENV = "AFD_DSV4_PARAM_DUMP"
+
 
 def _refresh_ascend_fused_moe() -> None:
     """Bind native DSV4 MoE construction to the Ascend implementation."""
@@ -69,12 +77,32 @@ def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
     return None
 
 
-def _checkpoint_weight_roles(name: str) -> frozenset[str]:
+def _attn_role_owns_gate(compute_gate_on_attention: bool) -> bool:
+    """Return whether the Attention role carries a router for this config.
+
+    Only the gate-on-Attention configuration gives Attention a router; with the
+    gate on FFN its MoE slot is a parameter-free transfer shell.
+    """
+
+    return bool(compute_gate_on_attention)
+
+
+def _checkpoint_weight_roles(
+    name: str,
+    *,
+    attn_owns_gate: bool = True,
+) -> frozenset[str]:
     """Return the AFD owner for a DSV4 checkpoint path.
 
     DSV4 checkpoints use ``attn``/``ffn`` names while the Ascend runtime
     model exposes ``self_attn``/``mlp``.  The native loader performs that name
     conversion later, so filtering must understand both spellings here.
+
+    ``attn_owns_gate`` describes whether the Attention role built a router for
+    the current configuration. Handing a role a path it never registered is not
+    a harmless no-op: the upstream Ascend loader indexes its parameter dict by
+    name without a membership check, so it raises ``KeyError`` instead of
+    skipping.
     """
 
     layer_path = _weight_layer_path(name)
@@ -86,7 +114,18 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
         return frozenset((_ATTENTION_ROLE,))
     if stage in ("ffn", "mlp"):
         if remainder and remainder[0] == "gate":
-            return _BOTH_ROLES
+            # The Hash id table is a parameter only where the Hash MoE is
+            # built, which is the FFN role, whatever the gate placement: with
+            # the gate on FFN the table lives on the FFN router, and with the
+            # gate on Attention the Hash path routes from the table instead of
+            # from a gate weight.
+            if "tid2eid" in remainder:
+                return frozenset((_FFN_ROLE,))
+            # The remaining gate parameters belong to every role that built a
+            # router. With the gate on FFN, Attention has none.
+            if attn_owns_gate:
+                return _BOTH_ROLES
+            return frozenset((_FFN_ROLE,))
         return frozenset((_FFN_ROLE,))
     # HC parameters and any future shared layer parameters are required by
     # both role-local model instances.
@@ -97,10 +136,104 @@ def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     role: str,
+    attn_owns_gate: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(name):
+        if role in _checkpoint_weight_roles(name, attn_owns_gate=attn_owns_gate):
             yield name, loaded_weight
+
+
+def transport_input_ids_enabled() -> bool:
+    """Return whether DSV4 moves token ids across the AFD boundary.
+
+    Hash layers route by token identity, and only Attention holds ``input_ids``,
+    so the ids must travel with the activations. Transporting them uses the
+    ``a2e`` operator's ids mode, which reserves AIV blocks for a second payload.
+
+    Transport is the normal path and is on by default. The switch exists only to
+    keep the boundary inspectable without that operator mode: with ids disabled
+    the transfer carries hidden states alone, so transport, FFN compute and the
+    return path are still exercised, while Hash layers have no routing input and
+    the run cannot produce native-equivalent output.
+    """
+
+    return not _env_enabled(AFD_DSV4_SKIP_INPUT_IDS_ENV)
+
+
+def _param_dump_requested() -> bool:
+    """Return whether the DSV4 parameter-layout diagnostic was requested.
+
+    The check lives behind an environment variable so a production run pays only
+    an env lookup. See ``tools/dump_dsv4_param_layout.py`` for what it reports.
+    """
+
+    return _env_enabled(AFD_DSV4_PARAM_DUMP_ENV)
+
+
+def _env_enabled(name: str) -> bool:
+    """Return whether a boolean AFD environment switch is set."""
+
+    import os
+
+    return os.environ.get(name, "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _log_param_layout(
+    model: object,
+    role_weights: list[tuple[str, torch.Tensor]],
+) -> None:
+    """Print the registered layout and the surviving checkpoint names once."""
+
+    from tools.dump_dsv4_param_layout import (
+        log_dsv4_parameter_layout,
+        log_role_filtered_names,
+    )
+
+    print(log_dsv4_parameter_layout(model, role=model.afd_role), flush=True)
+    log_role_filtered_names(role_weights, role=model.afd_role)
+
+
+class AFDDeepseekV4RemoteMoE(RemoteFFNProxy):
+    """DSV4 gate-on-FFN shell that sends Hash ids alongside the activations.
+
+    The FFN role owns the gate for this configuration. Its Hash layers route by
+    token identity, and only Attention holds ``input_ids``, so Attention sends
+    the rank-local ids that the FFN rank's tokens correspond to. Connectors that
+    do not transport ids ignore the extra argument, which keeps this shell valid
+    for gate-on-FFN configurations in general.
+
+    Whether ids cross the boundary is a run-level decision the two roles share
+    through :func:`transport_input_ids_enabled`, not a per-layer one, because the
+    FFN role cannot tell Hash layers from non-Hash ones. A forward context with no
+    ids is therefore an error here rather than a silent activations-only send.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from vllm.forward_context import get_forward_context
+
+        from afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate import (
+            hash_input_ids_from_context,
+        )
+
+        if not transport_input_ids_enabled():
+            return self._send_and_receive(hidden_states)
+        # The FFN rank derives the ids decision from the same switch and waits
+        # for the operator's ids channel whenever it is on, so this side must
+        # send ids rather than quietly fall back to an activations-only
+        # transfer. ``hash_input_ids_from_context`` raises if the forward
+        # context cannot supply them.
+        return self._send_and_receive(
+            hidden_states,
+            input_ids=hash_input_ids_from_context(
+                forward_context=get_forward_context(),
+                router_tokens=int(hidden_states.shape[0]),
+            ),
+        )
 
 
 class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
@@ -234,7 +367,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                     prefix=f"{prefix}.mlp",
                 )
             else:
-                self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
+                self.mlp = AFDDeepseekV4RemoteMoE(layer_idx=layer_idx)
         elif afd_config.role == _FFN_ROLE:
             self.self_attn = native.PPMissingLayer()
             _refresh_ascend_fused_moe()
@@ -275,6 +408,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         dynamic_scales_shared: torch.Tensor | None = None,
         topk_scales: torch.Tensor | None = None,
         group_list_type: int = 1,
+        input_ids: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | AFDF2ATransferPayload:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
@@ -303,7 +437,14 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                 # topk_weights, which CAM applies during combine-recv.
                 routed_scale_applied_in_topk=True,
             )
-        return self.mlp(hidden_states)
+        # ### PATCH START: FFN-side Hash routing needs the transported ids.
+        # The native MoE runs the gate internally when the gate is not on
+        # Attention, and its Hash layers route by token identity: vLLM-Ascend's
+        # FusedMoE reads `forward_context.input_ids`, which AFD installs from the
+        # transfer. Pass them on to the native MoE as well so the ids travel with
+        # the call rather than only through ambient context.
+        return self.mlp(hidden_states, input_ids=input_ids)
+        # ### PATCH END: FFN-side Hash routing needs the transported ids.
 
 
 @native.support_torch_compile
@@ -533,6 +674,11 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
 
     model_cls = AFDDeepseekV4Model
 
+    # DSV4 Hash layers route by token identity. The FFN role does not hold
+    # input_ids, so the connector must transport them and the FFN runner
+    # installs them in the forward context before the FFN compute.
+    afd_requires_input_ids = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
@@ -568,7 +714,21 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(_iter_role_weights(weights, role=self.afd_role))
+        role_weights = _iter_role_weights(
+            weights,
+            role=self.afd_role,
+            attn_owns_gate=_attn_role_owns_gate(
+                bool(self.afd_config.compute_gate_on_attention),
+            ),
+        )
+        if _param_dump_requested():
+            # Diagnostic only, and deliberately inert otherwise: materialise the
+            # generator so the layout can be printed, then load from the same
+            # content.
+            role_weights = list(role_weights)
+            _log_param_layout(self, role_weights)
+        loaded = super().load_weights(role_weights)
+        return loaded
 
 
 __all__ = [

@@ -4,10 +4,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    CAMP2P_CONNECTOR,
     AFDConfig,
     is_afd_async_dp,
     parse_afd_config,
@@ -17,6 +18,10 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
     from afd_plugin.connectors.base import ConnectorExtraInfo
+
+SUPPORTED_DSV4_CONNECTORS: Final[frozenset[str]] = frozenset(
+    {AFD_ASYNC_CONNECTOR, CAMP2P_CONNECTOR},
+)
 
 
 def fail_if_unsupported_npu_afd_features(
@@ -130,8 +135,21 @@ def _fail_if_unsupported_dsv4_async_features(
 
 
 def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
-    if afd_config.connector != AFD_ASYNC_CONNECTOR:
-        raise RuntimeError("DSV4 NPU AFD supports only CAMAsyncAFDConnector")
+    """Reject DSV4 on connector paths that have no ids transport.
+
+    DSV4 Hash layers route by token identity, so whichever role owns the gate
+    needs the tokens' ids. Both supported connectors can carry them: CAM async
+    reads them from its own dispatch metadata, and CAMP2P moves them over the
+    A2E ids channel with the gate left on FFN. ``P2pNcclAFDConnector`` is a CUDA
+    connector and never reaches this Ascend validation.
+    """
+
+    if afd_config.connector not in SUPPORTED_DSV4_CONNECTORS:
+        raise RuntimeError(
+            "DSV4 NPU AFD supports only "
+            f"{', '.join(sorted(SUPPORTED_DSV4_CONNECTORS))}; got "
+            f"{afd_config.connector!r}",
+        )
 
 
 def _fail_if_unsupported_npu_afd_async_features(

@@ -264,6 +264,22 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     num_tokens_across_dp,
                     dp_size=int(self.vllm_config.parallel_config.data_parallel_size),
                 )
+                # A model whose router is keyed by token identity needs the ids
+                # of the tokens this rank computes on installed in the forward
+                # context before the FFN compute runs. They arrive with the
+                # transfer, so the receive must happen before the context is
+                # built rather than inside it.
+                payload = self.connector.recv_attn_output(
+                    ubatch_idx=stage_idx,
+                    layer_idx=layer_idx,
+                    max_num_tokens=self.max_num_tokens,
+                    recv_input_ids=_model_requires_input_ids(self.model),
+                )
+                context = payload.context
+                metadata = context.metadata
+                states = context.states
+                hidden_states = payload.hidden_states
+                received_input_ids = getattr(states, "input_ids", None)
                 with ascend_forward_context(
                     vllm_config=self.vllm_config,
                     afd_metadata=afd_metadata,
@@ -272,16 +288,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     num_tokens_across_dp=dp_num_tokens_across_dp,
                     in_profile_run=is_profile,
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
+                    input_ids=received_input_ids,
                 ) as forward_context:
-                    payload = self.connector.recv_attn_output(
-                        ubatch_idx=stage_idx,
-                        layer_idx=layer_idx,
-                        max_num_tokens=self.max_num_tokens,
-                    )
-                    context = payload.context
-                    metadata = context.metadata
-                    states = context.states
-                    hidden_states = payload.hidden_states
                     metadata.layer_idx = layer_idx
                     metadata.stage_idx = stage_idx
                     forward_context.dp_metadata = dp_metadata_list.get(stage_idx)
@@ -292,6 +300,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
+                        input_ids=received_input_ids,
                     )
                     _send_ffn_output(
                         self.connector,
@@ -487,6 +496,25 @@ def _send_ffn_output(
         context,
         **kwargs,
     )
+
+
+def _model_requires_input_ids(model: object) -> bool:
+    """Return whether this FFN rank should ask for token ids.
+
+    The model declares ``afd_requires_input_ids`` when it routes on token
+    identity. The transport switch is read per forward through the model module
+    so a run that opted out of ids does not ask for them, which would fail the
+    connector's alignment check.
+    """
+
+    if not getattr(model, "afd_requires_input_ids", False):
+        return False
+
+    from afd_plugin.model_executor.models.npu.deepseek_v4 import (
+        transport_input_ids_enabled,
+    )
+
+    return transport_input_ids_enabled()
 
 
 def _ffn_layer_indices(runner: AFDNPUFFNModelRunner) -> range | list[int]:

@@ -182,7 +182,9 @@ class CAMP2PTransferState(AFDTransferState):
     ``input_ids`` holds the token-aligned ids that Attention sent alongside the
     hidden states, as received by the FFN rank. It is populated only when the
     receiving rank declared ``recv_input_ids``, which ``compute_gate_mode``
-    records.
+    records. ``compute_gate_mode`` is the operator's ids mode for this transfer
+    and has to equal the mode the sending rank selected, because the operator
+    only writes the ids slot in that mode.
     """
 
     aiv_num: int = 8
@@ -668,8 +670,11 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             ubatch_idx: Ubatch number, starting from ``0``.
             **kwargs: May provide existing transfer information or the layer
                 number needed to create it. ``recv_input_ids`` states that this
-                FFN rank expects token ids on the transfer, which makes the
-                connector validate and expose the operator's ids slot.
+                FFN rank expects token ids on the transfer, which selects the
+                operator's ids mode and makes the connector validate and expose
+                the operator's ids slot. The sending rank has to select the same
+                mode, so only request ids for a run whose Attention role
+                transports them.
 
         Returns:
             The received hidden states and the information FFN needs to process
@@ -729,16 +734,18 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.world_rank,
             group_ep,
             custom_states.aiv_num,
-            0,
+            custom_states.compute_gate_mode,
         )
         custom_states.atten_batch_size = outputs[3]
         custom_states.x_active_mask = outputs[4]
         custom_states.cam_p2p_ep_name = self.hccl_comm_name1
-        # The operator always returns its ids slot, but it only carries real ids
-        # when the transfer ran with compute_gate=1. That mode is declared by the
+        # The ids slot is only written in the operator's ids mode, so the mode has
+        # to match the sending rank's ``compute_gate``. It is declared here by the
         # receiving FFN rank through ``recv_input_ids`` rather than inferred from
         # the returned tensor: a genuine single-token layer would otherwise be
-        # indistinguishable from the operator's placeholder.
+        # indistinguishable from the operator's placeholder. Reading the slot in
+        # the other mode would hand the model uninitialised device memory as token
+        # ids, which a token-keyed router turns into an out-of-range table read.
         if custom_states.compute_gate_mode == 1:
             custom_states.input_ids = received_token_ids(
                 outputs[1],
