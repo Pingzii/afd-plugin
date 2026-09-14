@@ -39,6 +39,8 @@ from vllm_ascend.quantization.methods.w8a8_dynamic import (
     AscendW8A8DynamicFusedMoEMethod,
 )
 
+from afd_plugin.compat.vllm import TARGET_VLLM_VERSION
+
 _FORCE_LB_DETERMINISTIC_SEED = 1024
 
 
@@ -439,8 +441,48 @@ def apply(
     return final_hidden_states
 
 
-AscendW8A8DynamicFusedMoEMethod.__init__ = __init__
-AscendW8A8DynamicFusedMoEMethod.apply = apply
+def _is_target_vllm_compatible() -> bool:
+    """Return whether the installed vLLM matches this patch's target.
+
+    This patch copies whole ``AscendW8A8DynamicFusedMoEMethod`` bodies and
+    imports private vLLM-Ascend symbols, so it is only meaningful on the tested
+    runtime pairing. An unreadable version is treated as compatible because a
+    missing ``__version__`` attribute does not by itself prove a mismatch; a
+    readable version that differs from the target is rejected.
+    """
+
+    try:
+        import vllm
+
+        version_value = vllm.__version__
+    except (AttributeError, ImportError):
+        return True
+    version_text = str(version_value)
+    if "dev" in version_text:
+        return True
+    return version_text.startswith(TARGET_VLLM_VERSION)
+
+
+# Force load balance is an opt-in profiling switch. If the guard skips it the
+# model silently keeps its own routing, so record the decision for a runtime-side
+# check instead of relying on the best-effort patch import in register_afd().
+_AFD_FORCE_LOAD_BALANCE_PATCH_APPLIED = _is_target_vllm_compatible()
+
+if _AFD_FORCE_LOAD_BALANCE_PATCH_APPLIED:
+    # Keep the first captured upstream callables so a repeated application
+    # cannot overwrite a saved original with the AFD wrapper. ``getattr`` is
+    # deliberate: the patch replaces these methods rather than requiring them to
+    # pre-exist, so a class that does not define one has nothing to preserve.
+    if not hasattr(AscendW8A8DynamicFusedMoEMethod, "_afd_original_init"):
+        original_init = getattr(AscendW8A8DynamicFusedMoEMethod, "__init__", None)
+        if original_init is not None:
+            AscendW8A8DynamicFusedMoEMethod._afd_original_init = original_init
+        original_apply = getattr(AscendW8A8DynamicFusedMoEMethod, "apply", None)
+        if original_apply is not None:
+            AscendW8A8DynamicFusedMoEMethod._afd_original_apply = original_apply
+
+    AscendW8A8DynamicFusedMoEMethod.__init__ = __init__
+    AscendW8A8DynamicFusedMoEMethod.apply = apply
 
 
 __all__: list[str] = []

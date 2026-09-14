@@ -72,10 +72,8 @@ pythonpath = ["."]
 addopts = "-q"
 markers = [
     "vllm_runtime: tests requiring an importable vLLM runtime dependency.",
-    "gpu: GPU-gated AFD integration tests.",
     "npu: NPU-gated AFD integration tests.",
     "e2e: full end-to-end tests requiring model weights and hardware.",
-    "eval: accuracy/evaluation tests requiring datasets.",
     "slow: tests that take more than 120 seconds.",
 ]
 
@@ -120,6 +118,10 @@ ignore_missing_imports = true
 check_untyped_defs = true
 follow_imports = "silent"
 
+# Ty is configured but deliberately not wired into pre-commit or CI yet.
+# `ty check afd_plugin` still reports diagnostics that predate this
+# configuration, so adding a hook today would fail the build. Wire it only after
+# those findings are resolved or explicitly ignored.
 [tool.ty]
 
 [tool.ty.analysis]

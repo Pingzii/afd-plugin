@@ -482,3 +482,50 @@ def test_engine_core_ffn_start_rpc_failure_emits_no_readiness_log(monkeypatch, c
         engine.run_busy_loop()
 
     assert "AFD FFN EngineCore started; workers run connector loop." not in caplog.text
+
+
+def test_engine_core_patch_skips_application_on_other_vllm_version(
+    monkeypatch,
+    caplog,
+):
+    core_module = _install_fake_vllm_core(monkeypatch)
+    vllm_module = sys.modules["vllm"]
+    vllm_module.__version__ = "0.99.0"
+    original_init = core_module.EngineCore.__init__
+
+    patch_module = _load_patch_module()
+    with caplog.at_level(logging.WARNING, logger="fake-vllm-core"):
+        importlib.reload(patch_module)
+
+    assert patch_module._AFD_ENGINE_CORE_PATCH_APPLIED is False
+    assert core_module.EngineCore.__init__ is original_init
+    assert not hasattr(core_module.EngineCore, "_afd_original_init")
+    assert "AFD EngineCore patch skipped" in caplog.text
+
+
+def test_engine_core_patch_applies_on_target_vllm_version(monkeypatch):
+    core_module = _install_fake_vllm_core(monkeypatch)
+    vllm_module = sys.modules["vllm"]
+    vllm_module.__version__ = "0.26.0"
+    original_init = core_module.EngineCore.__init__
+
+    patch_module = _load_patch_module()
+    importlib.reload(patch_module)
+
+    assert patch_module._AFD_ENGINE_CORE_PATCH_APPLIED is True
+    assert core_module.EngineCore.__init__ is not original_init
+    assert core_module.EngineCore._afd_original_init is original_init
+
+
+def test_engine_core_patch_keeps_first_saved_original_on_reapply(monkeypatch):
+    core_module = _install_fake_vllm_core(monkeypatch)
+    sys.modules["vllm"].__version__ = "0.26.0"
+
+    patch_module = _load_patch_module()
+    importlib.reload(patch_module)
+    first_saved = core_module.EngineCore._afd_original_init
+
+    # Re-applying the patch must not capture the AFD wrapper as the "original".
+    importlib.reload(patch_module)
+    assert core_module.EngineCore._afd_original_init is first_saved
+    assert core_module.EngineCore.__init__ is patch_module.__init__

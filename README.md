@@ -65,7 +65,8 @@ Connector implementations are grouped by backend package:
 Known gaps:
 
 - vLLM versions other than `0.26.0` are not claimed as supported.
-- vLLM/vLLM-Ascend model runner v2 is not supported.
+- Model runner v2 is not supported on Ascend NPU. CUDA has a deliberately narrow
+  v2 channel; see [Model runner v2](#model-runner-v2).
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
 - Native DBO is limited to exactly two ubatches and is not supported by
@@ -177,8 +178,9 @@ or standard Ascend NPU platform. Explicit AFD worker paths remain accepted for
 compatibility with existing commands, but are not required or stable launch
 interfaces.
 
-GPU model runner v2 is not supported. Select model runner v1 before starting
-either GPU role:
+The upstream runtime selects the v1 or v2 model runner; see
+[Model runner v2](#model-runner-v2) for the supported combinations. To start
+either GPU role on the v1 path explicitly:
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -251,6 +253,33 @@ uv run python tests/e2e/runner.py \
 
 For NPU, use `--device-backend npu`; the runner maps the same device arguments
 to `ASCEND_RT_VISIBLE_DEVICES` and selects `CAMP2pAFDConnector`.
+
+## Model runner v2
+
+Model runner v2 is an upstream runtime selection (`VLLM_USE_V2_MODEL_RUNNER`),
+not an AFD configuration key. Only Attention adopts a native v2 runner; FFN stays
+connector-driven on the existing AFD runner and uses v2 only as a construction
+seam. Both roles validate the paired deployment before communication resources
+are created, so an unsupported combination fails at startup rather than during
+serving.
+
+The supported v2 deployment is deliberately narrow:
+
+| Constraint | Requirement |
+| --- | --- |
+| Platform and connector | CUDA with synchronous `P2pNcclAFDConnector`. Ascend NPU v2 is not supported. |
+| Gate placement | `compute_gate_on_attention=false` |
+| Parallelism | PP = PCP = DCP = 1; each role's configured rank count equals its DP x TP; static expert parallelism |
+| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, compile SP, DBO, and ubatching |
+| Graph execution | Eager or `FULL_DECODE_ONLY` |
+| Model | Must resolve to a registered AFD architecture |
+
+Repository CUDA v2 evidence covers DeepSeek-V2-Lite through the
+`afd-v2-eager-*` and `afd-v2-graph-*` 1A1F, DP2, and TP2 scenarios; see the
+[E2E test guide](tests/e2e/README.md#gpu-modelrunnerv2-evidence-matrix).
+The v2 scenarios additionally disable prefix caching, chunked prefill, and
+asynchronous scheduling. Ascend v2 has focused unit coverage but no repository
+hardware E2E case.
 
 ## AFD Config
 

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 import vllm.v1.engine.core as core_module
 
+from afd_plugin.compat.vllm import TARGET_VLLM_VERSION
 from afd_plugin.config import AFDConfig, is_afd_async_dp, parse_optional_afd_config
 
 if TYPE_CHECKING:
@@ -690,6 +691,31 @@ def _is_afd_ffn_config(vllm_config: VllmConfig | None) -> bool:
     return config is not None and config.role == "ffn"
 
 
+# Original upstream callables, captured before the AFD wrappers replace them.
+# Storing them on the upstream module keeps the pre-patch behavior available for
+# comparison and prevents a repeated patch application from overwriting a saved
+# original with an AFD wrapper.
+_ENGINE_CORE_PATCH_TARGETS: tuple[tuple[Any, str, Any], ...] = (
+    (core_module.EngineCore, "_afd_original_init", core_module.EngineCore.__init__),
+    (
+        core_module.EngineCore,
+        "_afd_original_initialize_kv_caches",
+        core_module.EngineCore._initialize_kv_caches,
+    ),
+    (core_module.EngineCore, "_afd_original_shutdown", core_module.EngineCore.shutdown),
+    (
+        core_module.EngineCoreProc,
+        "_afd_original_run_busy_loop",
+        core_module.EngineCoreProc.run_busy_loop,
+    ),
+    (
+        core_module.DPEngineCoreProc,
+        "_afd_original_dp_run_busy_loop",
+        core_module.DPEngineCoreProc.run_busy_loop,
+    ),
+)
+
+
 def _get_afd_config(vllm_config: VllmConfig | None) -> AFDConfig | None:
     existing = getattr(vllm_config, "afd_config", None)
     if isinstance(existing, AFDConfig):
@@ -704,12 +730,60 @@ def _get_afd_config(vllm_config: VllmConfig | None) -> AFDConfig | None:
         return None
 
 
-core_module.EngineCore.__init__ = __init__
-core_module.EngineCore._initialize_kv_caches = _initialize_kv_caches
-core_module.EngineCore.shutdown = shutdown
-core_module.EngineCoreProc.run_busy_loop = run_busy_loop
-core_module.DPEngineCoreProc.run_busy_loop = run_busy_loop
-core_module.logger.debug("AFD EngineCore patch applied")
+def _is_target_vllm_compatible() -> bool:
+    """Return whether the installed vLLM matches this patch's targets.
+
+    An unreadable version is treated as compatible, because a missing
+    ``__version__`` attribute does not by itself prove a version mismatch. A
+    readable version that differs from the target is rejected: this module
+    replaces ``EngineCore`` lifecycle methods whose upstream bodies change
+    across releases, so applying it on an untested version is unsafe.
+    """
+
+    try:
+        import vllm
+
+        version_value = vllm.__version__
+    except (AttributeError, ImportError):
+        return True
+    version_text = str(version_value)
+    if "dev" in version_text:
+        return True
+    return version_text.startswith(TARGET_VLLM_VERSION)
+
+
+def _install_engine_core_patch() -> None:
+    """Install the AFD EngineCore patch once, keeping the upstream originals."""
+
+    for owner, attr, target in _ENGINE_CORE_PATCH_TARGETS:
+        if not hasattr(owner, attr):
+            setattr(owner, attr, target)
+
+    engine_core_cls = core_module.EngineCore
+    engine_core_proc_cls = core_module.EngineCoreProc
+    dp_engine_core_proc_cls = core_module.DPEngineCoreProc
+
+    engine_core_cls.__init__ = __init__
+    engine_core_cls._initialize_kv_caches = _initialize_kv_caches
+    engine_core_cls.shutdown = shutdown
+    engine_core_proc_cls.run_busy_loop = run_busy_loop
+    dp_engine_core_proc_cls.run_busy_loop = run_busy_loop
+    core_module.logger.debug("AFD EngineCore patch applied")
+
+
+# The AFD FFN daemon depends on these replacements. If the guard skips them,
+# FFN EngineCore would run the unpatched upstream scheduler/KV startup path, so
+# record the decision for a runtime-side check instead of failing silently.
+_AFD_ENGINE_CORE_PATCH_APPLIED = _is_target_vllm_compatible()
+
+if _AFD_ENGINE_CORE_PATCH_APPLIED:
+    _install_engine_core_patch()
+else:
+    core_module.logger.warning(
+        "AFD EngineCore patch skipped: installed vLLM is not %s; AFD FFN "
+        "connector-daemon mode is unavailable on this runtime",
+        TARGET_VLLM_VERSION,
+    )
 
 
 __all__: list[str] = []

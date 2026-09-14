@@ -11,7 +11,8 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 ## Prerequisites
 
 - Install [NIXL](https://github.com/ai-dynamo/nixl).
-- At least 4 GPUs(A/H-class, tested against L20X).
+- At least 4 GPUs(A/H-class, tested against L20X). The `4a4f_*` colocation
+  scripts need 8 GPUs (Attention on 0-3, FFN on 4-7).
 - vLLM `v0.26.0` and the `afd-plugin` package installed in the same
   environment (see repository root `AGENTS.md`).
 - DeepSeek-V2-Lite weights on disk. All scripts default to
@@ -22,18 +23,21 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 
 ## Directory layout
 
-```
+```text
 .
-├── prefill_decode_disaggregation/        # prefill_decode_disaggregation, 2P1A1F topology
+├── prefill_decode_disaggregation/         # 2P1A1F: 1 prefill + Attention + FFN + proxy
 │   ├── 2p1a1f_eager_dbo.sh
 │   └── 2p1a1f_graph_dbo.sh
-└── prefill_decode_colocation/             # prefill_decode_colocation, 2A2F topology
+└── prefill_decode_colocation/             # AFD Attention/FFN colocated, no PD split
     ├── 2a2f_eager_dbo_dp1tp2.sh
     ├── 2a2f_eager_dbo_dp2tp1.sh
     ├── 2a2f_graph_dbo_dp1tp2.sh
-    └── 2a2f_graph_dbo_dp2tp1.sh
+    ├── 2a2f_graph_dbo_dp2tp1.sh
+    ├── 4a4f_eager_dbo_dp2tp2.sh            # needs 8 GPUs
+    └── 4a4f_graph_dbo_dp2tp2.sh            # needs 8 GPUs
 ```
-### 1. Prefill/Decode Disaggregation — `1a1f`
+
+### 1. Prefill/Decode Disaggregation — `2P1A1F`
 
 5 processes, 4 GPU workers + 1 proxy server:
 
@@ -45,8 +49,7 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 | 3    | Decode (FFN)        | 18304 |
 | /    | Proxy Server        | 18305 |
 
-
-### 2. Prefill/Decode Colocation — `2a2f`
+### 2. Prefill/Decode Colocation — `2A2F`
 
 2 processes, two GPUs each:
 
@@ -55,12 +58,15 @@ End-to-end launch scripts for running DeepSeek-V2-Lite with the AFD
 | 0, 1 | Attention | 18305 |
 | 2, 3 | FFN       | 18305 |
 
-The four variants cover the TP/DP cross product:
+The four `2a2f_*` variants cover the TP/DP cross product:
 
 | File                            | DP | TP |
 |---------------------------------|----|----|
 | `2a2f_*_dp1tp2.sh`              | 1  | 2  |
 | `2a2f_*_dp2tp1.sh`              | 2  | 1  |
+
+The two `4a4f_*` variants use DP=2/TP=2 on both roles and need 8 GPUs
+(Attention on devices 0-3, FFN on 4-7).
 
 ## Running
 
@@ -71,6 +77,7 @@ Wait for `attn.log` (and `afd_prefill0.log`, `afd_prefill1.log` in disaggregatio
 before sending traffic.
 
 ### prefill_decode_colocation
+
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -91,17 +98,15 @@ Once the serving stack is up, run:
 
 ```bash
 export MODEL_PATH=/path/model_weights/DeepSeek-V2-Lite
-export MODEL_NAME=$MODEL_PATH
 export RESULT_DIR=/tmp/results
 export RESULT_FILENAME=2a2f_graph_dbo_dp1tp2.json
-bash tools/benchmarks/benchmark.sh
+bash tools/benchmarks/request_generator.sh
 ```
 
-The script waits for `http://$HOST:$PORT/v1/models`, sends one completion
-smoke request, then runs `vllm bench serve`. By default it fires 1024 random
-requests (1024 input tokens / 128 output tokens) at request rate 5 with
-`--max-concurrency 32` against `127.0.0.1:18305`, and dumps the JSON result to
-`$RESULT_DIR/$RESULT_FILENAME`. Override `HOST`, `PORT`, `MODEL_NAME`,
+The script runs `vllm bench serve` against `127.0.0.1:18305`. By default it
+fires 1024 random requests (1024 input tokens / 128 output tokens) at request
+rate 5 with `--max-concurrency 32`, and dumps the JSON result to
+`$RESULT_DIR/$RESULT_FILENAME`. Override `HOST`, `PORT`, `MODEL_PATH`,
 `NUM_PROMPTS`, `REQUEST_RATE`, `MAX_CONCURRENCY`, `INPUT_LEN`, and `OUTPUT_LEN`
 for smaller smoke runs or larger throughput sweeps.
 
@@ -132,7 +137,7 @@ and deployment configuration.
 
 Graph mode replaces `--enforce-eager` with:
 
-```
+```text
 --max-cudagraph-capture-size 64
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY",
                        "cudagraph_capture_sizes":[64]}'

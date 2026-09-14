@@ -6,7 +6,7 @@ steps:
       - label: "Simple · Unit Test"
         timeout_in_minutes: 20
         commands:
-          - 'pytest -sv tests/unit -m "not gpu and not vllm_runtime"'
+          - 'pytest -sv tests/unit -m "not vllm_runtime"'
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: E2E Test"

@@ -6,7 +6,7 @@ environment that uses the versions pinned by this repository.
 From the repository root, run:
 
 ```bash
-python3 -m pytest -q tests/unit -m "not gpu and not vllm_runtime"
+python3 -m pytest -q tests/unit -m "not vllm_runtime"
 ```
 
 The suite covers the NPU worker and model-runner contracts, CAM connector
