@@ -5083,6 +5083,7 @@ vllm = [
 [package.dev-dependencies]
 dev = [
     { name = "datasets" },
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -5097,6 +5098,7 @@ provides-extras = ["vllm"]
 [package.metadata.requires-dev]
 dev = [
     { name = "datasets", specifier = ">=3.0" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=0.26" },
     { name = "pre-commit", specifier = ">=4" },
     { name = "pytest", specifier = ">=7.0" },

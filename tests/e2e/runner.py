@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Run DeepSeek-V2-Lite DeepEP baseline and AFD E2E scenarios."""
+"""Run fixed baseline and AFD E2E scenarios on real hardware."""
 
 from __future__ import annotations
 
@@ -22,6 +22,15 @@ from tests.e2e.accuracy.gsm8k import (
     _extract_gsm8k_accuracy,
     _extract_gsm8k_sample_count,
     _run_lm_eval,
+)
+from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
+from tests.e2e.models.deepseek_v4_flash.completions import evaluate_completions
+from tests.e2e.models.deepseek_v4_flash.config import (
+    DSV4_ASYNC_CAM_SCENARIO,
+    DSV4_ATTENTION_RANKS,
+    DSV4_ATTENTION_TP_SIZE,
+    DSV4_FFN_RANKS,
+    DSV4_PROCESS_TERMINATION_TIMEOUT_S,
 )
 from tests.e2e.process_utils import (
     kill_processes_matching_environment,
@@ -183,6 +192,8 @@ def main() -> int:
 
         if args.scenario == ASYNC_CAM_SCENARIO:
             run_completion_evaluation(args)
+        elif args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+            run_concurrent_completion_evaluation(args)
         else:
             run_gsm8k_evaluation(args)
 
@@ -202,6 +213,11 @@ def main() -> int:
                 try:
                     terminate_processes(
                         processes,
+                        termination_timeout_s=(
+                            DSV4_PROCESS_TERMINATION_TIMEOUT_S
+                            if args.scenario == DSV4_ASYNC_CAM_SCENARIO
+                            else PROCESS_TERMINATION_TIMEOUT_S
+                        ),
                         deferred_sigkill_pgids=deferred_sigkill_pgids,
                         force_kill_environment=(
                             {
@@ -218,7 +234,15 @@ def main() -> int:
                             thread.join(timeout=LOG_THREAD_JOIN_TIMEOUT_S)
                     finally:
                         for signum, previous_handler in previous_handlers.items():
-                            signal.signal(signum, previous_handler)
+                            # Preloaded native libraries can install handlers
+                            # unknown to Python (getsignal returns None). Python
+                            # cannot restore those; reset to the OS default.
+                            signal.signal(
+                                signum,
+                                signal.SIG_DFL
+                                if previous_handler is None
+                                else previous_handler,
+                            )
             except BaseException as exc:
                 cleanup_error = exc
         finally:
@@ -240,7 +264,7 @@ def main() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a manual DeepSeekV2 AFD E2E smoke test.",
+        description="Run a fixed baseline or AFD E2E scenario.",
     )
     parser.add_argument(
         "--model",
@@ -259,10 +283,15 @@ def parse_args() -> argparse.Namespace:
             "afd-graph-dbo-2a2f",
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
+            DSV4_ASYNC_CAM_SCENARIO,
             *V2_SCENARIOS,
         ],
         required=True,
         help="Fixed E2E scenario to run.",
+    )
+    parser.add_argument(
+        "--completion-output-path",
+        help="JSON file containing the ten concurrent DSV4 requests and responses.",
     )
     parser.add_argument(
         "--gsm8k-output-path",
@@ -362,6 +391,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
     """Set topology and features for the selected fixed scenario."""
     is_async_cam = args.scenario == ASYNC_CAM_SCENARIO
     is_async_ubatch = args.scenario == ASYNC_UBATCH_SCENARIO
+    is_dsv4 = args.scenario == DSV4_ASYNC_CAM_SCENARIO
     scenario_settings = {
         "baseline-graph": (True, True, False, 4, 0),
         "afd-eager-2a1f": (False, False, False, 2, 1),
@@ -384,6 +414,13 @@ def configure_scenario(args: argparse.Namespace) -> None:
             ASYNC_UBATCH_ATTENTION_RANKS,
             ASYNC_UBATCH_FFN_RANKS,
         ),
+        DSV4_ASYNC_CAM_SCENARIO: (
+            False,
+            False,
+            False,
+            DSV4_ATTENTION_RANKS,
+            DSV4_FFN_RANKS,
+        ),
         "afd-v2-eager-1a1f": (False, False, False, 1, 1),
         "afd-v2-eager-dp2": (False, False, False, 2, 2),
         "afd-v2-eager-tp2": (False, False, False, 2, 2),
@@ -400,7 +437,9 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.num_attention_ranks = attention_ranks
     args.num_ffn_ranks = ffn_ranks
     args.tp_size = 1
-    if is_async_cam:
+    if is_dsv4:
+        args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
+    elif is_async_cam:
         args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
     elif is_async_ubatch:
         args.attention_tp_size = ASYNC_UBATCH_ATTENTION_TP_SIZE
@@ -429,7 +468,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
             raise ValueError(
                 "ModelRunnerV2 E2E scenarios do not support decode-bench connector",
             )
-    if not is_async_cam and args.gsm8k_output_path is None:
+    if not is_async_cam and not is_dsv4 and args.gsm8k_output_path is None:
         raise ValueError("--gsm8k-output-path is required for GSM8K scenarios")
     if is_async_cam:
         args.afd_connector = ASYNC_AFD_CONNECTOR
@@ -467,6 +506,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
             for arg in args.common_vllm_arg
         ):
             args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
+    if is_dsv4:
+        dsv4_config.configure_scenario(args)
     if use_graph:
         args.cudagraph_capture_size = 8
     if enable_dbo:
@@ -509,7 +550,12 @@ def validate_topology(
     if args.use_v2_model_runner and args.device_backend != "gpu":
         raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
     if (
-        args.scenario in (ASYNC_CAM_SCENARIO, ASYNC_UBATCH_SCENARIO)
+        args.scenario
+        in (
+            ASYNC_CAM_SCENARIO,
+            ASYNC_UBATCH_SCENARIO,
+            DSV4_ASYNC_CAM_SCENARIO,
+        )
         and args.device_backend != "npu"
     ):
         raise ValueError("async CAM scenarios require NPU")
@@ -591,7 +637,7 @@ def build_vllm_command(
         "CAMP2pAFDConnector" if is_npu else "P2pNcclAFDConnector"
     )
 
-    afd_config = {
+    afd_config: dict[str, Any] = {
         "afd": {
             "role": role,
             "connector": connector,
@@ -610,6 +656,8 @@ def build_vllm_command(
     )
     if connector_extra_config:
         afd_config["afd"]["connector_extra_config"] = connector_extra_config
+    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+        afd_config.update(dsv4_config.additional_config())
     cmd = [
         args.vllm_bin,
         "serve",
@@ -713,6 +761,7 @@ def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     return args.device_backend == "npu" and args.scenario in (
         ASYNC_CAM_SCENARIO,
         ASYNC_UBATCH_SCENARIO,
+        DSV4_ASYNC_CAM_SCENARIO,
     )
 
 
@@ -830,6 +879,14 @@ def run_completion_evaluation(args: argparse.Namespace) -> None:
     print(f"Completion response: {text}")
 
 
+def run_concurrent_completion_evaluation(args: argparse.Namespace) -> None:
+    evaluate_completions(
+        url=f"http://{args.api_host}:{attention_api_port(args)}/v1/chat/completions",
+        model=served_model_name(args, "attention"),
+        output_path=Path(args.completion_output_path),
+    )
+
+
 def build_env(
     visible_devices: str,
     args: argparse.Namespace,
@@ -859,6 +916,8 @@ def build_env(
     ):
         env.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
     env.pop("AFD_PLUGIN_EARLY_ENGINE_PATCH", None)
+    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+        env.update(dsv4_config.role_environment(role))
     current_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
         str(REPO_ROOT)
@@ -947,12 +1006,13 @@ def ensure_processes_alive(processes: list[subprocess.Popen[str]]) -> None:
 def terminate_processes(
     processes: list[subprocess.Popen[str]],
     *,
+    termination_timeout_s: float = PROCESS_TERMINATION_TIMEOUT_S,
     deferred_sigkill_pgids: tuple[int, ...] = (),
     force_kill_environment: dict[str, str] | None = None,
 ) -> None:
     failures = terminate_process_groups(
         processes,
-        termination_timeout_s=PROCESS_TERMINATION_TIMEOUT_S,
+        termination_timeout_s=termination_timeout_s,
         poll_interval_s=PROCESS_POLL_INTERVAL_S,
         reap_timeout_s=PROCESS_REAP_TIMEOUT_S,
         deferred_sigkill_pgids=deferred_sigkill_pgids,

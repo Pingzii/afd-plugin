@@ -48,6 +48,7 @@ afd = "afd_plugin:register_afd"
 [dependency-groups]
 dev = [
     "datasets>=3.0",
+    "httpx>=0.27",
     "huggingface_hub>=0.26",
     "pre-commit>=4",
     "pytest>=7.0",
