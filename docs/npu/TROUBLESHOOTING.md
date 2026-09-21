@@ -149,19 +149,28 @@ Python tensor diagnostics are intentionally skipped while TorchDynamo is
 compiling because operations such as `storage_offset()` and `data_ptr()` cannot
 be represented in its full graph.
 
-To make the operator stack synchronous while reproducing a device-side error,
-combine it with:
+Do not combine this diagnostic with ``ASCEND_LAUNCH_BLOCKING=1`` while ACL
+Graph is enabled. vLLM-Ascend rejects that combination during configuration
+validation because synchronous launch is incompatible with ACL Graph capture.
+Keep asynchronous launch enabled for a Graph reproduction:
 
 ```bash
-export ASCEND_LAUNCH_BLOCKING=1
+unset ASCEND_LAUNCH_BLOCKING
+# Setting it explicitly to 0 is also valid.
+export AFD_NPU_GRAPH_DIAGNOSTICS=1
 ```
+
+Use the framework's capture/replay boundary records to identify the failing
+graph and inspect the Ascend plog files (under ``$HOME/ascend/log/debug`` by
+default) for the device-side first error. ``ASCEND_LAUNCH_BLOCKING=1`` remains
+useful only for a separate eager-mode reproduction with ACL Graph disabled.
 
 The tensor records describe the CAMP2P A2E and AFD FFN boundaries around
 `compute_ffn_output`. They help correlate the failing graph, topology, transfer,
 and layer but do not by themselves prove that the last submitted operator is
 the root cause.
-Disable both variables after diagnosis because synchronous launches and verbose
-logging affect performance.
+Disable ``AFD_NPU_GRAPH_DIAGNOSTICS`` after diagnosis because verbose logging
+affects performance.
 
 ## FFN workers do not exit
 
