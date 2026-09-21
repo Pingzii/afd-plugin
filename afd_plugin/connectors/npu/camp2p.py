@@ -559,18 +559,24 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         forward_context.cam_afdtransfer_state = transfer_state
         forward_context.ubatch_idx = ubatch_idx
 
-        _log_camp2p_graph_tensors(
-            self,
-            event="a2e_send_submission",
-            layer_idx=metadata.layer_idx,
-            stage_idx=ubatch_idx,
-            batch_size=transfer_state.batch_size,
-            compute_gate=compute_gate,
-            hidden_states=hidden_states,
-            input_ids=input_ids,
-            expert_ids=expert_ids,
-            expert_scales=expert_scales,
-        )
+        # This method is part of the model's TorchDynamo fullgraph. Python
+        # tensor introspection (for example storage_offset/data_ptr) cannot be
+        # represented in that graph, even when diagnostics are disabled at
+        # runtime, because Dynamo first attempts to inline the helper. Keep the
+        # diagnostic call entirely outside compiled execution.
+        if not torch.compiler.is_compiling():
+            _log_camp2p_graph_tensors(
+                self,
+                event="a2e_send_submission",
+                layer_idx=metadata.layer_idx,
+                stage_idx=ubatch_idx,
+                batch_size=transfer_state.batch_size,
+                compute_gate=compute_gate,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                expert_ids=expert_ids,
+                expert_scales=expert_scales,
+            )
 
         torch.ops.vllm.afd_camp2p_send_attn_output(
             hidden_states,
@@ -727,20 +733,21 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 outputs[1],
                 expected_tokens=batch_size,
             )
-        _log_camp2p_graph_tensors(
-            self,
-            event="a2e_receive_outputs",
-            layer_idx=layer_idx,
-            stage_idx=ubatch_idx,
-            batch_size=batch_size,
-            compute_gate=compute_gate_mode,
-            hidden_states=outputs[0],
-            raw_received_ids=outputs[1],
-            received_input_ids=received_ids,
-            received_scales=outputs[2],
-            atten_batch_size=outputs[3],
-            active_mask=outputs[4],
-        )
+        if not torch.compiler.is_compiling():
+            _log_camp2p_graph_tensors(
+                self,
+                event="a2e_receive_outputs",
+                layer_idx=layer_idx,
+                stage_idx=ubatch_idx,
+                batch_size=batch_size,
+                compute_gate=compute_gate_mode,
+                hidden_states=outputs[0],
+                raw_received_ids=outputs[1],
+                received_input_ids=received_ids,
+                received_scales=outputs[2],
+                atten_batch_size=outputs[3],
+                active_mask=outputs[4],
+            )
         return AFDA2FTransferPayload(
             hidden_states=outputs[0],
             context=context,
@@ -993,7 +1000,7 @@ def _log_camp2p_graph_tensors(
     compute_gate: int,
     **tensors: object,
 ) -> None:
-    if not npu_graph_diagnostics_enabled():
+    if torch.compiler.is_compiling() or not npu_graph_diagnostics_enabled():
         return
     tensor_fields = " ".join(
         f"{name}={_describe_camp2p_tensor(value)}" for name, value in tensors.items()

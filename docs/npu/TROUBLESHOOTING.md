@@ -142,9 +142,12 @@ The diagnostic emits warning-level records prefixed with
 device-synchronize boundaries. Capture and eager forwards also report the A/F
 topology and ratio, world and role ranks, graph key, layer and stage indices,
 token counts, and tensor shape, stride, dtype, device, storage offset, data
-pointer, and contiguous state. CAMP2P records include the Attention-side A2E
-submission and all FFN-side A2E outputs, including the transported ids, scales,
-batch handle, and active mask.
+pointer, and contiguous state. Outside TorchDynamo fullgraph compilation,
+CAMP2P records include the Attention-side A2E submission. FFN-side A2E output
+records include the transported ids, scales, batch handle, and active mask.
+Python tensor diagnostics are intentionally skipped while TorchDynamo is
+compiling because operations such as `storage_offset()` and `data_ptr()` cannot
+be represented in its full graph.
 
 To make the operator stack synchronous while reproducing a device-side error,
 combine it with:
