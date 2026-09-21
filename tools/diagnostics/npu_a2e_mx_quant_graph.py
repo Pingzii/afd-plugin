@@ -361,17 +361,17 @@ def _run_rank(rank: int, config: RunConfig) -> None:
                 operator_batch_size=operator_batch_size,
             )
         torch.npu.synchronize()
-        _validate_ffn_payload(
-            rank=rank,
-            phase=phase,
-            config=config,
-            outputs=graph_outputs,
-        )
         print(
             f"rank={rank} phase=capture status=PASS "
             f"{_describe_outputs(rank, graph_outputs, graph_quantized)}",
             flush=True,
         )
+        if rank < config.ffn_ranks:
+            print(
+                f"rank={rank} phase=capture payload_validation=SKIP "
+                "reason=validate_after_replay",
+                flush=True,
+            )
 
         for replay_index in range(config.replays):
             phase = f"replay[{replay_index}]"
