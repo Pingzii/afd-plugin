@@ -37,6 +37,7 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
+from afd_plugin.envs import npu_graph_diagnostics_enabled
 from afd_plugin.v1.worker.attention_metadata import (
     _resolve_world_ranks,
 )
@@ -180,6 +181,14 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             graph_enabled=graph_enabled,
             graph_exists=graph_info is not None,
         )
+        _log_graph_dispatch(
+            self,
+            graph_key=graph_key,
+            run_mode=run_mode,
+            graph_exists=graph_info is not None,
+            cached_graphs=len(acl_graphs),
+            is_graph_replaying=is_graph_replaying,
+        )
         if run_mode is AFDGraphRunMode.REPLAY:
             assert graph_info is not None
             logger.debug(
@@ -187,7 +196,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 graph_key,
                 len(acl_graphs),
             )
+            _log_graph_boundary(self, event="replay_begin", graph_key=graph_key)
             graph_info["graph"].replay()
+            _log_graph_boundary(self, event="replay_submitted", graph_key=graph_key)
             return None
         if run_mode in (AFDGraphRunMode.WARMUP, AFDGraphRunMode.CAPTURE):
             return self.execute_ffn_step(
@@ -221,6 +232,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         is_graph_capturing: bool = False,
         update_connector_state: bool = True,
         is_profile: bool = False,
+        diagnostic_phase: str = "eager",
     ) -> torch.Tensor | None:
         if update_connector_state:
             assert self.connector.control_plane, (
@@ -244,6 +256,10 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         )
         stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
         rank_ffn_output = None
+        diagnostics_enabled = npu_graph_diagnostics_enabled()
+        diagnostic_graph_key = (
+            self._make_graph_key(dp_metadata_list) if diagnostics_enabled else ()
+        )
 
         for layer_idx in _ffn_layer_indices(self):
             for stage_idx in stage_ids:
@@ -297,11 +313,42 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     assert states, "Context.states must not be None"
                     _set_moe_layer_index(forward_context, layer_idx)
 
+                    if diagnostics_enabled:
+                        _log_ffn_tensor_diagnostics(
+                            self,
+                            event="before_compute",
+                            phase=diagnostic_phase,
+                            graph_key=diagnostic_graph_key,
+                            layer_idx=layer_idx,
+                            stage_idx=stage_idx,
+                            num_tokens=num_tokens,
+                            num_tokens_across_dp=num_tokens_across_dp,
+                            dp_num_tokens_across_dp=dp_num_tokens_across_dp,
+                            aclgraph_runtime_mode=aclgraph_runtime_mode,
+                            hidden_states=hidden_states,
+                            input_ids=received_input_ids,
+                        )
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
                         input_ids=received_input_ids,
                     )
+                    if diagnostics_enabled:
+                        _log_ffn_tensor_diagnostics(
+                            self,
+                            event="after_compute_submission",
+                            phase=diagnostic_phase,
+                            graph_key=diagnostic_graph_key,
+                            layer_idx=layer_idx,
+                            stage_idx=stage_idx,
+                            num_tokens=num_tokens,
+                            num_tokens_across_dp=num_tokens_across_dp,
+                            dp_num_tokens_across_dp=dp_num_tokens_across_dp,
+                            aclgraph_runtime_mode=aclgraph_runtime_mode,
+                            hidden_states=hidden_states,
+                            input_ids=received_input_ids,
+                            output=rank_ffn_output,
+                        )
                     _send_ffn_output(
                         self.connector,
                         rank_ffn_output,
@@ -391,6 +438,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 self._ffn_forward(
                     dp_metadata_list=dp_metadata_list,
                     is_graph_capturing=False,
+                    diagnostic_phase="warmup",
                 )
             else:
                 with graph_capture(device=self.device):
@@ -430,6 +478,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             return
 
         logger.debug("AFD NPU FFN capturing ACL graph for key=%s", graph_key)
+        _log_graph_boundary(self, event="capture_begin", graph_key=graph_key)
         graph = torch.npu.NPUGraph()
         logger.debug("AFD NPU FFN created NPUGraph for key=%s", graph_key)
         self.connector.control_plane.update_state_from_dp_metadata(
@@ -449,6 +498,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 aclgraph_runtime_mode=aclgraph_runtime_mode,
                 is_graph_capturing=is_attn_graph_capturing,
                 update_connector_state=False,
+                diagnostic_phase="capture",
             )
             logger.debug("AFD NPU FFN left _ffn_forward for key=%s", graph_key)
         self._acl_graphs[graph_key] = {
@@ -456,6 +506,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             "output": output,
         }
         logger.debug("AFD NPU FFN captured ACL graph for key=%s", graph_key)
+        _log_graph_boundary(self, event="capture_stored", graph_key=graph_key)
 
     def sample_tokens(
         self,
@@ -495,6 +546,120 @@ def _send_ffn_output(
         ffn_output.routed_output,
         context,
         **kwargs,
+    )
+
+
+def _log_graph_dispatch(
+    runner: AFDNPUFFNModelRunner,
+    *,
+    graph_key: tuple,
+    run_mode: AFDGraphRunMode,
+    graph_exists: bool,
+    cached_graphs: int,
+    is_graph_replaying: bool,
+) -> None:
+    if not npu_graph_diagnostics_enabled():
+        return
+    logger.warning(
+        "AFD NPU graph diagnostic; event=dispatch graph_key=%s run_mode=%s "
+        "graph_exists=%s cached_graphs=%s replay_requested=%s "
+        "world_rank=%s role_rank=%s attention_size=%s ffn_size=%s",
+        graph_key,
+        run_mode.value,
+        graph_exists,
+        cached_graphs,
+        is_graph_replaying,
+        runner.connector.world_rank,
+        runner.connector.topology.role_rank,
+        runner.connector.attn_size,
+        runner.connector.ffn_size,
+    )
+
+
+def _log_graph_boundary(
+    runner: AFDNPUFFNModelRunner,
+    *,
+    event: str,
+    graph_key: tuple,
+) -> None:
+    if not npu_graph_diagnostics_enabled():
+        return
+    logger.warning(
+        "AFD NPU graph diagnostic; event=%s graph_key=%s world_rank=%s "
+        "role_rank=%s attention_size=%s ffn_size=%s",
+        event,
+        graph_key,
+        runner.connector.world_rank,
+        runner.connector.topology.role_rank,
+        runner.connector.attn_size,
+        runner.connector.ffn_size,
+    )
+
+
+def _log_ffn_tensor_diagnostics(
+    runner: AFDNPUFFNModelRunner,
+    *,
+    event: str,
+    phase: str,
+    graph_key: tuple,
+    layer_idx: int,
+    stage_idx: int,
+    num_tokens: int,
+    num_tokens_across_dp: torch.Tensor,
+    dp_num_tokens_across_dp: torch.Tensor,
+    aclgraph_runtime_mode: CUDAGraphMode | None,
+    hidden_states: object,
+    input_ids: object,
+    output: object = None,
+) -> None:
+    if not npu_graph_diagnostics_enabled():
+        return
+    runtime_mode = (
+        aclgraph_runtime_mode.name if aclgraph_runtime_mode is not None else "NONE"
+    )
+    logger.warning(
+        "AFD NPU graph diagnostic; event=%s phase=%s graph_key=%s "
+        "world_rank=%s role_rank=%s attention_size=%s ffn_size=%s "
+        "layer=%s stage=%s num_tokens=%s ffn_token_counts=%s "
+        "dp_token_counts=%s aclgraph_runtime_mode=%s hidden_states=%s "
+        "input_ids=%s output=%s",
+        event,
+        phase,
+        graph_key,
+        runner.connector.world_rank,
+        runner.connector.topology.role_rank,
+        runner.connector.attn_size,
+        runner.connector.ffn_size,
+        layer_idx,
+        stage_idx,
+        num_tokens,
+        _to_int_list(num_tokens_across_dp),
+        _to_int_list(dp_num_tokens_across_dp),
+        runtime_mode,
+        _describe_tensor_value(hidden_states),
+        _describe_tensor_value(input_ids),
+        _describe_tensor_value(output),
+    )
+
+
+def _describe_tensor_value(value: object) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, AFDF2ATransferPayload):
+        return (
+            "AFDF2ATransferPayload("
+            f"routed_output={_describe_tensor_value(value.routed_output)}, "
+            f"shared_output={_describe_tensor_value(value.shared_output)})"
+        )
+    if not isinstance(value, torch.Tensor):
+        return f"{type(value).__name__}"
+    return (
+        "Tensor("
+        f"shape={tuple(value.shape)}, stride={tuple(value.stride())}, "
+        f"dtype={value.dtype}, device={value.device}, layout={value.layout}, "
+        f"storage_offset={value.storage_offset()}, data_ptr=0x{value.data_ptr():x}, "
+        f"numel={value.numel()}, element_size={value.element_size()}, "
+        f"contiguous={value.is_contiguous()})"
     )
 
 
