@@ -129,15 +129,21 @@ def _make_inputs(
             aggregate_tokens,
         )
 
-    hidden_states = torch.randn(
-        (config.local_tokens, config.hidden_size),
+    # Encode the source rank and row in every hidden-state row. This lets the
+    # FFN side verify that graph replay preserved both peer order and payload.
+    row_values = torch.arange(
+        config.local_tokens,
         dtype=torch.bfloat16,
         device="npu",
-    )
+    ) + rank * config.local_tokens
+    hidden_states = row_values.view(-1, 1).expand(-1, config.hidden_size)
+    hidden_states = hidden_states.contiguous()
     # DeepSeek-V4's attention-side gate mode transports repeated token ids in
     # the expert_ids slot and zeroes the unused scales slot.
+    token_base = (rank - config.ffn_ranks) * config.local_tokens
     token_ids = torch.arange(
-        config.local_tokens,
+        token_base,
+        token_base + config.local_tokens,
         dtype=torch.int32,
         device="npu",
     ).view(-1, 1)
@@ -197,6 +203,97 @@ def _describe_outputs(
     )
 
 
+def _assert_same_tensor(
+    *,
+    rank: int,
+    phase: str,
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> None:
+    actual_cpu = actual.detach().cpu()
+    if actual_cpu.shape == expected.shape and torch.equal(actual_cpu, expected):
+        return
+
+    mismatch = None
+    if actual_cpu.shape == expected.shape:
+        mismatch_indices = torch.nonzero(actual_cpu != expected, as_tuple=False)
+        if mismatch_indices.numel():
+            index = tuple(int(item) for item in mismatch_indices[0].tolist())
+            mismatch = (
+                f"first_mismatch={index} actual={actual_cpu[index]} "
+                f"expected={expected[index]}"
+            )
+    raise AssertionError(
+        f"rank={rank} phase={phase} payload={name} mismatch; "
+        f"actual_shape={tuple(actual_cpu.shape)} "
+        f"expected_shape={tuple(expected.shape)} {mismatch or ''}"
+    )
+
+
+def _validate_ffn_payload(
+    *,
+    rank: int,
+    phase: str,
+    config: RunConfig,
+    outputs: tuple[torch.Tensor, ...],
+) -> None:
+    if rank >= config.ffn_ranks:
+        return
+
+    source_ranks = [
+        rank + (peer_index + 1) * config.ffn_ranks
+        for peer_index in range(config.attention_ranks // config.ffn_ranks)
+    ]
+    expected_hidden_parts = []
+    expected_id_parts = []
+    for source_rank in source_ranks:
+        row_values = (
+            torch.arange(config.local_tokens, dtype=torch.bfloat16)
+            + source_rank * config.local_tokens
+        )
+        expected_hidden_parts.append(
+            row_values.view(-1, 1).expand(-1, config.hidden_size).contiguous()
+        )
+        token_base = (source_rank - config.ffn_ranks) * config.local_tokens
+        expected_ids = torch.arange(
+            token_base,
+            token_base + config.local_tokens,
+            dtype=torch.int32,
+        ).view(-1, 1)
+        expected_id_parts.append(expected_ids.repeat(1, config.topk))
+
+    expected_hidden = torch.cat(expected_hidden_parts)
+    expected_ids = torch.cat(expected_id_parts)
+    expected_scales = torch.zeros_like(expected_ids, dtype=torch.float32)
+    _assert_same_tensor(
+        rank=rank,
+        phase=phase,
+        name="hidden_states",
+        actual=outputs[0],
+        expected=expected_hidden,
+    )
+    _assert_same_tensor(
+        rank=rank,
+        phase=phase,
+        name="token_ids",
+        actual=outputs[1],
+        expected=expected_ids,
+    )
+    _assert_same_tensor(
+        rank=rank,
+        phase=phase,
+        name="scales",
+        actual=outputs[2],
+        expected=expected_scales,
+    )
+    print(
+        f"rank={rank} phase={phase} payload_validation=PASS "
+        f"source_ranks={source_ranks}",
+        flush=True,
+    )
+
+
 @torch.inference_mode()
 def _run_rank(rank: int, config: RunConfig) -> None:
     phase = "initialize"
@@ -236,6 +333,12 @@ def _run_rank(rank: int, config: RunConfig) -> None:
             operator_batch_size=operator_batch_size,
         )
         torch.npu.synchronize()
+        _validate_ffn_payload(
+            rank=rank,
+            phase=phase,
+            config=config,
+            outputs=eager_outputs,
+        )
         print(
             f"rank={rank} phase=eager status=PASS "
             f"{_describe_outputs(rank, eager_outputs, eager_quantized)}",
@@ -258,6 +361,12 @@ def _run_rank(rank: int, config: RunConfig) -> None:
                 operator_batch_size=operator_batch_size,
             )
         torch.npu.synchronize()
+        _validate_ffn_payload(
+            rank=rank,
+            phase=phase,
+            config=config,
+            outputs=graph_outputs,
+        )
         print(
             f"rank={rank} phase=capture status=PASS "
             f"{_describe_outputs(rank, graph_outputs, graph_quantized)}",
@@ -273,6 +382,12 @@ def _run_rank(rank: int, config: RunConfig) -> None:
             )
             graph.replay()
             torch.npu.synchronize()
+            _validate_ffn_payload(
+                rank=rank,
+                phase=phase,
+                config=config,
+                outputs=graph_outputs,
+            )
             print(
                 f"rank={rank} phase=replay index={replay_index} status=PASS",
                 flush=True,
