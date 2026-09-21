@@ -1781,6 +1781,24 @@ def test_npu_ffn_runner_graph_key_uses_ffn_aggregated_token_counts():
     )
 
 
+def test_npu_ffn_tensor_diagnostic_includes_layout_and_address():
+    _require_npu_runtime()
+    import torch
+
+    from afd_plugin.v1.worker.npu.ffn_model_runner import _describe_tensor_value
+
+    tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+    description = _describe_tensor_value(tensor)
+
+    assert "shape=(3, 4)" in description
+    assert "stride=(4, 1)" in description
+    assert "dtype=torch.float32" in description
+    assert "storage_offset=0" in description
+    assert f"data_ptr=0x{tensor.data_ptr():x}" in description
+    assert "contiguous=True" in description
+
+
 def test_npu_ffn_runner_falls_back_to_eager_on_acl_graph_miss(monkeypatch):
     _patch_ffn_forward_context(monkeypatch)
     runner = _new_ffn_runner()

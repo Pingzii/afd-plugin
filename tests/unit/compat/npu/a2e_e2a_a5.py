@@ -14,6 +14,7 @@ Environment:
     AFD_TEST_E        expert/FFN rank count, default 1
     AFD_TEST_A        attention rank count, default same as E
     AFD_TEST_WORLD    HCCL world size, default E + A
+    AFD_TEST_BATCH    token count on each Attention rank, default 16
     AFD_TEST_PORT     MASTER_PORT, default 29601
 """
 
@@ -188,11 +189,20 @@ def run_once(local_rank_id, ep_world_size):
     dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
 
     # Test parameters. Default is 1A1F (expert_rank_size=1, attention_rank_size=1).
-    batch_size = 16
+    local_batch_size = int(os.environ.get("AFD_TEST_BATCH", "16"))
     hidden_size = 512
     topk = 2
     expert_rank_size = int(os.environ.get("AFD_TEST_E", "1"))
     attention_rank_size = int(os.environ.get("AFD_TEST_A", expert_rank_size))
+    assert attention_rank_size % expert_rank_size == 0, (
+        "This sample currently requires A to be divisible by E"
+    )
+    attention_per_ffn = attention_rank_size // expert_rank_size
+    batch_size = (
+        local_batch_size
+        if rank >= expert_rank_size
+        else local_batch_size * attention_per_ffn
+    )
     aiv_num = 4
     data_type = torch.bfloat16
 
@@ -272,6 +282,10 @@ def run_once(local_rank_id, ep_world_size):
         print(f"  A2E simulate_expert_scales shape: {simulate_expert_scales.shape}")
         print(f"  A2E atten_batch_size shape: {atten_batch_size.shape}")
         print(f"  A2E x_active_mask_out shape: {x_active_mask_out.shape}")
+        assert tuple(expand_x.shape) == (batch_size, hidden_size), (
+            f"A2E aggregate shape mismatch: {expand_x.shape} vs "
+            f"({batch_size}, {hidden_size})"
+        )
 
     dist.destroy_process_group()
 

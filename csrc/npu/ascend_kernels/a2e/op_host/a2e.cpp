@@ -136,7 +136,13 @@ namespace ge {
         int expertRankSize = *(attrPointers->GetInt(ATTR_ENUM_EP_RANK_SIZE));
         int attentionRankSize = *(attrPointers->GetInt(ATTR_ENUM_ATTN_RANK_SIZE));
         int rank = *(attrPointers->GetInt(ATTR_ENUM_RANK));
-        batchSize = batchSize * (attentionRankSize + expertRankSize - 1) / expertRankSize;
+
+        // On an FFN rank, batch_size is already the total number of tokens
+        // received from all Attention ranks mapped to it.  The kernel splits
+        // that total by the A/F ratio before copying each peer, so multiplying
+        // it by the ratio here makes the Graph-visible output shape larger than
+        // both the PyTorch wrapper allocation and the number of rows written by
+        // the kernel.  Keep the host shape contract identical to those paths.
 
         gert::Shape* expandXShape = context->GetOutputShape(0);
         expandXShape->SetDimNum(2);
@@ -150,7 +156,7 @@ namespace ge {
 
         gert::Shape* simulateExpertIdsShape = context->GetOutputShape(1);
         simulateExpertIdsShape->SetDimNum(2);
-        if (rank < attentionRankSize) {
+        if (rank < expertRankSize) {
             simulateExpertIdsShape->SetDim(0, batchSize);
             simulateExpertIdsShape->SetDim(1, topk);
         } else {
@@ -160,7 +166,7 @@ namespace ge {
 
         gert::Shape* simulateExpertScalesShape = context->GetOutputShape(2);
         simulateExpertScalesShape->SetDimNum(2);
-        if (rank < attentionRankSize) {
+        if (rank < expertRankSize) {
             simulateExpertScalesShape->SetDim(0, batchSize);
             simulateExpertScalesShape->SetDim(1, topk);
         } else {
@@ -174,7 +180,7 @@ namespace ge {
 
         gert::Shape* xActiveMaskOutShape = context->GetOutputShape(4);
         xActiveMaskOutShape->SetDimNum(1);
-        if (rank < attentionRankSize) {
+        if (rank < expertRankSize) {
             xActiveMaskOutShape->SetDim(0, batchSize);
         } else {
             xActiveMaskOutShape->SetDim(0, 1);

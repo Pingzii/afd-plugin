@@ -163,6 +163,70 @@ def test_a2e_e2a_meta_contracts() -> None:
     )
 
 
+def test_a2e_e2a_meta_contracts_with_more_attention_ranks() -> None:
+    """A/F topology must not scale an already aggregated FFN batch twice."""
+    _load_ops_or_skip()
+
+    local_batch_size = 16
+    attention_rank_size = 2
+    expert_rank_size = 1
+    ffn_batch_size = local_batch_size * attention_rank_size
+    hidden_size = 32
+    topk = 2
+
+    ffn_x = torch.empty((0, hidden_size), device="meta", dtype=torch.bfloat16)
+    ffn_outputs = torch.ops.afd_ascend.a2e(
+        ffn_x,
+        None,
+        None,
+        ffn_batch_size,
+        hidden_size,
+        topk,
+        expert_rank_size,
+        attention_rank_size,
+        0,
+        "meta_group",
+        1,
+        0,
+    )
+    _assert_tensor_spec(
+        ffn_outputs[0],
+        (ffn_batch_size, hidden_size),
+        torch.bfloat16,
+        "meta",
+    )
+    _assert_tensor_spec(
+        ffn_outputs[1],
+        (ffn_batch_size, topk),
+        torch.int32,
+        "meta",
+    )
+
+    attention_ref = torch.empty(
+        (local_batch_size, hidden_size),
+        device="meta",
+        dtype=torch.bfloat16,
+    )
+    attention_output = torch.ops.afd_ascend.e2a(
+        attention_ref,
+        ffn_outputs[3],
+        local_batch_size,
+        hidden_size,
+        topk,
+        expert_rank_size,
+        attention_rank_size,
+        1,
+        "meta_group",
+        1,
+    )
+    _assert_tensor_spec(
+        attention_output,
+        (local_batch_size, hidden_size),
+        torch.bfloat16,
+        "meta",
+    )
+
+
 def _get_default_hccl_group_name(rank: int) -> str:
     import torch.distributed as dist
 

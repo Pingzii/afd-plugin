@@ -129,6 +129,37 @@ export ASCEND_LAUNCH_BLOCKING=1
 If the failure remains, disable sequence parallelism and verify the plain TP
 topology first.
 
+## Diagnose an NPU Graph failure on an FFN worker
+
+Enable the AFD Graph diagnostic before starting every FFN process:
+
+```bash
+export AFD_NPU_GRAPH_DIAGNOSTICS=1
+```
+
+The diagnostic emits warning-level records prefixed with
+`AFD NPU graph diagnostic`. They identify graph dispatch, capture, replay, and
+device-synchronize boundaries. Capture and eager forwards also report the A/F
+topology and ratio, world and role ranks, graph key, layer and stage indices,
+token counts, and tensor shape, stride, dtype, device, storage offset, data
+pointer, and contiguous state. CAMP2P records include the Attention-side A2E
+submission and all FFN-side A2E outputs, including the transported ids, scales,
+batch handle, and active mask.
+
+To make the operator stack synchronous while reproducing a device-side error,
+combine it with:
+
+```bash
+export ASCEND_LAUNCH_BLOCKING=1
+```
+
+The tensor records describe the CAMP2P A2E and AFD FFN boundaries around
+`compute_ffn_output`. They help correlate the failing graph, topology, transfer,
+and layer but do not by themselves prove that the last submitted operator is
+the root cause.
+Disable both variables after diagnosis because synchronous launches and verbose
+logging affect performance.
+
 ## FFN workers do not exit
 
 An idle async FFN worker can remain blocked in `async_dispatch_recv` during

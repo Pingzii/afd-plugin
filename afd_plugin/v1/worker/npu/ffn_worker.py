@@ -22,6 +22,7 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
+from afd_plugin.envs import npu_graph_diagnostics_enabled
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
@@ -187,7 +188,46 @@ class AFDNPUFFNWorker(NPUWorker):
                 is_profile=is_profile,
                 is_graph_replaying=is_graph_replaying,
             )
-            torch.npu.synchronize()
+            diagnostics_enabled = npu_graph_diagnostics_enabled()
+            graph_key = (
+                self.model_runner._make_graph_key(dp_metadata_list)
+                if diagnostics_enabled
+                else ()
+            )
+            if diagnostics_enabled:
+                logger.warning(
+                    "AFD NPU graph diagnostic; event=device_synchronize_begin "
+                    "graph_key=%s capture=%s warmup=%s replay=%s profile=%s",
+                    graph_key,
+                    is_attn_graph_capturing,
+                    is_warmup,
+                    is_graph_replaying,
+                    is_profile,
+                )
+            try:
+                torch.npu.synchronize()
+            except Exception:
+                if diagnostics_enabled:
+                    logger.exception(
+                        "AFD NPU graph diagnostic; event=device_synchronize_failed "
+                        "graph_key=%s capture=%s warmup=%s replay=%s profile=%s",
+                        graph_key,
+                        is_attn_graph_capturing,
+                        is_warmup,
+                        is_graph_replaying,
+                        is_profile,
+                    )
+                raise
+            if diagnostics_enabled:
+                logger.warning(
+                    "AFD NPU graph diagnostic; event=device_synchronize_end "
+                    "graph_key=%s capture=%s warmup=%s replay=%s profile=%s",
+                    graph_key,
+                    is_attn_graph_capturing,
+                    is_warmup,
+                    is_graph_replaying,
+                    is_profile,
+                )
 
     def raise_ffn_loop_error_if_any(self) -> None:
         error = self._ffn_loop_error

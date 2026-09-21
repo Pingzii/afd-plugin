@@ -55,6 +55,7 @@ from afd_plugin.distributed import (
     init_afd_process_group,
     topology_from_config,
 )
+from afd_plugin.envs import npu_graph_diagnostics_enabled
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -364,6 +365,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] = {}
         self.is_graph_capturing = False
         self.is_warmup = False
+        self.is_graph_replaying = False
         self.scheduler_config = vllm_config.scheduler_config
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.afd_pg_list: list[ProcessGroup] = []
@@ -557,6 +559,19 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         forward_context.cam_afdtransfer_state = transfer_state
         forward_context.ubatch_idx = ubatch_idx
 
+        _log_camp2p_graph_tensors(
+            self,
+            event="a2e_send_submission",
+            layer_idx=metadata.layer_idx,
+            stage_idx=ubatch_idx,
+            batch_size=transfer_state.batch_size,
+            compute_gate=compute_gate,
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            expert_ids=expert_ids,
+            expert_scales=expert_scales,
+        )
+
         torch.ops.vllm.afd_camp2p_send_attn_output(
             hidden_states,
             self.hccl_comm_name,
@@ -712,6 +727,20 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 outputs[1],
                 expected_tokens=batch_size,
             )
+        _log_camp2p_graph_tensors(
+            self,
+            event="a2e_receive_outputs",
+            layer_idx=layer_idx,
+            stage_idx=ubatch_idx,
+            batch_size=batch_size,
+            compute_gate=compute_gate_mode,
+            hidden_states=outputs[0],
+            raw_received_ids=outputs[1],
+            received_input_ids=received_ids,
+            received_scales=outputs[2],
+            atten_batch_size=outputs[3],
+            active_mask=outputs[4],
+        )
         return AFDA2FTransferPayload(
             hidden_states=outputs[0],
             context=context,
@@ -785,6 +814,7 @@ class CAMP2pAFDControlPlane(AFDControlPlane):
         connector.dp_metadata_list = payload.dp_metadata_list
         connector.is_graph_capturing = payload.is_graph_capturing
         connector.is_warmup = payload.is_warmup
+        connector.is_graph_replaying = payload.is_graph_replaying
 
     def send_dp_metadata_list(
         self,
@@ -951,6 +981,57 @@ def _get_group_ep(
     if ubatch_idx < 0:
         raise RuntimeError(f"CAMP2P ubatch index must be non-negative: {ubatch_idx}")
     return hccl_comm_name1
+
+
+def _log_camp2p_graph_tensors(
+    connector: CAMP2pAFDConnector,
+    *,
+    event: str,
+    layer_idx: int,
+    stage_idx: int,
+    batch_size: int,
+    compute_gate: int,
+    **tensors: object,
+) -> None:
+    if not npu_graph_diagnostics_enabled():
+        return
+    tensor_fields = " ".join(
+        f"{name}={_describe_camp2p_tensor(value)}" for name, value in tensors.items()
+    )
+    logger.warning(
+        "AFD NPU graph diagnostic; event=%s world_rank=%s role_rank=%s "
+        "attention_size=%s ffn_size=%s af_ratio=%s layer=%s stage=%s "
+        "batch_size=%s compute_gate=%s capture=%s warmup=%s replay=%s %s",
+        event,
+        connector.world_rank,
+        connector.topology.role_rank,
+        connector.attn_size,
+        connector.ffn_size,
+        connector.ratio,
+        layer_idx,
+        stage_idx,
+        batch_size,
+        compute_gate,
+        connector.is_graph_capturing,
+        connector.is_warmup,
+        connector.is_graph_replaying,
+        tensor_fields,
+    )
+
+
+def _describe_camp2p_tensor(value: object) -> str:
+    if value is None:
+        return "None"
+    if not isinstance(value, torch.Tensor):
+        return type(value).__name__
+    return (
+        "Tensor("
+        f"shape={tuple(value.shape)}, stride={tuple(value.stride())}, "
+        f"dtype={value.dtype}, device={value.device}, layout={value.layout}, "
+        f"storage_offset={value.storage_offset()}, data_ptr=0x{value.data_ptr():x}, "
+        f"numel={value.numel()}, element_size={value.element_size()}, "
+        f"contiguous={value.is_contiguous()})"
+    )
 
 
 def _register_camp2p_custom_ops() -> None:

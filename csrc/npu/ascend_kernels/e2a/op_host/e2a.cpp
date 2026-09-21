@@ -124,18 +124,16 @@ namespace ge {
         int expertRankSize = *(attrPointers->GetInt(ATTR_ENUM_EP_RANK_SIZE));
         int rank = *(attrPointers->GetInt(ATTR_ENUM_RANK));
 
-        int attentionRankSize = *(attrPointers->GetInt(ATTR_ENUM_ATTN_RANK_SIZE));
-
         gert::Shape* xShape = context->GetOutputShape(0);
         xShape->SetDimNum(TWO_DIMS);
         if (rank < expertRankSize) {
             xShape->SetDim(0, 1);
             xShape->SetDim(1, 1);
-        } else if (attentionRankSize <= expertRankSize) {
-            xShape->SetDim(0, batchSize);
-            xShape->SetDim(1, hiddenSize);
         } else {
-            xShape->SetDim(0, batchSize / (attentionRankSize / expertRankSize));
+            // Attention ranks pass their local token count.  The FFN kernel
+            // performs the A/F split before sending, so E2A must not divide the
+            // receiving rank's output shape by that ratio a second time.
+            xShape->SetDim(0, batchSize);
             xShape->SetDim(1, hiddenSize);
         }
 

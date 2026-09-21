@@ -113,6 +113,20 @@ def test_ascend_shared_kernel_headers_are_not_duplicated():
             assert not stale.exists(), stale
 
 
+def test_camp2p_host_shapes_do_not_rescale_role_batch_size():
+    """Host inference must match the PyTorch wrappers' local/aggregate contract."""
+    root = Path(__file__).resolve().parents[3]
+    a2e_host = (
+        root / "csrc/npu/ascend_kernels/a2e/op_host/a2e.cpp"
+    ).read_text()
+    e2a_host = (
+        root / "csrc/npu/ascend_kernels/e2a/op_host/e2a.cpp"
+    ).read_text()
+
+    assert "batchSize = batchSize *" not in a2e_host
+    assert "batchSize / (attentionRankSize / expertRankSize)" not in e2a_host
+
+
 def test_ascend_ops_build_is_disabled_by_default_on_gpu(
     monkeypatch: pytest.MonkeyPatch,
 ):
