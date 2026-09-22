@@ -15,7 +15,7 @@ examples.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -946,9 +946,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # the fallback rather than a caller-supplied value, because the Attention
         # ranks size the very same fallback and a different number here would make
         # the operator read rows no peer wrote.
-        batch_size = _num_tokens_for_ffn_rank(
+        batch_size = ffn_receive_rows(
             self.dp_token_counts.get(ubatch_idx, ()),
-            ffn_rank=self.role_rank,
+            self.role_rank,
             attention_size=self.attn_size,
             ffn_size=self.ffn_size,
             shard=self.attention_shard,
@@ -1208,48 +1208,6 @@ def _dp_stage_token_counts(
         )
         for stage_idx, metadata in dp_metadata_list.items()
     }
-
-
-def _num_tokens_for_ffn_rank(
-    stage_token_counts: Sequence[int],
-    *,
-    ffn_rank: int,
-    attention_size: int,
-    ffn_size: int,
-    shard: int,
-    fallback: int,
-) -> int:
-    """Count the rows that one FFN rank receives from Attention.
-
-    A2E gives an FFN rank one tile per Attention peer and reads the same row count
-    from every peer, so its total is ``attention_size // ffn_size`` tiles of the
-    row count those peers write (see :mod:`afd_plugin.a2e_layout`). The tile is
-    derived from the same counts, shard and fallback the Attention ranks use, and
-    this total is what the operator divides by its peer ratio to size one peer:
-    A2E does not read fewer rows when a receiver under-sizes itself, it reads rows
-    the sender never wrote, so the two sides have to agree on this number.
-
-    Args:
-        stage_token_counts: Per-DP-rank token counts of this stage.
-        ffn_rank: FFN rank whose token count is needed.
-        attention_size: Total number of Attention ranks.
-        ffn_size: Total number of FFN ranks.
-        shard: Divisor FlashComm v1 applies to one Attention rank's rows.
-        fallback: All-rank token count used when the counts cannot describe the
-            peer group; the Attention ranks size the same fallback tile.
-
-    Returns:
-        The number of rows this FFN rank receives, always at least one.
-    """
-
-    return ffn_receive_rows(
-        stage_token_counts,
-        ffn_rank,
-        attention_size=attention_size,
-        ffn_size=ffn_size,
-        shard=shard,
-        fallback=fallback,
-    )
 
 
 def _get_group_ep(
