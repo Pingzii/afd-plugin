@@ -1,0 +1,26 @@
+diff --git a/vllm_ascend/ops/fused_moe/experts_selector.py b/vllm_ascend/ops/fused_moe/experts_selector.py
+index aa9b4bae7..6842736ef 100644
+--- a/vllm_ascend/ops/fused_moe/experts_selector.py
++++ b/vllm_ascend/ops/fused_moe/experts_selector.py
+@@ -16,8 +16,9 @@
+ #
+ from collections.abc import Callable
+ 
+ import torch
+ import torch.nn.functional as F
++import torch_npu
+ from vllm.distributed import get_tp_group
+ from vllm.forward_context import get_forward_context
+ 
+@@ -266,7 +267,10 @@ def _select_experts_with_fusion_ops(
+         else:
+             input_ids = None
+             tid2eid_ones = None
+-        topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
++        # Use the CANN-maintained hash-capable routing operator. The legacy
++        # vLLM-Ascend custom kernel is no longer maintained and faults during
++        # ACL Graph replay on A5 for larger token rows.
++        topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
+             x=router_logits,
+             k=top_k,
+             bias=e_score_correction_bias,
