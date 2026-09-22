@@ -15,6 +15,7 @@ pytest.importorskip("torch_npu")
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors import (
     AFDConnectorFactory,
+    AFDControlPayload,
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
@@ -124,6 +125,23 @@ def _init_ffn_connector(rank, vllm_config):
     return connector
 
 
+def _publish_dp_metadata(connector, dp_metadata_list):
+    """Publish DP metadata the way the control plane does.
+
+    The connector derives its A2E tile from an integer snapshot that the control
+    plane takes when it publishes a payload, so knowing the counts means going
+    through the same path.
+    """
+
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload(
+            dp_metadata_list=dp_metadata_list,
+            is_graph_capturing=False,
+            is_warmup=False,
+        ),
+    )
+
+
 def test_camp2p_recv_attn_output_uses_the_padded_a2e_tile_layout(monkeypatch):
     torch = pytest.importorskip("torch")
     monkeypatch.setattr(
@@ -138,8 +156,8 @@ def test_camp2p_recv_attn_output_uses_the_padded_a2e_tile_layout(monkeypatch):
     dp_metadata_list = {0: _FakeDPMetadata([2, 2, 5, 7])}
     rank0 = _init_ffn_connector(0, _vllm_config())
     rank1 = _init_ffn_connector(1, _vllm_config())
-    rank0.dp_metadata_list = dp_metadata_list
-    rank1.dp_metadata_list = dp_metadata_list
+    _publish_dp_metadata(rank0, dp_metadata_list)
+    _publish_dp_metadata(rank1, dp_metadata_list)
 
     context0 = rank0.recv_attn_output(ubatch_idx=0, layer_idx=3).context
     context1 = rank1.recv_attn_output(ubatch_idx=0, layer_idx=3).context
@@ -176,7 +194,7 @@ def test_camp2p_recv_attn_output_drives_the_operator_ids_mode(monkeypatch):
 
     monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
     connector = _init_ffn_connector(0, _vllm_config())
-    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 2, 5, 5])}
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([2, 2, 5, 5])})
 
     with_ids = connector.recv_attn_output(
         ubatch_idx=0,
@@ -241,7 +259,7 @@ def test_camp2p_connector_uses_role_specific_core_num(monkeypatch):
             },
         ),
     )
-    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 2, 5, 5])}
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([2, 2, 5, 5])})
 
     states = connector.recv_attn_output(ubatch_idx=0, layer_idx=3).context.states
 

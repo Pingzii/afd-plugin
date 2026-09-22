@@ -15,7 +15,7 @@ examples.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -28,6 +28,7 @@ from vllm.forward_context import DPMetadata, get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from afd_plugin.a2e_layout import (
+    attention_rank_token_counts,
     ffn_rank_for_attention_rank,
     padded_ffn_token_counts,
     padded_tile_rows,
@@ -427,6 +428,10 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # ids channel carries are indices into them.
         self.vocab_size = int(hf_config.vocab_size)
         self.control_plane = CAMP2pAFDControlPlane(self)
+        # Per-stage, per-DP-rank token counts as plain integers. The control plane
+        # refreshes them whenever it publishes a payload; see
+        # ``_dp_stage_token_counts`` for why the tensors themselves are not read.
+        self.dp_token_counts: dict[int, tuple[int, ...]] = {}
 
     @property
     def is_initialized(self) -> bool:
@@ -541,16 +546,29 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.hccl_comm_name_list = []
         self._initialized = False
 
-    def _wire_rows_for_step(self, forward_context: Any, stage_idx: int) -> int | None:
-        """Return the tile row count A2E reads from this Attention rank.
+    def _padding_rows_for_step(
+        self,
+        forward_context: Any,
+        stage_idx: int,
+    ) -> int | None:
+        """Return the tile this Attention rank pads its payload up to, or ``None``.
 
         A2E reads the same number of rows from every Attention peer of an FFN
         rank, so this rank has to write that many rows. A FULL graph reports one
-        padded token count for the whole step, which every rank already writes.
-        Outside a FULL graph the DP counts are the only source and DP ranks hold
-        independent batches, so the peers of this rank's FFN rank may differ: the
-        tile is then the largest count of that peer group, which every peer in the
-        group derives from the same counts and therefore pads up to identically.
+        padded token count for the whole step and every rank runs that size, so
+        the report is the tile. Outside a FULL graph the DP counts are the only
+        source and DP ranks hold independent batches, so the peers of this rank's
+        FFN rank may differ: the tile is then the largest count of that peer
+        group, which every peer in the group derives from the same counts and
+        therefore pads up to identically. Only that group's tile is returned, so
+        the even step -- where every peer already writes the tile -- keeps its
+        payload without a copy.
+
+        Only the connector's integer snapshot of the counts is read here, never
+        the tensors themselves: this runs inside the traced model forward, where
+        the DP tensors are symbolic and any comparison against them fails the
+        data-dependent guard in ``torch.compile``.
+
         Returns ``None`` when the step keeps its own per-stage rows (an AFD
         ubatch) or when this rank's peer group cannot be derived, which leaves the
         payload at the row count the forward produced.
@@ -561,8 +579,6 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             return reported_rows
         if getattr(forward_context, "ubatch_slices", None):
             return None
-        # The connector state holds the counts this step publishes to the FFN
-        # role, so the tile derived here is the one the receiver reads.
         ffn_rank = ffn_rank_for_attention_rank(
             self.role_rank,
             attention_size=self.attn_size,
@@ -570,12 +586,21 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         )
         if ffn_rank is None:
             return None
-        return padded_tile_rows(
-            _dp_token_counts(self.dp_metadata_list.get(stage_idx)),
+        counts = attention_rank_token_counts(
+            self.dp_token_counts.get(stage_idx, ()),
+            attention_size=self.attn_size,
+        )
+        if counts is None or self.role_rank >= len(counts):
+            return None
+        tile_rows = padded_tile_rows(
+            counts,
             ffn_rank=ffn_rank,
             attention_size=self.attn_size,
             ffn_size=self.ffn_size,
         )
+        if tile_rows is None or tile_rows <= counts[self.role_rank]:
+            return None
+        return tile_rows
 
     def send_attn_output(
         self,
@@ -619,7 +644,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             )
         input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
         forward_context = get_forward_context()
-        wire_rows = self._wire_rows_for_step(forward_context, metadata.stage_idx)
+        wire_rows = self._padding_rows_for_step(forward_context, metadata.stage_idx)
         if (
             wire_rows is not None
             and not torch.compiler.is_compiling()
@@ -638,15 +663,11 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # the operator a payload of exactly that many rows: A2E reads one equal
         # tile per Attention peer in both directions, so a shorter payload would
         # leave the tail of this rank's ids and hidden-state regions unwritten and
-        # the receiving FFN would read the neighbouring regions as token ids. A
-        # FULL graph reports the padded count for the whole step; outside one the
-        # DP counts are the only source and they are uneven whenever the DP ranks
-        # hold different batches, so the payload is padded up to the largest count
-        # of this rank's peer group. The copy goes through a fixed-size buffer
-        # rather than a computed pad amount because the pad amount would have to
-        # read this payload's token count, which specializes the dimension the
-        # compiled model declares dynamic.
-        if wire_rows is not None and wire_rows > int(metadata.total_tokens):
+        # the receiving FFN would read the neighbouring regions as token ids. The
+        # copy goes through a fixed-size buffer rather than a computed pad amount
+        # because the pad amount would have to read this payload's token count,
+        # which specializes the dimension the compiled model declares dynamic.
+        if wire_rows is not None:
             hidden_states = self._wire_payload(
                 hidden_states,
                 wire_rows=wire_rows,
@@ -855,8 +876,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # and sizing the operator by that sum would leave its tail rows unwritten
         # (see :mod:`afd_plugin.a2e_layout`).
         batch_size = _num_tokens_for_ffn_rank(
-            self.dp_metadata_list,
-            ubatch_idx,
+            self.dp_token_counts.get(ubatch_idx, ()),
             ffn_rank=self.role_rank,
             attention_size=self.attn_size,
             ffn_size=self.ffn_size,
@@ -991,6 +1011,7 @@ class CAMP2pAFDControlPlane(AFDControlPlane):
     ) -> None:
         connector = self.connector
         connector.dp_metadata_list = payload.dp_metadata_list
+        connector.dp_token_counts = _dp_stage_token_counts(payload.dp_metadata_list)
         connector.is_graph_capturing = payload.is_graph_capturing
         connector.is_warmup = payload.is_warmup
 
@@ -1096,21 +1117,29 @@ def build_camp2p_topology(
     )
 
 
-def _dp_token_counts(
-    dp_metadata: DPMetadata | AFDDPMetadata | None,
-) -> list[int]:
-    """Return the per-DP-rank token counts of one stage as plain integers."""
+def _dp_stage_token_counts(
+    dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
+) -> dict[int, tuple[int, ...]]:
+    """Copy the per-DP-rank token counts of every stage into plain integers.
 
-    if dp_metadata is None:
-        return []
-    return [
-        int(count) for count in dp_metadata.num_tokens_across_dp_cpu.flatten().tolist()
-    ]
+    The counts are read once, where the control payload is published, because the
+    Attention model forward may be traced: inside a trace the DP tensors are
+    symbolic, so a connector that compared or summed those symbols would fail the
+    data-dependent guard in ``torch.compile``. Everything the connector derives
+    from the counts (the A2E tile and the rows an FFN rank computes on) is derived
+    from this snapshot instead of from the tensors.
+    """
+
+    return {
+        int(stage_idx): tuple(
+            int(count) for count in metadata.num_tokens_across_dp_cpu.flatten().tolist()
+        )
+        for stage_idx, metadata in dp_metadata_list.items()
+    }
 
 
 def _num_tokens_for_ffn_rank(
-    dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
-    stage_idx: int,
+    stage_token_counts: Sequence[int],
     *,
     ffn_rank: int,
     attention_size: int,
@@ -1121,14 +1150,13 @@ def _num_tokens_for_ffn_rank(
 
     A2E gives an FFN rank one tile per Attention peer and reads the same row count
     from every peer, so the peers pad their payloads up to the largest count of
-    their peer group (see :mod:`afd_plugin.a2e_layout`). The rows
-    this rank receives are therefore ``attention_size // ffn_size`` padded tiles
-    rather than the sum of the real counts. When TP creates several Attention
-    workers for one DP rank, each DP count first covers those TP workers.
+    their peer group (see :mod:`afd_plugin.a2e_layout`). The rows this rank
+    receives are therefore ``attention_size // ffn_size`` padded tiles rather
+    than the sum of the real counts. When TP creates several Attention workers for
+    one DP rank, each DP count first covers those TP workers.
 
     Args:
-        dp_metadata_list: Token counts received from Attention for each ubatch.
-        stage_idx: Ubatch number to inspect.
+        stage_token_counts: Per-DP-rank token counts of this stage.
         ffn_rank: FFN rank whose token count is needed.
         attention_size: Total number of Attention ranks.
         ffn_size: Total number of FFN ranks.
@@ -1139,7 +1167,7 @@ def _num_tokens_for_ffn_rank(
     """
 
     ffn_counts = padded_ffn_token_counts(
-        _dp_token_counts(dp_metadata_list.get(stage_idx)),
+        stage_token_counts,
         attention_size=attention_size,
         ffn_size=ffn_size,
     )
