@@ -15,8 +15,12 @@ import pytest
 from afd_plugin.a2e_layout import (
     attention_peer_ranks,
     attention_rank_token_counts,
+    attention_tile_rows,
+    fallback_tile_rows,
     ffn_rank_for_attention_rank,
-    padded_ffn_token_counts,
+    ffn_receive_rows,
+    ffn_tile_count,
+    flash_comm_shard,
     padded_tile_rows,
 )
 
@@ -102,42 +106,155 @@ class TestPaddedTile:
         assert padded_tile_rows([], ffn_rank=0, attention_size=4, ffn_size=2) is None
 
 
-class TestPaddedFfnTokenCounts:
-    def test_counts_one_padded_tile_per_attention_peer(self):
-        # 4A2F: two tiles per FFN rank, each the size of its group maximum.
-        assert padded_ffn_token_counts(
-            [4, 8, 16, 16], attention_size=4, ffn_size=2
-        ) == (
-            32,
-            32,
-        )
+class TestFfnReceiveRows:
+    def test_counts_one_tile_per_attention_peer(self):
+        # 4A2F: F0 owns {A0, A2} and F1 owns {A1, A3}, each receiving two tiles
+        # sized by its own group maximum.
+        assert ffn_receive_rows([4, 8, 16, 16], 0, attention_size=4, ffn_size=2) == 32
+        assert ffn_receive_rows([4, 8, 16, 16], 1, attention_size=4, ffn_size=2) == 32
 
     def test_keeps_even_groups_at_their_real_total(self):
-        assert padded_ffn_token_counts([6, 6, 6, 6], attention_size=4, ffn_size=2) == (
-            12,
-            12,
-        )
+        assert ffn_receive_rows([6, 6, 6, 6], 0, attention_size=4, ffn_size=2) == 12
+        assert ffn_receive_rows([6, 6, 6, 6], 1, attention_size=4, ffn_size=2) == 12
 
     def test_matches_the_single_tile_layout_when_the_sizes_match(self):
-        # 2A2F: one tile per FFN rank, so the padded total is the peer's count.
-        assert padded_ffn_token_counts([5, 7], attention_size=2, ffn_size=2) == (5, 7)
+        # 2A2F: one tile per FFN rank, so the receive is the peer's count.
+        assert ffn_receive_rows([5, 7], 0, attention_size=2, ffn_size=2) == 5
+        assert ffn_receive_rows([5, 7], 1, attention_size=2, ffn_size=2) == 7
 
     def test_expands_dp_counts_before_aggregating(self):
         # DP=1 with TP=2 replicates the single count over both Attention ranks.
-        assert padded_ffn_token_counts([8], attention_size=2, ffn_size=2) == (8, 8)
+        assert ffn_receive_rows([8], 0, attention_size=2, ffn_size=2) == 8
+        assert ffn_receive_rows([8], 1, attention_size=2, ffn_size=2) == 8
+
+    def test_divides_the_receive_by_the_flash_comm_shard(self):
+        # 4A2F over 2 TP workers: two tiles of 24 / 2 = 12 rows per FFN rank.
+        rows = ffn_receive_rows([24, 24], 0, attention_size=4, ffn_size=2, shard=2)
+        assert rows == 24
+
+    def test_sizes_a_missing_counts_step_by_the_shared_fallback(self):
+        assert (
+            ffn_receive_rows([], 0, attention_size=4, ffn_size=2, shard=2, fallback=64)
+            == 64
+        )
 
     @pytest.mark.parametrize(
         ("attention_size", "ffn_size"),
         [(2, 4), (3, 2), (4, 0)],
     )
-    def test_returns_none_for_a_topology_it_cannot_describe(
+    def test_falls_back_to_one_tile_for_a_topology_it_cannot_describe(
         self,
         attention_size,
         ffn_size,
     ):
+        # One tile of the all-rank fallback, which is the tile the Attention ranks
+        # derive for the same topology.
         assert (
-            padded_ffn_token_counts(
-                [4, 4], attention_size=attention_size, ffn_size=ffn_size
+            ffn_receive_rows(
+                [4, 4],
+                0,
+                attention_size=attention_size,
+                ffn_size=ffn_size,
+                fallback=16,
             )
-            is None
+            == 16
         )
+
+
+class TestFlashCommShard:
+    def test_keeps_the_dp_count_when_a_rank_holds_all_of_it(self):
+        assert flash_comm_shard(sequence_parallel=False, tensor_parallel_size=4) == 1
+        assert flash_comm_shard(sequence_parallel=True, tensor_parallel_size=1) == 1
+
+    def test_divides_by_the_tp_workers_when_sp_is_enabled(self):
+        # FlashComm v1 pads to a multiple of TP and splits, so one Attention rank
+        # holds a share of the DP rank's rows rather than all of them.
+        assert flash_comm_shard(sequence_parallel=True, tensor_parallel_size=2) == 2
+
+
+class TestShardedTileRows:
+    def test_divides_the_group_maximum_by_the_shard(self):
+        # 4A2F over 2 TP workers: F0 owns {A0, A2}, each holding 24 / 2 = 12 rows,
+        # and its receive is two of those sharded tiles.
+        assert (
+            padded_tile_rows(
+                [24, 24], ffn_rank=0, attention_size=4, ffn_size=2, shard=2
+            )
+            == 12
+        )
+        assert (
+            ffn_receive_rows([24, 24], 0, attention_size=4, ffn_size=2, shard=2) == 24
+        )
+
+    def test_rounds_a_sharded_tile_up(self):
+        # A shard never drops a row, so an odd count still covers its tokens.
+        assert (
+            padded_tile_rows([25], ffn_rank=0, attention_size=2, ffn_size=2, shard=2)
+            == 13
+        )
+
+
+class TestFallbackTileRows:
+    def test_shards_the_all_rank_count_the_same_way(self):
+        assert fallback_tile_rows(shard=1, fallback=64) == 64
+        assert fallback_tile_rows(shard=2, fallback=64) == 32
+
+    def test_never_returns_zero_rows(self):
+        assert fallback_tile_rows(shard=4, fallback=1) == 1
+        assert fallback_tile_rows(shard=1, fallback=0) == 1
+
+
+class TestAttentionTileRows:
+    def test_uses_the_peer_group_maximum(self):
+        assert (
+            attention_tile_rows([2, 2, 5, 7], ffn_rank=0, attention_size=4, ffn_size=2)
+            == 5
+        )
+        assert (
+            attention_tile_rows([2, 2, 5, 7], ffn_rank=1, attention_size=4, ffn_size=2)
+            == 7
+        )
+
+    def test_falls_back_to_the_shared_all_rank_count(self):
+        # A missing-counts step sizes both roles by the same all-rank fallback
+        # instead of letting the receiver invent a larger tile than the sender
+        # writes, which would make A2E read rows no peer wrote.
+        assert (
+            attention_tile_rows(
+                [],
+                ffn_rank=0,
+                attention_size=4,
+                ffn_size=2,
+                shard=2,
+                fallback=64,
+            )
+            == 32
+        )
+
+    def test_keeps_even_groups_at_one_tile_per_peer(self):
+        assert (
+            attention_tile_rows(
+                [12, 12, 12, 12], ffn_rank=0, attention_size=4, ffn_size=2
+            )
+            == 12
+        )
+
+
+class TestFfnTileCount:
+    def test_counts_the_tiles_of_one_ffn_rank(self):
+        assert ffn_tile_count(attention_size=4, ffn_size=2) == 2
+        assert ffn_tile_count(attention_size=2, ffn_size=2) == 1
+
+    def test_uses_one_tile_for_a_topology_it_cannot_describe(self):
+        assert ffn_tile_count(attention_size=3, ffn_size=2) == 1
+
+    def test_the_receive_total_is_the_senders_tiles(self):
+        # The two roles have to agree on one number: the Attention rank writes
+        # ``tile`` rows and the FFN rank sizes its receive by ``tiles * tile``,
+        # which the operator divides back into one tile per peer.
+        counts = [24, 24]
+        tile = attention_tile_rows(
+            counts, ffn_rank=0, attention_size=4, ffn_size=2, shard=2
+        )
+        assert ffn_tile_count(attention_size=4, ffn_size=2) * tile == 24
+        assert ffn_receive_rows(counts, 0, attention_size=4, ffn_size=2, shard=2) == 24

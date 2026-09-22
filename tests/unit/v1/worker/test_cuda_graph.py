@@ -203,6 +203,43 @@ def test_make_ffn_graph_key_dp1_tp1_unchanged():
     assert key == ((0, (8,)),)
 
 
+def test_make_ffn_graph_key_divides_the_tile_by_the_flash_comm_shard():
+    """FlashComm v1 leaves one Attention rank its TP share of the DP count.
+
+    4A2F with SP over 2 TP workers: F0 receives two tiles of 24 / 2 = 12 rows, so
+    the graph key has to be 24 rather than the 48 a replicated count produces.
+    """
+
+    metadata = SimpleNamespace(num_tokens_across_dp_cpu=[24, 24])
+
+    key = make_ffn_graph_key(
+        {0: metadata},
+        attention_size=4,
+        ffn_size=2,
+        fallback=64,
+        shard=2,
+    )
+
+    assert key == ((0, (24, 24)),)
+
+
+def test_make_ffn_graph_key_shards_the_missing_metadata_fallback():
+    """A step without usable counts keys by the fallback both roles size by."""
+
+    metadata = SimpleNamespace(num_tokens_across_dp_cpu=[])
+
+    key = make_ffn_graph_key(
+        {0: metadata},
+        attention_size=4,
+        ffn_size=2,
+        fallback=64,
+        shard=2,
+    )
+
+    # No counts: two tiles of ceil(64 / 2) = 32 rows per FFN rank.
+    assert key == ((0, (64, 64)),)
+
+
 @pytest.mark.parametrize(
     ("is_graph_replaying", "graph_exists", "expected"),
     [

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from afd_plugin.a2e_layout import padded_ffn_token_counts
+from afd_plugin.a2e_layout import ffn_receive_rows
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -109,6 +109,7 @@ def make_ffn_graph_key(
     attention_size: int | None = None,
     ffn_size: int | None = None,
     fallback: int = 1,
+    shard: int = 1,
 ) -> tuple[tuple[int, tuple]]:
     """Extract the AFD FFN graph hashable key from DP metadata."""
 
@@ -130,6 +131,7 @@ def make_ffn_graph_key(
                     attention_size=int(attention_size),
                     ffn_size=int(ffn_size),
                     fallback=int(fallback),
+                    shard=int(shard),
                 )
         key_parts.append((int(stage_idx), values_tuple))
     return tuple(key_parts)
@@ -182,21 +184,26 @@ def _aggregate_ffn_values_tuple(
     attention_size: int,
     ffn_size: int,
     fallback: int,
+    shard: int = 1,
 ) -> tuple[int, ...]:
     # Only the AFD NPU runners pass the role sizes, so this branch describes the
     # A2E tile layout: every FFN rank receives ``attention_size // ffn_size`` tiles
-    # of the largest count in its (strided) Attention peer group. The key has to
-    # match the rows the transfer actually delivers, because a key built from the
-    # real counts would send an uneven step to eager execution with a tile A2E
-    # cannot represent.
-    ffn_counts = padded_ffn_token_counts(
-        values,
-        attention_size=int(attention_size),
-        ffn_size=int(ffn_size),
+    # of the largest count in its (strided) Attention peer group, divided by the
+    # FlashComm v1 shard because one Attention rank holds only its TP share of a
+    # DP rank's rows. The key has to match the rows the transfer actually
+    # delivers, because a key built from the real counts would send an uneven step
+    # to eager execution with a tile A2E cannot represent.
+    return tuple(
+        ffn_receive_rows(
+            values,
+            ffn_rank,
+            attention_size=int(attention_size),
+            ffn_size=int(ffn_size),
+            shard=int(shard),
+            fallback=int(fallback),
+        )
+        for ffn_rank in range(max(1, int(ffn_size)))
     )
-    if ffn_counts is None:
-        return tuple(max(1, int(fallback)) for _ in range(ffn_size))
-    return tuple(max(1, int(count)) for count in ffn_counts)
 
 
 __all__ = [
