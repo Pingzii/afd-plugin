@@ -194,6 +194,18 @@ class TestShardedTileRows:
         )
 
 
+class TestShardedRows:
+    def test_keeps_the_reported_count_when_nothing_is_sharded(self):
+        assert sharded_rows(24, shard=1) == 24
+
+    def test_divides_by_the_flash_comm_shard(self):
+        assert sharded_rows(24, shard=2) == 12
+        assert sharded_rows(25, shard=2) == 13
+
+    def test_never_returns_zero_rows(self):
+        assert sharded_rows(0, shard=4) == 1
+
+
 class TestFallbackTileRows:
     def test_shards_the_all_rank_count_the_same_way(self):
         assert fallback_tile_rows(shard=1, fallback=64) == 64

@@ -140,7 +140,19 @@ def fallback_tile_rows(*, shard: int = 1, fallback: int = 0) -> int:
     side instead of letting the receiver guess a larger tile.
     """
 
-    return max(1, _ceil_div(max(0, int(fallback)), max(1, shard)))
+    return sharded_rows(fallback, shard=shard)
+
+
+def sharded_rows(reported_rows: int, *, shard: int = 1) -> int:
+    """Return the rows one Attention rank holds of a reported DP token count.
+
+    FlashComm v1 pads a DP rank's rows to a multiple of the TP size and splits
+    them across its TP workers, so a rank holds ``ceil(count / shard)`` rows of
+    the count reported for its DP rank. The divisor is 1 when SP is off, which
+    makes this the reported count itself.
+    """
+
+    return max(1, _ceil_div(max(0, int(reported_rows)), max(1, shard)))
 
 
 def padded_tile_rows(
@@ -166,7 +178,10 @@ def padded_tile_rows(
     counts = attention_rank_token_counts(dp_counts, attention_size=attention_size)
     if peers is None or counts is None:
         return None
-    return max(1, _ceil_div(max(counts[peer] for peer in peers), max(1, shard)))
+    return sharded_rows(
+        max(counts[peer] for peer in peers),
+        shard=shard,
+    )
 
 
 def attention_tile_rows(
@@ -260,4 +275,5 @@ __all__ = [
     "ffn_tile_count",
     "flash_comm_shard",
     "padded_tile_rows",
+    "sharded_rows",
 ]
