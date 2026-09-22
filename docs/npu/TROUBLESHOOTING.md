@@ -188,25 +188,31 @@ Four cause families are worth separating before touching the model:
   padded tiles, so the transfer is aligned in eager steps as well as in graphs.
   DP ranks hold independent batches, which is where uneven counts come from; check
   `num_tokens_across_dp_cpu` and the TP-to-AFD rank expansion it is read through.
-- **A sender that sizes its payload by its own report.** This is the shape a
-  split `4A2F` topology on DP-only ranks (`--tensor-parallel-size 1`) actually
-  hits. Under FULL graphs every Attention rank replays the graph matching *its
-  own* padded token count, so the peers of one FFN rank can genuinely differ
-  (12 rows on one rank, 32 on another). The publish path reports one count for
-  every Attention rank, and only `min(attention_size, ffn_size)` ranks publish at
-  all, so with `A > F` an FFN rank never learns the real size of the peer that
-  did not publish. A sender that then pads to *its own* count writes 12 rows while
-  the receiver reads 32 per peer, and the over-read starts exactly at row `2 *
-  12 = 24`: rows 12..23 are the sender's zero-filled scales and stay silent, and
-  rows 24..31 are the sender's activations, which the router reads as token ids.
-  The fault onset row is therefore `2 * sender_rows`, and `rowCount` in the
-  tiling data is the receiver's tile, not the sender's payload. With `A == F`
-  each FFN rank has exactly one peer and receives that peer's own payload, which
-  is why the same model runs on `2A2F`. `CAMP2pAFDConnector` now derives the tile
-  from the published metadata on the sending side too, so the payload is padded up
-  to the tile the receiver uses; a sender whose own rows exceed the published tile
-  is a step this layout cannot represent and eager steps fail fast on it with both
-  row counts in the message.
+- **A sender sized by a compiled forward.** This is the shape a split `4A2F`
+  topology actually hits, and it is the one confirmed on device: the connector's
+  Python lives inside the model forward, so a compiled step runs it only at trace
+  time. The row count it handed the operator stays frozen at the shape that trace
+  saw, together with the ids, scales and activation offsets derived from it, while
+  the FFN rank sizes its receive from the metadata of the *current* step. Any step
+  whose rows differ from the traced ones then has A2E read past the smaller peer's
+  payload: the over-read starts exactly at row `2 * traced_rows`, crosses that
+  peer's zero-filled scales (silent) and lands in its activations, which a
+  token-keyed router reads as token ids -- hence the fault onset row, and hence
+  `rowCount` in the tiling data being the receiver's tile rather than the sender's
+  payload. The tell is the Attention side reporting no send at all for steps the
+  FFN side received, because `send_attn_output` never re-ran on the host.
+  `CAMP2pAFDConnector`'s operator implementations are the part that does run per
+  step, so both directions now size the transfer from the payload the call carries
+  (`hidden_states.shape[0]`, `ref_tensor.shape[0]`) instead of from the traced
+  argument. With `A == F` each FFN rank has exactly one peer, which is why the same
+  model runs on `2A2F`.
+- **Attention peers that ran different token counts.** A2E reads one equal tile per
+  Attention peer, so the peers of one FFN rank have to write the same number of
+  rows. DP padding to the group maximum used to be applied only for cudagraph
+  modes, so an eager or piecewise step let each DP rank run its own count -- on
+  device, `padded_tokens=4` next to peers at `16`, with the FFN rank sizing its
+  receive for 16. The AFD Attention role now pads every DP rank to the group
+  maximum in every mode, which is what the equal-tile contract needs.
 - **A padded step that sends unpadded rows.** When the runner pads the Attention
   batch (FULL CUDA graphs, DP padding) it reports the padded token count for the
   rank, and A2E reads exactly `batch_size / attnToMoeRatio` rows per peer, in both
