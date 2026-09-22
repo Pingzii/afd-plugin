@@ -6,9 +6,6 @@ connectors. Use it together with the connector-specific setup guide:
 - [CAM async connector](CAM_ASYNC_CONNECTOR_USER_GUIDE.md)
 - [CAM P2P connector](CAM_P2P_CONNECTOR_USER_GUIDE.md)
 
-For Ascend 950 (A5) platform issues, including the expert-parallel MC2 dispatch
-failure, see the [A5 bring-up notes](A5_BRINGUP_NOTES.md).
-
 Before troubleshooting, confirm that every Attention and FFN process uses the
 same model, AFD topology, rendezvous address, and connector settings. Also use
 the vLLM, vLLM-Ascend, CANN, and CAM versions documented by the selected
