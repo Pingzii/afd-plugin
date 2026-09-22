@@ -212,7 +212,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             attention_size=int(self.connector.attn_size),
             ffn_size=int(self.connector.ffn_size),
             fallback=int(self.max_num_tokens),
-            shard=int(self.connector.attention_shard),
         )
 
     def _ffn_forward(
@@ -553,15 +552,14 @@ def _ffn_token_counts_across_ranks(
     )
     # A2E hands one padded tile per Attention peer to every FFN rank, so this rank
     # computes on whole tiles even when the DP ranks hold different batch sizes.
-    # The connector sizes the same transfer from these counts, the FlashComm shard
-    # and this fallback, and the router rows have to be the rows that arrive.
+    # The connector sizes the same transfer from these counts and this fallback,
+    # and the router rows have to be the rows that arrive.
     values = [
         ffn_receive_rows(
             counts,
             ffn_rank=ffn_rank,
             attention_size=int(connector.attn_size),
             ffn_size=int(connector.ffn_size),
-            shard=int(connector.attention_shard),
             fallback=int(fallback),
         )
         for ffn_rank in range(int(connector.ffn_size))

@@ -33,8 +33,6 @@ from afd_plugin.a2e_layout import (
     fallback_tile_rows,
     ffn_rank_for_attention_rank,
     ffn_receive_rows,
-    flash_comm_shard,
-    sharded_rows,
 )
 from afd_plugin.compat.npu import ensure_cam_p2p_ops_available
 from afd_plugin.config import AFDConfig
@@ -64,7 +62,6 @@ from afd_plugin.distributed import (
     init_afd_process_group,
     topology_from_config,
 )
-from afd_plugin.hash_token_ids import validate_hash_token_ids
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -267,28 +264,6 @@ def _reported_attention_tokens(forward_context: Any) -> int | None:
     return max(1, int(batch_descriptor.num_tokens))
 
 
-def _flash_comm_sequence_parallel(vllm_config: VllmConfig, tp_size: int) -> bool:
-    """Report whether vLLM-Ascend shards router rows across TP for this run.
-
-    Mirrors the ``flash_comm_v1_enabled`` condition of the pinned
-    ``vllm_ascend.ascend_forward_context``: FlashComm v1 is active for a MoE
-    model whenever SP is enabled. Every AFD NPU model is a MoE, so the model-kind
-    half of that condition already holds here.
-
-    A single TP worker keeps the whole DP count, so the platform setting is only
-    consulted when there are TP workers to shard across.
-
-    The import stays inside the function because this module is imported on both
-    backends while ``vllm_ascend`` only exists on NPU hosts.
-    """
-
-    if tp_size <= 1:
-        return False
-    from vllm_ascend.utils import enable_sp
-
-    return bool(enable_sp(vllm_config))
-
-
 def prepare_token_id_transfer(
     input_ids: torch.Tensor,
     *,
@@ -450,17 +425,6 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # Row count of the model's token-to-expert (Hash) tables: token ids the
         # ids channel carries are indices into them.
         self.vocab_size = int(hf_config.vocab_size)
-        # Rows one Attention rank holds per DP token count. FlashComm v1 splits the
-        # router rows across the TP workers, so a rank's A2E payload is shorter
-        # than the DP count both roles derive the tile from; without that divisor
-        # the FFN rank reads rows the peer never wrote. It is 1 when SP is off.
-        self.attention_shard = flash_comm_shard(
-            sequence_parallel=_flash_comm_sequence_parallel(
-                vllm_config,
-                int(vllm_config.parallel_config.tensor_parallel_size),
-            ),
-            tensor_parallel_size=int(vllm_config.parallel_config.tensor_parallel_size),
-        )
         # All-rank token count A2E falls back to when a stage has no usable
         # counts. Both roles read it from the same scheduler configuration, so the
         # fallback tile stays equal on the sending and the receiving side.
@@ -618,16 +582,12 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             ffn_size=self.ffn_size,
         )
         if ffn_rank is None:
-            return fallback_tile_rows(
-                shard=self.attention_shard,
-                fallback=self.max_num_tokens,
-            )
+            return fallback_tile_rows(fallback=self.max_num_tokens)
         return attention_tile_rows(
             stage_token_counts,
             ffn_rank=ffn_rank,
             attention_size=self.attn_size,
             ffn_size=self.ffn_size,
-            shard=self.attention_shard,
             fallback=self.max_num_tokens,
         )
 
@@ -694,12 +654,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # Rows this rank's payload holds, from the count snapshot rather than from
         # the payload tensor: a traced or padded step reports its rows through the
         # graph, and reading a symbol there is what makes the compiled path fail.
-        own_rows = self._own_reported_rows(stage_idx)
-        payload_rows = (
-            None
-            if own_rows is None
-            else sharded_rows(own_rows, shard=self.attention_shard)
-        )
+        payload_rows = self._own_reported_rows(stage_idx)
         graph_rows = _reported_attention_tokens(forward_context)
         if graph_rows is not None:
             # A graph step sends the rows its captured graph holds and cannot pad
@@ -941,7 +896,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         compute_gate_mode = 1 if recv_input_ids else 0
         # A2E gives this rank one tile per Attention peer and reads the same number
         # of rows from each, so the operator is sized by whole tiles and both roles
-        # derive that tile from the same counts, FlashComm shard and fallback (see
+        # derive that tile from the same counts and fallback (see
         # :mod:`afd_plugin.a2e_layout`). The connector's own ``max_num_tokens`` is
         # the fallback rather than a caller-supplied value, because the Attention
         # ranks size the very same fallback and a different number here would make
@@ -951,7 +906,6 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.role_rank,
             attention_size=self.attn_size,
             ffn_size=self.ffn_size,
-            shard=self.attention_shard,
             fallback=self.max_num_tokens,
         )
         metadata = AFDTransferMetadata.create_ffn_metadata(
@@ -1005,12 +959,6 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             received_ids = received_token_ids(
                 outputs[1],
                 expected_tokens=batch_size,
-            )
-            validate_hash_token_ids(
-                received_ids,
-                table_rows=self.vocab_size,
-                context="CAMP2P FFN-side Hash routing",
-                padding_value=_PAD_HASH_TOKEN_ID,
             )
         return AFDA2FTransferPayload(
             hidden_states=outputs[0],

@@ -30,9 +30,7 @@ FFN runner, and the graph-key builder. The operators fix both properties
 
 Counts are positional in Attention-rank order: ``num_tokens_across_dp_cpu`` holds
 one count per DP rank and every count is replicated across that DP rank's TP
-workers. FlashComm v1 then splits a DP rank's rows across those TP workers, so
-one Attention rank holds ``ceil(count / tp)`` rows of the count reported for its
-DP rank; :func:`flash_comm_shard` is that divisor and is 1 when SP is off. The
+workers, so a count is the row count of each Attention rank that holds it. The
 module deliberately depends on nothing else, because the NPU connector, the NPU
 FFN runner, and the CPU-safe graph-key helper all import it.
 """
@@ -106,33 +104,7 @@ def ffn_rank_for_attention_rank(
     return attention_rank % ffn_size
 
 
-def flash_comm_shard(
-    *,
-    sequence_parallel: bool,
-    tensor_parallel_size: int,
-) -> int:
-    """Return the divisor FlashComm v1 applies to one Attention rank's rows.
-
-    FlashComm v1 pads the router input to a multiple of the TP size and splits it
-    across the TP workers, so one Attention rank holds ``ceil(tokens / tp)`` rows
-    while ``num_tokens_across_dp_cpu`` describes the whole DP rank. A2E moves the
-    rows a rank actually holds, so both roles have to divide the DP count by this
-    factor before turning it into a tile. Without FlashComm v1 the divisor is 1
-    and the DP count is already the rank's row count.
-    """
-
-    if not sequence_parallel or tensor_parallel_size <= 1:
-        return 1
-    return tensor_parallel_size
-
-
-def _ceil_div(value: int, divisor: int) -> int:
-    """Divide rounding up, so a sharded tile never drops a row."""
-
-    return -(-value // divisor)
-
-
-def fallback_tile_rows(*, shard: int = 1, fallback: int = 0) -> int:
+def fallback_tile_rows(*, fallback: int = 0) -> int:
     """Return the tile A2E uses when the DP counts describe no peer group.
 
     Both roles pass the same run-level token count, so a step whose metadata is
@@ -140,19 +112,7 @@ def fallback_tile_rows(*, shard: int = 1, fallback: int = 0) -> int:
     side instead of letting the receiver guess a larger tile.
     """
 
-    return sharded_rows(fallback, shard=shard)
-
-
-def sharded_rows(reported_rows: int, *, shard: int = 1) -> int:
-    """Return the rows one Attention rank holds of a reported DP token count.
-
-    FlashComm v1 pads a DP rank's rows to a multiple of the TP size and splits
-    them across its TP workers, so a rank holds ``ceil(count / shard)`` rows of
-    the count reported for its DP rank. The divisor is 1 when SP is off, which
-    makes this the reported count itself.
-    """
-
-    return max(1, _ceil_div(max(0, int(reported_rows)), max(1, shard)))
+    return max(1, int(fallback))
 
 
 def padded_tile_rows(
@@ -161,13 +121,12 @@ def padded_tile_rows(
     ffn_rank: int,
     attention_size: int,
     ffn_size: int,
-    shard: int = 1,
 ) -> int | None:
     """Return the row count every Attention peer of one FFN rank writes.
 
-    The value is the largest count in that FFN rank's peer group divided by
-    ``shard``, which is what each peer pads its own payload up to. Returns
-    ``None`` when the metadata or the topology cannot describe the group.
+    The value is the largest count in that FFN rank's peer group, which is what
+    each peer pads its own payload up to. Returns ``None`` when the metadata or
+    the topology cannot describe the group.
     """
 
     peers = attention_peer_ranks(
@@ -178,10 +137,7 @@ def padded_tile_rows(
     counts = attention_rank_token_counts(dp_counts, attention_size=attention_size)
     if peers is None or counts is None:
         return None
-    return sharded_rows(
-        max(counts[peer] for peer in peers),
-        shard=shard,
-    )
+    return max(1, max(counts[peer] for peer in peers))
 
 
 def attention_tile_rows(
@@ -190,7 +146,6 @@ def attention_tile_rows(
     ffn_rank: int,
     attention_size: int,
     ffn_size: int,
-    shard: int = 1,
     fallback: int = 0,
 ) -> int:
     """Return the rows one Attention peer writes into an FFN rank's A2E tile.
@@ -212,10 +167,9 @@ def attention_tile_rows(
         ffn_rank=ffn_rank,
         attention_size=attention_size,
         ffn_size=ffn_size,
-        shard=shard,
     )
     if rows is None:
-        rows = fallback_tile_rows(shard=shard, fallback=fallback)
+        rows = fallback_tile_rows(fallback=fallback)
     return max(1, rows)
 
 
@@ -241,7 +195,6 @@ def ffn_receive_rows(
     *,
     attention_size: int,
     ffn_size: int,
-    shard: int = 1,
     fallback: int = 0,
 ) -> int:
     """Return the rows one FFN rank receives, which is what it computes on.
@@ -259,7 +212,6 @@ def ffn_receive_rows(
             ffn_rank=ffn_rank,
             attention_size=attention_size,
             ffn_size=ffn_size,
-            shard=shard,
             fallback=fallback,
         ),
     )
@@ -273,7 +225,5 @@ __all__ = [
     "ffn_rank_for_attention_rank",
     "ffn_receive_rows",
     "ffn_tile_count",
-    "flash_comm_shard",
     "padded_tile_rows",
-    "sharded_rows",
 ]

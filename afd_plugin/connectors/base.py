@@ -60,12 +60,6 @@ class AFDConnectorBase(ABC):
     control_plane: AFDControlPlane | None = None
     attn_size: int = 0
     ffn_size: int = 0
-    # How many rows one Attention rank holds per token count reported for its DP
-    # rank. Transports that move one equal tile per Attention peer derive their
-    # tile from this divisor, because a rank holding a share of the DP count
-    # writes fewer rows than the count itself. Backends that keep the full count
-    # on every Attention rank leave it at 1.
-    attention_shard: int = 1
 
     @classmethod
     @abstractmethod

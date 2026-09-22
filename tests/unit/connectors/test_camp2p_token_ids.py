@@ -475,48 +475,6 @@ def test_recv_attn_output_follows_the_strided_attention_peer_group(monkeypatch):
     assert calls[0][3] == 32
 
 
-def test_recv_attn_output_validates_hash_ids_when_enabled(monkeypatch):
-    """The opt-in check names the rows a device ``tid2eid`` read would fault on."""
-
-    monkeypatch.setenv("AFD_VALIDATE_HASH_TOKEN_IDS", "1")
-    monkeypatch.setattr(
-        torch.ops.afd_ascend,
-        "a2e",
-        _a2e_returning_ids(first_id=4096),
-        raising=False,
-    )
-    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
-    connector = _connector(role="ffn", rank=1)
-    _publish_dp_metadata(connector, {0: _FakeDPMetadata([2, 3, 6, 6])})
-
-    with pytest.raises(RuntimeError, match=r"outside \[0, 256\)"):
-        connector.recv_attn_output(ubatch_idx=0, layer_idx=0, recv_input_ids=True)
-
-
-def test_recv_attn_output_skips_hash_id_validation_by_default(monkeypatch):
-    """The check synchronises, so a default run must not pay for it."""
-
-    monkeypatch.delenv("AFD_VALIDATE_HASH_TOKEN_IDS", raising=False)
-    monkeypatch.setattr(
-        torch.ops.afd_ascend,
-        "a2e",
-        _a2e_returning_ids(first_id=4096),
-        raising=False,
-    )
-    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
-    connector = _connector(role="ffn", rank=1)
-    _publish_dp_metadata(connector, {0: _FakeDPMetadata([2, 3, 6, 6])})
-
-    payload = connector.recv_attn_output(
-        ubatch_idx=0,
-        layer_idx=0,
-        recv_input_ids=True,
-    )
-
-    assert payload.input_ids is not None
-    assert payload.input_ids[0].item() == 4096
-
-
 def _full_graph_forward_context(*, num_tokens: int) -> SimpleNamespace:
     """Build the forward-context fields a padded CUDA graph step exposes."""
 

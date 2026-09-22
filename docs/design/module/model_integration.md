@@ -7,7 +7,6 @@ owners:
   - "@jiangkuaixue123"
 primary_code_paths:
   - "afd_plugin/model_executor/**/*.py"
-  - "afd_plugin/hash_token_ids.py"
 related_code_paths:
   - "afd_plugin/connectors/metadata.py"
   - "afd_plugin/a2e_layout.py"
@@ -203,13 +202,10 @@ split under [#105](https://github.com/JiusiServe/afd-plugin/issues/105).
 
 A model whose router is keyed by token identity routes on ids that arrive from
 the Attention role, and those ids index a token-to-expert table the model owns.
-`afd_plugin/hash_token_ids.py` is the shared validator for that relation: it
-names the rows whose ids fall outside the table, behind
-`AFD_VALIDATE_HASH_TOKEN_IDS=1`, and the connector validates the ids it installs
-on the FFN role with the same helper. When the ids already describe every router
-row, `compat/patches/npu/hash_ids_alignment.py` keeps the pinned vLLM-Ascend
-fused selector from re-aligning them to a sequence-parallel layout the FFN role
-does not use.
+When the ids already describe every router row,
+`compat/patches/npu/hash_ids_alignment.py` keeps the pinned vLLM-Ascend fused
+selector from re-aligning them to a sequence-parallel layout the FFN role does
+not use.
 
 ## Model execution flow
 

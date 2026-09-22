@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from afd_plugin.hash_token_ids import validate_hash_token_ids
-
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
@@ -152,12 +150,6 @@ def _compute_sqrtsoftplus_topk(
     correction_bias = moe.gate.e_score_correction_bias
     if correction_bias is not None and correction_bias.dtype != router_logits.dtype:
         correction_bias = correction_bias.to(router_logits.dtype)
-    if input_ids is not None and tid2eid is not None:
-        validate_hash_token_ids(
-            input_ids,
-            table_rows=int(tid2eid.shape[0]),
-            context="DSV4 Attention-side Hash routing",
-        )
     topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
         x=router_logits,
         k=moe.top_k,

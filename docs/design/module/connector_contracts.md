@@ -14,7 +14,6 @@ related_code_paths:
   - "afd_plugin/v1/worker/**"
   - "afd_plugin/model_executor/**"
   - "afd_plugin/compat/npu/ops.py"
-  - "afd_plugin/hash_token_ids.py"
   - "afd_plugin/compat/patches/npu/hash_ids_alignment.py"
 depends_on:
   - "plugin_boundary.md"
@@ -133,11 +132,9 @@ have independent stable ownership.
 `AFDConnectorBase` defines the lifecycle and data-plane shape below. Its
 `control_plane: AFDControlPlane | None` attribute is the explicit runtime
 selector: synchronous connectors install a control-plane object during
-construction, while CAM async leaves it as `None`. Its `attn_size`, `ffn_size`,
-and `attention_shard` attributes describe the transfer layout the concrete
-connector owns: how many Attention peers an FFN rank has, and how many rows one
-Attention rank holds of the token count reported for its DP rank
-(`attention_shard` is 1 unless the platform shards router rows across TP).
+construction, while CAM async leaves it as `None`. Its `attn_size` and `ffn_size`
+attributes describe the transfer layout the concrete connector owns, including
+how many Attention peers one FFN rank has.
 
 | Surface | Caller and current responsibility |
 | --- | --- |
@@ -171,18 +168,17 @@ control-plane separation but did not establish a public work-item protocol.
 moves. The host-side operators pair an FFN rank with strided Attention peers
 (`r, r + ffn_size, ...`) and read one equal tile per peer in both directions, so
 the row count a peer writes, the rows the FFN rank reads per peer, and the rows
-it computes on are one number, derived from `num_tokens_across_dp_cpu`, the
-`attention_shard` divisor, and one shared fallback. The connector, the NPU FFN
-runner, and the CPU-safe graph-key helper all call the same helpers, so a change
-to the layout cannot leave the send, the receive, and the graph key disagreeing.
+it computes on are one number, derived from `num_tokens_across_dp_cpu` and one
+shared fallback. The connector, the NPU FFN runner, and the CPU-safe graph-key
+helper all call the same helpers, so a change to the layout cannot leave the
+send, the receive, and the graph key disagreeing.
 
 The ids channel that rides with the transfer carries token ids the FFN role's
 router indexes its token-to-expert table with, so the rows it delivers have to be
-the rows the router sees. `afd_plugin/hash_token_ids.py` can assert that relation
-on device behind `AFD_VALIDATE_HASH_TOKEN_IDS=1`; it reads device tensors and
-synchronizes, so it stays off unless an operator turns it on for diagnosis.
-`afd_plugin/compat/patches/npu/hash_ids_alignment.py` patches the pinned
-vLLM-Ascend fused selector to keep ids that already describe every router row.
+the rows the router sees. `afd_plugin/compat/patches/npu/hash_ids_alignment.py`
+patches the pinned vLLM-Ascend fused selector to keep ids that already describe
+every router row instead of re-aligning them to a sequence-parallel layout the
+FFN role does not use.
 
 ## Payload and metadata ownership
 
