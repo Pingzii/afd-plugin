@@ -701,17 +701,6 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             else sharded_rows(own_rows, shard=self.attention_shard)
         )
         graph_rows = _reported_attention_tokens(forward_context)
-        if not torch.compiler.is_compiling():
-            # Numbers of the last A2E send, for the runner to report once per step.
-            # A graph-frozen send repeats the values it was captured with, so a
-            # reporter can tell a per-step payload from a baked-in one.
-            self.last_a2e_send = (
-                int(metadata.layer_idx),
-                int(stage_idx),
-                -1 if payload_rows is None else int(payload_rows),
-                int(wire_rows),
-                tuple(int(count) for count in self.dp_token_counts.get(stage_idx, ())),
-            )
         if graph_rows is not None:
             # A graph step sends the rows its captured graph holds and cannot pad
             # them, so the tile the FFN rank sizes its receive with has to be
@@ -964,11 +953,6 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             ffn_size=self.ffn_size,
             shard=self.attention_shard,
             fallback=self.max_num_tokens,
-        )
-        self.last_a2e_recv = (
-            int(ubatch_idx),
-            int(batch_size),
-            tuple(int(count) for count in self.dp_token_counts.get(ubatch_idx, ())),
         )
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
