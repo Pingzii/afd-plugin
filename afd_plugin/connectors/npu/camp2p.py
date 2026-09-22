@@ -1314,7 +1314,13 @@ def _register_camp2p_custom_ops() -> None:
         transfer_state = getattr(get_forward_context(), "cam_afdtransfer_state", None)
         if transfer_state is None:
             transfer_state = CAMP2PTransferState()
-        transfer_state.batch_size = batch_size
+        # This implementation runs once per step with the tensor the compiled
+        # forward produced, while ``batch_size`` is the value the traced Python
+        # passed and stays frozen at the shape that trace saw. Sizing the transfer
+        # from the traced value makes a step whose rows differ from it write too few
+        # rows, and A2E then reads this rank's scales and activations as ids on the
+        # FFN side. The payload's own row count is the step's row count.
+        transfer_state.batch_size = int(hidden_states.shape[0])
         transfer_state.h = hidden_size
         transfer_state.k = topk
         transfer_state.aiv_num = aiv_num
@@ -1401,7 +1407,7 @@ def _register_camp2p_custom_ops() -> None:
                 dtype=torch.int32,
                 device=ref_tensor.device,
             )
-        transfer_state.batch_size = batch_size
+        transfer_state.batch_size = int(ref_tensor.shape[0])
         transfer_state.h = hidden_size
         transfer_state.k = topk
         transfer_state.aiv_num = aiv_num

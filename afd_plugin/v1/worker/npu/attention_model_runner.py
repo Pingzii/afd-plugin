@@ -54,10 +54,8 @@ from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.step3p5 import AscendStep3p5MTPProposer
 from vllm_ascend.utils import (
-    embedding_tp_enable,
     enable_sp,
     lmhead_tp_enable,
-    oproj_tp_enable,
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.model_runner_v1 import (
@@ -1900,10 +1898,12 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode,
-                    allow_dp_padding=(cudagraph_mode != CUDAGraphMode.NONE)
-                    or enable_sp(self.vllm_config)
-                    or oproj_tp_enable()
-                    or embedding_tp_enable(),
+                    # A2E reads one equal tile per Attention peer, so every peer of
+                    # an FFN rank has to run the same token count. Padding each DP
+                    # rank to the group maximum keeps that true for eager steps too;
+                    # without it a rank whose batch is smaller than its peer's sends
+                    # fewer rows than the FFN rank reads.
+                    allow_dp_padding=True,
                 )
             )
             if num_tokens_across_dp is not None:
