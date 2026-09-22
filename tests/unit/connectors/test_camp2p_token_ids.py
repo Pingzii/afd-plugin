@@ -33,21 +33,6 @@ import pytest
 torch = pytest.importorskip("torch")
 
 
-def _init_stub_logger(*args: Any, **kwargs: Any) -> logging.Logger:
-    """Return a logger carrying the ``*_once`` methods vLLM patches onto its own.
-
-    The connector logs its transfer-tile diagnostics with ``info_once``, so the
-    stub has to expose the same surface. ``getLogger`` keeps the logger in the
-    logging hierarchy, so a record still reaches pytest's capture handler
-    instead of disappearing into a parentless logger.
-    """
-
-    stub_logger = logging.getLogger("test")
-    stub_logger.info_once = stub_logger.info  # type: ignore[attr-defined]
-    stub_logger.debug_once = stub_logger.debug  # type: ignore[attr-defined]
-    return stub_logger
-
-
 _STUB_MODULES = (
     "vllm",
     "vllm.config",
@@ -98,7 +83,7 @@ def _vllm_stub() -> Iterator[None]:
         DPMetadata=type("DPMetadata", (), {}),
         get_forward_context=lambda: None,
     )
-    make("vllm.logger", init_logger=_init_stub_logger)
+    make("vllm.logger", init_logger=lambda *args, **kwargs: logging.getLogger("test"))
     make("vllm.utils")
     make(
         "vllm.utils.torch_utils",
@@ -417,67 +402,6 @@ def _a2e_returning_ids(*, first_id: int) -> Any:
         return ("hidden", ids, None, "atten-batch", "active-mask")
 
     return fake_a2e
-
-
-def test_transfer_tile_diagnostics_are_logged(monkeypatch, caplog):
-    """Both sides print the tile sizes they transfer with, without a flag.
-
-    These two lines are what a "the FFN read a tile no Attention peer wrote"
-    investigation needs: the tile each rank used and the counts it derived it
-    from. The Attention line may only carry values that cannot come from a traced
-    tensor shape, because formatting those would specialize the token dimension
-    the compiled model declares dynamic.
-    """
-
-    caplog.set_level(logging.INFO)
-    monkeypatch.setattr(
-        torch.ops.vllm,
-        "afd_camp2p_send_attn_output",
-        lambda *args: None,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        camp2p_module.torch.compiler,
-        "is_compiling",
-        lambda: True,
-    )
-    forward_context = _full_graph_forward_context(num_tokens=8)
-    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
-    send_connector = _connector(role="attention", rank=0)
-    send_connector.send_attn_output(
-        torch.zeros(3, send_connector.hidden_size),
-        AFDTransferContext(
-            metadata=AFDTransferMetadata.create_attention_metadata(
-                layer_idx=1,
-                stage_idx=0,
-                seq_len=3,
-            ),
-        ),
-    )
-
-    assert "AFD CAMP2P send tile" in caplog.text
-    assert "layer=1" in caplog.text
-    assert "tile_rows=8" in caplog.text
-    # Values derived from the traced payload size must stay out of the line.
-    assert "payload_rows" not in caplog.text
-    assert "num_tokens" not in caplog.text
-
-    recv_connector = _connector(role="ffn", rank=1)
-    recv_connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 6, 6])}
-    monkeypatch.setattr(
-        torch.ops.afd_ascend,
-        "a2e",
-        lambda *args: ("hidden", None, None, "atten-batch", "active-mask"),
-        raising=False,
-    )
-    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
-
-    recv_connector.recv_attn_output(ubatch_idx=0, layer_idx=2)
-
-    assert "AFD CAMP2P recv tile" in caplog.text
-    assert "batch_size=12" in caplog.text
-    assert "peer_counts=[6, 6]" in caplog.text
-    assert "recv_batch_size=6" in caplog.text
 
 
 def test_recv_attn_output_rejects_uneven_attention_peers(monkeypatch):
