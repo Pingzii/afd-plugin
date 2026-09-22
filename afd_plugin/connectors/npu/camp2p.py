@@ -25,7 +25,6 @@ import torch.distributed as dist
 from torch.distributed.distributed_c10d import ProcessGroup
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import DPMetadata, get_forward_context
-from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from afd_plugin.compat.npu import ensure_cam_p2p_ops_available
@@ -62,7 +61,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 _CAMP2P_CUSTOM_OPS_REGISTERED = False
-logger = init_logger(__name__)
 
 # Padding value for token ids that only exist to fill a padded transfer. The
 # receiving FFN maps it to token 0 before routing, so a padded row can never
