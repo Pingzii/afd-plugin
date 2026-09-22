@@ -153,27 +153,25 @@ def _select_experts_with_fusion_ops(
     return topk_weights, topk_ids
 
 
-def apply_afd_hash_ids_alignment_patch() -> bool:
+def apply_afd_hash_ids_alignment_patch() -> None:
     """Patch the fused selector of the installed vLLM-Ascend.
 
-    Returns ``True`` when the selector was patched, and ``False`` when this
-    vLLM-Ascend revision does not expose it. The AFD FFN worker imports
+    The rebind reads the attribute directly rather than probing for it: AFD
+    patches the pinned vLLM-Ascend revision, so a revision that renamed or dropped
+    the selector has to fail here and now instead of silently leaving the upstream
+    re-alignment in place. The FFN worker imports
     ``vllm_ascend.ops.fused_moe.experts_selector`` for the force-load-balance
-    patch before calling this, so a revision that lacks the selector cannot run
-    AFD at all.
+    patch before calling this, so the module is importable either way.
     """
 
     global _PATCHED
     if _PATCHED:
-        return True
+        return
 
     from vllm_ascend.ops.fused_moe import experts_selector
 
-    if not hasattr(experts_selector, "_select_experts_with_fusion_ops"):
-        return False
     experts_selector._select_experts_with_fusion_ops = _select_experts_with_fusion_ops
     _PATCHED = True
-    return True
 
 
 __all__ = [

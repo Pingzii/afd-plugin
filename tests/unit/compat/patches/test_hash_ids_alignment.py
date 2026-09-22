@@ -153,7 +153,7 @@ def test_patch_rebinds_the_fused_selector(monkeypatch):
     module = _import_patch_module(monkeypatch)
     monkeypatch.setattr(module.torch, "ops", _fake_hash_ops(hash_calls))
 
-    assert module.apply_afd_hash_ids_alignment_patch() is True
+    module.apply_afd_hash_ids_alignment_patch()
     assert (
         selector._select_experts_with_fusion_ops
         is module._select_experts_with_fusion_ops
@@ -238,7 +238,15 @@ def test_unaligned_ids_keep_the_upstream_realignment(monkeypatch):
     assert forward_context.alignment_calls == [("pad_and_split", 2)]
 
 
-def test_patch_reports_false_without_the_selector(monkeypatch):
+def test_patch_raises_without_the_selector(monkeypatch):
+    """A renamed selector has to fail the rebind instead of passing silently.
+
+    AFD patches the pinned vLLM-Ascend revision, so the patch reads the attribute
+    instead of probing for it: a revision that dropped the selector would
+    otherwise leave the upstream id re-alignment in place, which is the behaviour
+    this patch exists to replace.
+    """
+
     forward_context = _RecordingForwardContext(input_ids=torch.arange(4))
     hash_calls: list[dict[str, Any]] = []
     _install_fake_modules(
@@ -249,7 +257,8 @@ def test_patch_reports_false_without_the_selector(monkeypatch):
     )
     module = _import_patch_module(monkeypatch)
 
-    assert module.apply_afd_hash_ids_alignment_patch() is False
+    with pytest.raises(AttributeError, match="_select_experts_with_fusion_ops"):
+        module.apply_afd_hash_ids_alignment_patch()
 
 
 def test_ids_describe_router_rows_counts_one_id_per_row():

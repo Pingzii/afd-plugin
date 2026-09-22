@@ -56,10 +56,10 @@ class AFDNPUFFNWorker(NPUWorker):
 
         # The FFN role routes Hash layers by token identity, and the ids the
         # connector installs already describe exactly the rows its router sees.
-        if not apply_afd_hash_ids_alignment_patch():
-            raise RuntimeError(
-                "AFD NPU Hash routing requires the vLLM-Ascend fused selector",
-            )
+        # The patch rebinds the pinned selector directly, so a vLLM-Ascend
+        # revision that renamed it fails here with the attribute error rather
+        # than leaving the upstream re-alignment silently in place.
+        apply_afd_hash_ids_alignment_patch()
 
         apply_afd_ascend_patches_if_needed()
         super().__init__(*args, **kwargs)
