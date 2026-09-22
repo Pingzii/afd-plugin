@@ -197,6 +197,29 @@ Four cause families are worth separating before touching the model:
   ids. This is why a larger capture size faults where a smaller one does not: the
   over-read grows with the tile. `CAMP2pAFDConnector` pads the Attention payload up
   to the tile and trims the received tile back to the rows the model produced.
+- **A tile that ignores the FlashComm shard.** With sequence parallelism
+  (FlashComm v1, `enable_sp()`) a DP rank's rows are padded to a multiple of the
+  TP size and split across its TP workers, so one Attention rank holds
+  `ceil(count / tp)` rows while `num_tokens_across_dp_cpu` reports the whole DP
+  rank. A tile built from the DP count is then `tp` times the payload the sender
+  writes: with `4A2F`, `tp=2` and 24 tokens the sender writes 12 rows and a
+  receiver sized by the DP count reads 32, so ids rows 24..31 hold that sender's
+  activations -- the exact rows, and only those rows, that fault in the plog
+  (rows 12..23 are the sender's zero-filled scales and stay silent, which is why
+  the fault looks like an off-by-eight instead of a factor of two). Every other
+  per-rank token dimension in vLLM-Ascend divides by the TP size under
+  `enable_sp()` (`vllm_ascend/worker/model_runner_v1.py`, `intermediate_tokens`,
+  `max_actual_tokens`), and `afd_plugin/a2e_layout.py::flash_comm_shard` now
+  applies the same divisor to the tile. It is 1 when SP is off, so a run without
+  FlashComm keeps its layout.
+- **A receiver and a sender that derive different tiles.** The FFN rank cannot
+  read the sender's row count from the transfer, so both roles have to reach the
+  tile from the same inputs. A receiver that falls back to its own
+  `max_num_tokens` while the sender pads to a smaller tile produces the same
+  over-read as above, and with `tp>1` it produces exactly the 12-vs-32 shape.
+  `attention_tile_rows` and `fallback_tile_rows` are the single derivation both
+  roles call, and the `rowCount` in the faulting `MoeGatingTopKHash` tiling data
+  is the tile the receiver used: `2 * tile` for `4A2F`.
 - **Ids shorter than the rows the router sees.** vLLM-Ascend's fused selector
   re-aligns `forward_context.input_ids` to the MoE's sequence-parallel layout: it
   pads them to `padded_num_tokens`, splits them across the tensor-parallel group,
@@ -208,9 +231,10 @@ Four cause families are worth separating before touching the model:
   the plog as float-pattern values (around 1e9) in the faulting cores' SU
   registers instead of token ids.
   `afd_plugin/compat/patches/npu/hash_ids_alignment.py` patches the selector so
-  that ids which already describe the router rows are used unchanged; this is the
-  case that faults on the FFN role of a split topology (`4A2F`) while the same
-  model runs on `2A2F`.
+  that ids which already describe the router rows are used unchanged. Confirm the
+  patch is in the tree the run imports before attributing a fault to this family:
+  it leaves the ids untouched, so a run that still faults identically after it is
+  installed is faulting on what the transfer delivered, not on the re-alignment.
 - **Ids that are not tokens.** Enable the value check on the FFN process:
 
   ```bash
@@ -236,9 +260,10 @@ the DP tensors are symbolic, and comparing those symbols fails with
 `Could not guard on data-dependent expression`. The payload is copied into a
 buffer of exactly the tile size: pad rows keep zeros for the hidden states and the
 sentinel the FFN maps back to token 0 for the ids, and the receive trims the
-returned tile with the reference tensor's row count. Two steps keep the rows their
-forward produced instead, because their metadata does not describe one tile for
-the whole step: an AFD ubatch, which reports per-stage counts, and a rank whose
-counts cannot describe every Attention rank. An Attention rank that produced more
-rows than the tile is the one case the layout cannot represent, and eager steps
-fail fast on it.
+returned tile with the reference tensor's row count. A rank whose counts cannot
+describe every Attention rank, and a topology the `attention_size // ffn_size`
+layout does not describe, size the tile from `max_num_tokens` divided by the same
+shard; both roles read that fallback from the same scheduler configuration, so a
+step without usable metadata still keeps one tile for the whole step. An Attention
+rank that produced more rows than the tile is the one case the layout cannot
+represent, and eager steps fail fast on it.
