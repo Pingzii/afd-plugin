@@ -175,7 +175,7 @@ The lines after the first `MTE`/`VEC` error are the aborted-context cascade
 (`EnterFailureAbort`, `Stream Synchronize failed`, `aclnnInplaceCopy`,
 `507035`), so diagnose the first error rather than the last one.
 
-Three cause families are worth separating before touching the model:
+Four cause families are worth separating before touching the model:
 
 - **Uneven Attention peers.** When there are more Attention ranks than FFN ranks,
   one FFN rank serves several Attention peers, and A2E lays that rank's ids and
@@ -197,6 +197,20 @@ Three cause families are worth separating before touching the model:
   ids. This is why a larger capture size faults where a smaller one does not: the
   over-read grows with the tile. `CAMP2pAFDConnector` pads the Attention payload up
   to the tile and trims the received tile back to the rows the model produced.
+- **Ids shorter than the rows the router sees.** vLLM-Ascend's fused selector
+  re-aligns `forward_context.input_ids` to the MoE's sequence-parallel layout: it
+  pads them to `padded_num_tokens`, splits them across the tensor-parallel group,
+  and splits them again for FlashComm v1. That is correct where the MoE chunks the
+  activations it routes, but the AFD FFN role routes the complete A2E tile and
+  never chunks them, so the ids the connector installs already cover every router
+  row and the re-alignment only shrinks the buffer below what the kernel iterates.
+  The kernel then reads unrelated device memory as token ids, which is visible in
+  the plog as float-pattern values (around 1e9) in the faulting cores' SU
+  registers instead of token ids.
+  `afd_plugin/compat/patches/npu/hash_ids_alignment.py` patches the selector so
+  that ids which already describe the router rows are used unchanged; this is the
+  case that faults on the FFN role of a split topology (`4A2F`) while the same
+  model runs on `2A2F`.
 - **Ids that are not tokens.** Enable the value check on the FFN process:
 
   ```bash
