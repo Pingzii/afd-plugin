@@ -205,7 +205,10 @@ Three cause families are worth separating before touching the model:
   smaller than the id space. Turn it off after diagnosis: the check reads device
   tensors and synchronises.
 
-Graph replay runs no Python, so the layout checks fire while the graph is
-captured, not while it is replayed. A padded transfer size is therefore frozen
-into the captured graph, which is what makes the alignment above permanent for
-that graph.
+The alignment runs outside `torch.compile`. Comparing the reported count with the
+rows a traced forward produced specializes the token dimension the compiled model
+declares dynamic, and `torch.compile` rejects that with a dynamic shape constraint
+violation naming `input_ids`. A compiled or captured step therefore keeps the rows
+its forward produced and relies on the runner reporting the count it executes,
+while eager steps get the padding and the checks above. Graph replay runs no
+Python at all, so on the compiled path the transfer size is whatever was captured.

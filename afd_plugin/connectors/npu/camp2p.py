@@ -602,10 +602,15 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             )
         input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
         forward_context = get_forward_context()
-        model_rows = int(metadata.total_tokens)
         reported_rows = _reported_attention_tokens(forward_context)
         attention_rows: int | None = None
-        if reported_rows is not None and reported_rows != model_rows:
+        # Branching on the token count specializes the dimension the compiled
+        # model declares as dynamic, so the alignment runs outside
+        # ``torch.compile`` only, exactly like the shape check above. A compiled
+        # or captured step therefore relies on the runner reporting the count it
+        # executes, which is what the reported count means.
+        if not torch.compiler.is_compiling() and reported_rows is not None:
+            model_rows = int(metadata.total_tokens)
             if reported_rows < model_rows:
                 raise RuntimeError(
                     f"CAMP2P Attention rank sends {model_rows} tokens but this "
@@ -616,23 +621,24 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                     "Align the reported token count with the rows the forward "
                     "produces.",
                 )
-            # Pad up to the reported tile: A2E reads exactly that many rows from
-            # every peer, so a short payload would otherwise leave the tail of
-            # this rank's ids and hidden-state regions unwritten.
-            pad_rows = reported_rows - model_rows
-            hidden_states = _pad_leading_rows(hidden_states, pad_rows)
-            if input_ids is not None:
-                input_ids = _pad_leading_rows(
-                    input_ids.reshape(-1),
-                    pad_rows,
-                    value=_PAD_HASH_TOKEN_ID,
+            if reported_rows > model_rows:
+                # Pad up to the reported tile: A2E reads exactly that many rows
+                # from every peer, so a short payload would otherwise leave the
+                # tail of this rank's ids and hidden-state regions unwritten.
+                pad_rows = reported_rows - model_rows
+                hidden_states = _pad_leading_rows(hidden_states, pad_rows)
+                if input_ids is not None:
+                    input_ids = _pad_leading_rows(
+                        input_ids.reshape(-1),
+                        pad_rows,
+                        value=_PAD_HASH_TOKEN_ID,
+                    )
+                metadata = AFDTransferMetadata.create_attention_metadata(
+                    layer_idx=metadata.layer_idx,
+                    stage_idx=metadata.stage_idx,
+                    seq_len=reported_rows,
                 )
-            metadata = AFDTransferMetadata.create_attention_metadata(
-                layer_idx=metadata.layer_idx,
-                stage_idx=metadata.stage_idx,
-                seq_len=reported_rows,
-            )
-            attention_rows = model_rows
+                attention_rows = model_rows
         expert_ids: torch.Tensor | None = None
         expert_scales: torch.Tensor | None = None
         compute_gate = 0

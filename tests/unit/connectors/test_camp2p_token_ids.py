@@ -521,6 +521,51 @@ def test_send_attn_output_pads_the_payload_to_the_reported_graph_size(monkeypatc
     assert forward_context.cam_afdtransfer_state.attention_rows == 3
 
 
+def test_send_attn_output_skips_alignment_while_compiling(monkeypatch):
+    """Branching on the token count would specialize a dynamic dimension.
+
+    The compiled model declares its token dimension dynamic, so comparing the
+    reported count against the produced rows inside the trace raises a dynamic
+    shape constraint violation. A compiled or captured step therefore keeps the
+    payload it produced and relies on the reported count being the count the
+    model executes.
+    """
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    forward_context = _full_graph_forward_context(num_tokens=8)
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    monkeypatch.setattr(
+        camp2p_module.torch.compiler,
+        "is_compiling",
+        lambda: True,
+    )
+    connector = _connector(role="attention", rank=0)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=3,
+        ),
+    )
+
+    connector.send_attn_output(
+        torch.zeros(3, connector.hidden_size),
+        context,
+        input_ids=torch.tensor([7, 11, 13], dtype=torch.int64),
+    )
+
+    (args,) = calls
+    assert tuple(args[0].shape) == (3, connector.hidden_size)
+    assert args[4] == 3
+    assert forward_context.cam_afdtransfer_state.attention_rows is None
+
+
 def test_send_attn_output_keeps_stage_rows_when_ubatching(monkeypatch):
     """A ubatch stage reports per-stage counts, so it must not be padded.
 
