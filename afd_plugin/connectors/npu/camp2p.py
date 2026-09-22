@@ -596,21 +596,25 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
         forward_context = get_forward_context()
         reported_rows = _reported_attention_tokens(forward_context)
-        dp_metadata = getattr(forward_context, "dp_metadata", None)
-        dp_counts = getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
-        logger.info_once(
-            "AFD CAMP2P send tile: rank=%d layer=%d stage=%d payload_rows=%s "
-            "graph_mode=%s ubatch=%s tile_rows=%s num_tokens=%s dp_counts=%s",
-            self.world_rank,
-            metadata.layer_idx,
-            metadata.stage_idx,
-            "traced" if torch.compiler.is_compiling() else int(metadata.total_tokens),
-            getattr(forward_context, "cudagraph_runtime_mode", None),
-            bool(getattr(forward_context, "ubatch_slices", None)),
-            reported_rows,
-            getattr(forward_context, "num_tokens", None),
-            None if dp_counts is None else dp_counts.tolist(),
-        )
+        # Only values that cannot come from a traced tensor shape may be logged
+        # here: formatting anything derived from ``hidden_states``/``input_ids``
+        # size forces the token dimension the compiled model declares dynamic to
+        # a constant, which torch.compile rejects. That rules out the payload row
+        # count, so the FFN side prints the tile it reads instead.
+        if reported_rows is not None:
+            dp_metadata = getattr(forward_context, "dp_metadata", None)
+            dp_counts = getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
+            logger.info_once(
+                "AFD CAMP2P send tile: rank=%d layer=%d stage=%d tile_rows=%d "
+                "graph_mode=%s ubatch=%s dp_counts=%s",
+                self.world_rank,
+                metadata.layer_idx,
+                metadata.stage_idx,
+                reported_rows,
+                getattr(forward_context, "cudagraph_runtime_mode", None),
+                bool(getattr(forward_context, "ubatch_slices", None)),
+                None if dp_counts is None else dp_counts.tolist(),
+            )
         padded_payload = False
         # Whenever the step reports a padded token count, hand the operator a
         # payload of exactly that many rows: A2E reads one equal tile per

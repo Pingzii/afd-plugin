@@ -424,7 +424,9 @@ def test_transfer_tile_diagnostics_are_logged(monkeypatch, caplog):
 
     These two lines are what a "the FFN read a tile no Attention peer wrote"
     investigation needs: the tile each rank used and the counts it derived it
-    from.
+    from. The Attention line may only carry values that cannot come from a traced
+    tensor shape, because formatting those would specialize the token dimension
+    the compiled model declares dynamic.
     """
 
     caplog.set_level(logging.INFO)
@@ -433,6 +435,11 @@ def test_transfer_tile_diagnostics_are_logged(monkeypatch, caplog):
         "afd_camp2p_send_attn_output",
         lambda *args: None,
         raising=False,
+    )
+    monkeypatch.setattr(
+        camp2p_module.torch.compiler,
+        "is_compiling",
+        lambda: True,
     )
     forward_context = _full_graph_forward_context(num_tokens=8)
     monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
@@ -451,6 +458,9 @@ def test_transfer_tile_diagnostics_are_logged(monkeypatch, caplog):
     assert "AFD CAMP2P send tile" in caplog.text
     assert "layer=1" in caplog.text
     assert "tile_rows=8" in caplog.text
+    # Values derived from the traced payload size must stay out of the line.
+    assert "payload_rows" not in caplog.text
+    assert "num_tokens" not in caplog.text
 
     recv_connector = _connector(role="ffn", rank=1)
     recv_connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 6, 6])}
