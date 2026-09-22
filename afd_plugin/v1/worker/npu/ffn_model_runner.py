@@ -266,6 +266,11 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     self.connector,
                     num_tokens_across_dp,
                 )
+                # Report the rows this rank is about to read before reading them:
+                # a step that fails inside the transfer still leaves the tile it
+                # sized the receive with, which is what the Attention peers have to
+                # have written.
+                self._report_a2e_rows(stage_idx)
                 # DBO stages can have different token counts. Build a fresh
                 # Ascend context for each stage so its MC2 padding mask matches
                 # the hidden states received for that stage.
@@ -316,24 +321,28 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         context,
                         stage_idx=stage_idx,
                     )
-        self._report_a2e_recv()
         return rank_ffn_output
 
-    def _report_a2e_recv(self) -> None:
-        """Report the A2E tile this FFN rank sized its receive with, once per step.
+    def _report_a2e_rows(self, stage_idx: int) -> None:
+        """Report the rows this rank sizes one stage's receive with.
 
-        The operator reads one equal tile per Attention peer, so this rank's rows
-        have to be the rows those peers wrote. Reporting the tile next to the DP
-        counts it came from shows a step whose metadata describes a different tile
-        than the Attention ranks padded their payloads up to -- the case that
-        makes the receive read past a peer's ids into its activations.
+        Sizing is known before the transfer runs, so the report does not depend on
+        a step that may fail inside it.
         """
 
-        recv = self.connector.last_a2e_recv
-        if recv is None or recv == self._afd_reported_recv:
+        dp_counts = self.connector.dp_token_counts.get(int(stage_idx), ())
+        a2e_rows = ffn_receive_rows(
+            dp_counts,
+            self.connector.role_rank,
+            attention_size=int(self.connector.attn_size),
+            ffn_size=int(self.connector.ffn_size),
+            shard=int(self.connector.attention_shard),
+            fallback=int(self.max_num_tokens),
+        )
+        report = (int(stage_idx), a2e_rows, tuple(int(count) for count in dp_counts))
+        if report == self._afd_reported_recv:
             return
-        self._afd_reported_recv = recv
-        stage_idx, a2e_rows, dp_counts = recv
+        self._afd_reported_recv = report
         tiles = ffn_tile_count(
             attention_size=int(self.connector.attn_size),
             ffn_size=int(self.connector.ffn_size),
@@ -342,12 +351,12 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             "AFD NPU A2E recv; world_rank=%d stage=%d a2e_rows=%d rows_per_peer=%d "
             "tiles=%d shard=%d dp_counts=%s",
             self.connector.world_rank,
-            stage_idx,
+            int(stage_idx),
             a2e_rows,
             a2e_rows // max(1, tiles),
             tiles,
             int(self.connector.attention_shard),
-            dp_counts,
+            report[2],
         )
 
     def _ffn_forward_connector_driven(
