@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from afd_plugin.envs import validate_hash_token_ids_enabled
+
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
@@ -99,6 +101,57 @@ def hash_input_ids_from_context(
     )
 
 
+def validate_hash_token_ids(
+    input_ids: torch.Tensor,
+    *,
+    table_rows: int,
+    context: str,
+) -> None:
+    """Fail fast when Hash routing ids cannot index the ``tid2eid`` table.
+
+    The CANN Hash operator indexes the token-to-expert table with the raw id of
+    each row (``moe_gating_top_k_hash_regbase.h``) and never validates it, so one
+    id outside ``[0, table_rows)`` faults the AIV core with an MTE DDR
+    out-of-range error and reports only which core died. Reporting the offending
+    rows here instead names the culprit: ids that are plausible tokens point at a
+    table that is too small, while ids that are not tokens at all point at an id
+    buffer that was never fully written for the rows being routed.
+
+    Disabled unless ``AFD_VALIDATE_HASH_TOKEN_IDS=1``, because the check reads
+    device tensors and synchronises.
+
+    Args:
+        input_ids: Ids about to be handed to the Hash operator.
+        table_rows: Row count of the ``tid2eid`` table they index.
+        context: Human-readable description of the routing path, used in the
+            error message.
+
+    Raises:
+        RuntimeError: If the table has no rows, or if any id is outside it.
+    """
+
+    if not validate_hash_token_ids_enabled():
+        return
+    rows = int(table_rows)
+    if rows <= 0:
+        raise RuntimeError(
+            f"{context}: the Hash token-to-expert table has {rows} rows, so no "
+            "id can be routed through it",
+        )
+    ids = input_ids.reshape(-1)
+    invalid = (ids < 0) | (ids >= rows)
+    invalid_count = int(invalid.sum())
+    if invalid_count == 0:
+        return
+    invalid_index = invalid.nonzero().flatten()[:8]
+    raise RuntimeError(
+        f"{context}: {invalid_count} of {int(ids.numel())} Hash routing ids are "
+        f"outside [0, {rows}) and would fault the tid2eid lookup on device; "
+        f"rows={invalid_index.tolist()} values={ids[invalid_index].tolist()} "
+        f"min={int(ids.min())} max={int(ids.max())} dtype={ids.dtype}",
+    )
+
+
 def compute_attention_gate_topk(
     moe: AFDDeepseekV4AttentionGateRemoteMoE,
     hidden_states: torch.Tensor,
@@ -150,6 +203,12 @@ def _compute_sqrtsoftplus_topk(
     correction_bias = moe.gate.e_score_correction_bias
     if correction_bias is not None and correction_bias.dtype != router_logits.dtype:
         correction_bias = correction_bias.to(router_logits.dtype)
+    if input_ids is not None and tid2eid is not None:
+        validate_hash_token_ids(
+            input_ids,
+            table_rows=int(tid2eid.shape[0]),
+            context="DSV4 Attention-side Hash routing",
+        )
     topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
         x=router_logits,
         k=moe.top_k,

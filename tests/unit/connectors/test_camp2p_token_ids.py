@@ -156,6 +156,7 @@ def _vllm_config() -> SimpleNamespace:
                 num_experts_per_tok=2,
                 n_routed_experts=4,
                 n_shared_experts=0,
+                vocab_size=256,
             ),
         ),
     )
@@ -221,35 +222,53 @@ def test_received_token_ids_collapses_replicated_columns():
         expected_tokens=3,
     )
 
-    received = received_token_ids(sent_ids, expected_tokens=3)
+    received = received_token_ids(sent_ids, expected_tokens=3, written_tokens=3)
 
     assert received.dtype == torch.int32
     assert received.tolist() == [7, 11, 13]
 
 
 def test_received_token_ids_trims_operator_padded_capacity():
-    # The operator works on a padded capacity, so extra trailing rows are normal.
+    # The operator sizes its output to the capacity it was given rather than to
+    # the rows it writes, so extra trailing rows are normal.
     sent_ids, _ = prepare_token_id_transfer(
         torch.tensor([7, 11, 13, 99, 99], dtype=torch.int32),
         topk=2,
         expected_tokens=5,
     )
 
-    received = received_token_ids(sent_ids, expected_tokens=3)
+    received = received_token_ids(sent_ids, expected_tokens=3, written_tokens=3)
 
     assert received.tolist() == [7, 11, 13]
 
 
-def test_received_token_ids_rejects_alignment_shortfall():
-    """Misaligned ids must fail loudly rather than route the wrong tokens."""
+def test_received_token_ids_rejects_unwritten_tail_rows():
+    """Rows the transfer never writes must fail loudly.
+
+    ``expected_tokens`` is what the FFN computes on while ``written_tokens`` is
+    what A2E actually wrote. A shortfall means the tail rows still hold
+    uninitialised device memory, which a Hash layer reads as an out-of-range
+    ``tid2eid`` index.
+    """
+    sent_ids, _ = prepare_token_id_transfer(
+        torch.tensor([7, 11, 13], dtype=torch.int32),
+        topk=2,
+        expected_tokens=3,
+    )
+
+    with pytest.raises(ValueError, match="uninitialised device memory"):
+        received_token_ids(sent_ids, expected_tokens=5, written_tokens=3)
+
+
+def test_received_token_ids_rejects_capacity_below_written_rows():
     sent_ids, _ = prepare_token_id_transfer(
         torch.tensor([7, 11], dtype=torch.int32),
         topk=2,
         expected_tokens=2,
     )
 
-    with pytest.raises(ValueError, match="not aligned with the FFN token layout"):
-        received_token_ids(sent_ids, expected_tokens=5)
+    with pytest.raises(ValueError, match="not sized for this topology"):
+        received_token_ids(sent_ids, expected_tokens=3, written_tokens=3)
 
 
 def test_send_attn_output_selects_the_operator_ids_mode(monkeypatch):
@@ -328,8 +347,9 @@ def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(monkeypat
     monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
     connector = _connector(role="ffn", rank=1)
-    # FFN rank 1 owns attention ranks 2 and 3, so it computes on 5 + 7 tokens.
-    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+    # FFN rank 1 owns attention ranks 2 and 3, so it computes on 6 + 6 tokens.
+    # A2E lays those out as two equal tiles, so the peers have to agree.
+    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 6, 6])}
 
     with_ids = connector.recv_attn_output(
         ubatch_idx=0,
@@ -360,3 +380,83 @@ def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(monkeypat
     ]
     assert calls[1][-1] == 0
     assert without_ids.input_ids is None
+
+
+def _a2e_returning_ids(*, first_id: int) -> Any:
+    """Build an operator stub whose id column starts at ``first_id``."""
+
+    def fake_a2e(*args: Any) -> tuple[Any, ...]:
+        tokens, topk = int(args[3]), int(args[5])
+        ids = (
+            (torch.arange(tokens, dtype=torch.int32) + first_id)
+            .unsqueeze(1)
+            .expand(tokens, topk)
+            .contiguous()
+        )
+        return ("hidden", ids, None, "atten-batch", "active-mask")
+
+    return fake_a2e
+
+
+def test_recv_attn_output_rejects_uneven_attention_peers(monkeypatch):
+    """Uneven peers must fail before the transfer, not on the device.
+
+    A2E lays one FFN rank's ids and hidden states out as equal per-peer tiles.
+    With 5 and 7 tokens the receiver reads a fixed 6 rows per peer, so the rows
+    no longer follow the FFN's token layout and the tail ids rows are never
+    written; a Hash layer would read that memory as an out-of-range id.
+    """
+
+    def fail_a2e(*args: Any) -> tuple[Any, ...]:
+        raise AssertionError("A2E must not run for an uneven Attention group")
+
+    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fail_a2e, raising=False)
+    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    connector = _connector(role="ffn", rank=1)
+    # FFN rank 1 owns attention ranks 2 and 3: 5 and 7 tokens.
+    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+
+    with pytest.raises(RuntimeError, match="uneven token counts"):
+        connector.recv_attn_output(ubatch_idx=0, layer_idx=0, recv_input_ids=True)
+
+
+def test_recv_attn_output_validates_hash_ids_when_enabled(monkeypatch):
+    """The opt-in check names the rows a device ``tid2eid`` read would fault on."""
+
+    monkeypatch.setenv("AFD_VALIDATE_HASH_TOKEN_IDS", "1")
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "a2e",
+        _a2e_returning_ids(first_id=4096),
+        raising=False,
+    )
+    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    connector = _connector(role="ffn", rank=1)
+    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 6, 6])}
+
+    with pytest.raises(RuntimeError, match=r"outside \[0, 256\)"):
+        connector.recv_attn_output(ubatch_idx=0, layer_idx=0, recv_input_ids=True)
+
+
+def test_recv_attn_output_skips_hash_id_validation_by_default(monkeypatch):
+    """The check synchronises, so a default run must not pay for it."""
+
+    monkeypatch.delenv("AFD_VALIDATE_HASH_TOKEN_IDS", raising=False)
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "a2e",
+        _a2e_returning_ids(first_id=4096),
+        raising=False,
+    )
+    monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
+    connector = _connector(role="ffn", rank=1)
+    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 6, 6])}
+
+    payload = connector.recv_attn_output(
+        ubatch_idx=0,
+        layer_idx=0,
+        recv_input_ids=True,
+    )
+
+    assert payload.input_ids is not None
+    assert payload.input_ids[0].item() == 4096
