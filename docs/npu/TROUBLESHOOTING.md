@@ -6,6 +6,9 @@ connectors. Use it together with the connector-specific setup guide:
 - [CAM async connector](CAM_ASYNC_CONNECTOR_USER_GUIDE.md)
 - [CAM P2P connector](CAM_P2P_CONNECTOR_USER_GUIDE.md)
 
+For Ascend 950 (A5) platform issues, including the expert-parallel MC2 dispatch
+failure, see the [A5 bring-up notes](A5_BRINGUP_NOTES.md).
+
 Before troubleshooting, confirm that every Attention and FFN process uses the
 same model, AFD topology, rendezvous address, and connector settings. Also use
 the vLLM, vLLM-Ascend, CANN, and CAM versions documented by the selected
@@ -175,7 +178,7 @@ The lines after the first `MTE`/`VEC` error are the aborted-context cascade
 (`EnterFailureAbort`, `Stream Synchronize failed`, `aclnnInplaceCopy`,
 `507035`), so diagnose the first error rather than the last one.
 
-Two cause families are worth separating before touching the model:
+Three cause families are worth separating before touching the model:
 
 - **Uneven Attention peers.** When there are more Attention ranks than FFN ranks,
   one FFN rank serves several Attention peers, and A2E lays that rank's ids and
@@ -184,6 +187,16 @@ Two cause families are worth separating before touching the model:
   `CAMP2pAFDConnector` now refuses the transfer and reports the counts it saw, so
   check the DP metadata (`num_tokens_across_dp_cpu`) that Attention sends and the
   TP-to-AFD rank expansion it is read through.
+- **A padded step that sends unpadded rows.** When the runner pads the Attention
+  batch (FULL CUDA graphs, DP padding) it reports the padded token count for the
+  rank, and A2E reads exactly `batch_size / attnToMoeRatio` rows per peer, in both
+  directions. A sender that writes fewer rows leaves the tail of its regions
+  unwritten, and the receiver's over-read first crosses the zero-filled scales
+  region and then the sender's activations, which a Hash layer reads as huge token
+  ids. This is why a larger capture size faults where a smaller one does not: the
+  over-read grows with the tile. `CAMP2pAFDConnector` now pads the Attention
+  payload up to the reported count and trims the received tile back to the rows
+  the model produced.
 - **Ids that are not tokens.** Enable the value check on the FFN process:
 
   ```bash
@@ -194,3 +207,8 @@ Two cause families are worth separating before touching the model:
   an id buffer that was never fully written from a `tid2eid` table that is
   smaller than the id space. Turn it off after diagnosis: the check reads device
   tensors and synchronises.
+
+Graph replay runs no Python, so the layout checks fire while the graph is
+captured, not while it is replayed. A padded transfer size is therefore frozen
+into the captured graph, which is what makes the alignment above permanent for
+that graph.
