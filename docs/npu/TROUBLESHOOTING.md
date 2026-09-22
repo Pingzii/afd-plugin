@@ -188,6 +188,25 @@ Four cause families are worth separating before touching the model:
   padded tiles, so the transfer is aligned in eager steps as well as in graphs.
   DP ranks hold independent batches, which is where uneven counts come from; check
   `num_tokens_across_dp_cpu` and the TP-to-AFD rank expansion it is read through.
+- **A sender that sizes its payload by its own report.** This is the shape a
+  split `4A2F` topology on DP-only ranks (`--tensor-parallel-size 1`) actually
+  hits. Under FULL graphs every Attention rank replays the graph matching *its
+  own* padded token count, so the peers of one FFN rank can genuinely differ
+  (12 rows on one rank, 32 on another). The publish path reports one count for
+  every Attention rank, and only `min(attention_size, ffn_size)` ranks publish at
+  all, so with `A > F` an FFN rank never learns the real size of the peer that
+  did not publish. A sender that then pads to *its own* count writes 12 rows while
+  the receiver reads 32 per peer, and the over-read starts exactly at row `2 *
+  12 = 24`: rows 12..23 are the sender's zero-filled scales and stay silent, and
+  rows 24..31 are the sender's activations, which the router reads as token ids.
+  The fault onset row is therefore `2 * sender_rows`, and `rowCount` in the
+  tiling data is the receiver's tile, not the sender's payload. With `A == F`
+  each FFN rank has exactly one peer and receives that peer's own payload, which
+  is why the same model runs on `2A2F`. `CAMP2pAFDConnector` now derives the tile
+  from the published metadata on the sending side too, so the payload is padded up
+  to the tile the receiver uses; a sender whose own rows exceed the published tile
+  is a step this layout cannot represent and eager steps fail fast on it with both
+  row counts in the message.
 - **A padded step that sends unpadded rows.** When the runner pads the Attention
   batch (FULL CUDA graphs, DP padding) it reports the padded token count for the
   rank, and A2E reads exactly `batch_size / attnToMoeRatio` rows per peer, in both
@@ -197,13 +216,14 @@ Four cause families are worth separating before touching the model:
   ids. This is why a larger capture size faults where a smaller one does not: the
   over-read grows with the tile. `CAMP2pAFDConnector` pads the Attention payload up
   to the tile and trims the received tile back to the rows the model produced.
-- **A tile that ignores the FlashComm shard.** With sequence parallelism
-  (FlashComm v1, `enable_sp()`) a DP rank's rows are padded to a multiple of the
-  TP size and split across its TP workers, so one Attention rank holds
-  `ceil(count / tp)` rows while `num_tokens_across_dp_cpu` reports the whole DP
-  rank. A tile built from the DP count is then `tp` times the payload the sender
-  writes: with `4A2F`, `tp=2` and 24 tokens the sender writes 12 rows and a
-  receiver sized by the DP count reads 32, so ids rows 24..31 hold that sender's
+- **A tile that ignores the FlashComm shard.** Only reachable with
+  `--tensor-parallel-size > 1`. With sequence parallelism (FlashComm v1,
+  `enable_sp()`) a DP rank's rows are padded to a multiple of the TP size and
+  split across its TP workers, so one Attention rank holds `ceil(count / tp)` rows
+  while `num_tokens_across_dp_cpu` reports the whole DP rank. A tile built from the
+  DP count is then `tp` times the payload the sender writes: with `4A2F`, `tp=2`
+  and 24 tokens the sender writes 12 rows and a receiver sized by the DP count
+  reads 32, so ids rows 24..31 hold that sender's
   activations -- the exact rows, and only those rows, that fault in the plog
   (rows 12..23 are the sender's zero-filled scales and stay silent, which is why
   the fault looks like an off-by-eight instead of a factor of two). Every other
