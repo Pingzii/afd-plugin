@@ -194,8 +194,12 @@ runtime integration and are not stable third-party extension interfaces.
 `afd_plugin.envs` centralizes diagnostic and offline-scheduler environment
 names. `AFD_CAMP2P_STUB_IO` and `AFD_FORCE_BALANCED_TOPK_IDS` have boolean
 helpers; offline scheduler CSV/rank/request-index names are exported for their
-consumers. Environment switches do not replace `additional_config["afd"]` as
-the activation or topology channel.
+consumers. `AFD_VALIDATE_HASH_TOKEN_IDS` is a diagnostic boolean that makes the
+NPU Hash-id boundary check the ids it is about to route against the table that
+indexes them, naming the offending rows; it reads device tensors and
+synchronizes, so it stays off unless an operator enables it for a diagnosis.
+Environment switches do not replace `additional_config["afd"]` as the activation
+or topology channel.
 
 `VLLM_USE_V2_MODEL_RUNNER` belongs to the upstream runtime and selects the V1
 or V2 construction path; it does not activate AFD or relax AFD validation.
