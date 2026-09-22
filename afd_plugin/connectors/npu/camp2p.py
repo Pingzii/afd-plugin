@@ -668,31 +668,31 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 "back, so the extra tokens cannot be represented. Align the "
                 "reported token count with the rows the forward produces.",
             )
-        # Hand the operator a payload of exactly the tile's rows: A2E reads one
-        # equal tile per Attention peer in both directions, so a shorter payload
-        # would leave the tail of this rank's ids and hidden-state regions
+        # Hand the operator a payload of exactly the tile's rows when the forward
+        # produced fewer: A2E reads one equal tile per Attention peer, so a shorter
+        # payload would leave the tail of this rank's ids and hidden-state regions
         # unwritten and the receiving FFN would read the neighbouring regions as
-        # token ids. The copy goes through a fixed-size buffer rather than a
-        # computed pad amount because the pad amount would have to read this
-        # payload's token count, which specializes the dimension the compiled
-        # model declares dynamic.
-        hidden_states = self._wire_payload(
-            hidden_states,
-            wire_rows=wire_rows,
-            fill=0,
-        )
-        if input_ids is not None:
-            input_ids = self._wire_payload(
-                input_ids.reshape(-1).to(torch.int32),
+        # token ids. A step whose rows already are the tile keeps its payload and
+        # its buffers untouched, which matters inside a captured graph, where a
+        # buffer allocated for the copy would be frozen at its capture address.
+        padded_payload = wire_rows > int(metadata.total_tokens)
+        if padded_payload:
+            hidden_states = self._wire_payload(
+                hidden_states,
                 wire_rows=wire_rows,
-                fill=_PAD_HASH_TOKEN_ID,
+                fill=0,
             )
-        metadata = AFDTransferMetadata.create_attention_metadata(
-            layer_idx=metadata.layer_idx,
-            stage_idx=metadata.stage_idx,
-            seq_len=wire_rows,
-        )
-        padded_payload = True
+            if input_ids is not None:
+                input_ids = self._wire_payload(
+                    input_ids.reshape(-1).to(torch.int32),
+                    wire_rows=wire_rows,
+                    fill=_PAD_HASH_TOKEN_ID,
+                )
+            metadata = AFDTransferMetadata.create_attention_metadata(
+                layer_idx=metadata.layer_idx,
+                stage_idx=metadata.stage_idx,
+                seq_len=wire_rows,
+            )
         expert_ids: torch.Tensor | None = None
         expert_scales: torch.Tensor | None = None
         compute_gate = 0
