@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from afd_plugin.a2e_layout import padded_ffn_token_counts
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -181,22 +183,20 @@ def _aggregate_ffn_values_tuple(
     ffn_size: int,
     fallback: int,
 ) -> tuple[int, ...]:
-    # Expand DP-level values to AFD-level when TP > 1.
-    # With TP > 1, attention_size = num_attention_ranks includes TP workers
-    # but values only has dp_size entries (from num_tokens_across_dp_cpu).
-    # Each DP rank's count is replicated tp_size times because all TP workers
-    # within the same DP rank process the same tokens.
-    expanded = values
-    if len(values) < attention_size and attention_size % len(values) == 0:
-        tp_size = attention_size // len(values)
-        expanded = tuple(values[i // tp_size] for i in range(attention_size))
-    if len(expanded) < attention_size:
-        return tuple(max(1, int(fallback)) for _ in range(ffn_size))
-    group_size = attention_size // ffn_size
-    return tuple(
-        max(1, sum(expanded[idx * group_size : (idx + 1) * group_size]))
-        for idx in range(ffn_size)
+    # Only the AFD NPU runners pass the role sizes, so this branch describes the
+    # A2E tile layout: every FFN rank receives ``attention_size // ffn_size`` tiles
+    # of the largest count in its (strided) Attention peer group. The key has to
+    # match the rows the transfer actually delivers, because a key built from the
+    # real counts would send an uneven step to eager execution with a tile A2E
+    # cannot represent.
+    ffn_counts = padded_ffn_token_counts(
+        values,
+        attention_size=int(attention_size),
+        ffn_size=int(ffn_size),
     )
+    if ffn_counts is None:
+        return tuple(max(1, int(fallback)) for _ in range(ffn_size))
+    return tuple(max(1, int(count)) for count in ffn_counts)
 
 
 __all__ = [

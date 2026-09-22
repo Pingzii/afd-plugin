@@ -15,6 +15,7 @@ from vllm.platforms import current_platform
 from vllm_ascend import ascend_forward_context as ascend_context
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, graph_capture
 
+from afd_plugin.a2e_layout import padded_ffn_token_counts
 from afd_plugin.compat.npu import (
     ascend_forward_context,
     fail_if_unsupported_npu_afd_features,
@@ -546,35 +547,23 @@ def _ffn_token_counts_across_ranks(
     fallback: int,
 ) -> torch.Tensor:
     dp_metadata = dp_metadata_list.get(int(stage_idx))
-    if dp_metadata is None:
+    counts = (
+        _to_int_list(dp_metadata.num_tokens_across_dp_cpu)
+        if dp_metadata is not None
+        else []
+    )
+    # A2E hands one padded tile per Attention peer to every FFN rank, so this rank
+    # computes on whole tiles even when the DP ranks hold different batch sizes.
+    # The connector sizes the same transfer from these counts.
+    ffn_counts = padded_ffn_token_counts(
+        counts,
+        attention_size=int(connector.attn_size),
+        ffn_size=int(connector.ffn_size),
+    )
+    if ffn_counts is None:
         values = [max(1, int(fallback))] * int(connector.ffn_size)
     else:
-        attention_counts = _to_int_list(dp_metadata.num_tokens_across_dp_cpu)
-        # Expand DP-level counts to AFD-level counts when TP > 1.
-        # With TP, attn_size = num_attention_ranks includes TP workers
-        # but num_tokens_across_dp_cpu only has dp_size entries.
-        # Each DP rank's token count is replicated tp_size times because
-        # all TP workers within the same DP rank process the same tokens.
-        if (
-            len(attention_counts) < int(connector.attn_size)
-            and int(connector.attn_size) % len(attention_counts) == 0
-        ):
-            tp_size = int(connector.attn_size) // len(attention_counts)
-            attention_counts = [
-                attention_counts[i // tp_size] for i in range(int(connector.attn_size))
-            ]
-        if (
-            len(attention_counts) >= int(connector.attn_size)
-            and int(connector.attn_size) >= int(connector.ffn_size)
-            and int(connector.attn_size) % int(connector.ffn_size) == 0
-        ):
-            group_size = int(connector.attn_size) // int(connector.ffn_size)
-            values = [
-                max(1, sum(attention_counts[idx * group_size : (idx + 1) * group_size]))
-                for idx in range(int(connector.ffn_size))
-            ]
-        else:
-            values = [max(1, int(fallback))] * int(connector.ffn_size)
+        values = [max(1, int(count)) for count in ffn_counts]
     return torch.tensor(values, dtype=torch.int32, device="cpu")
 
 

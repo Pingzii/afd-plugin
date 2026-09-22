@@ -124,7 +124,7 @@ def _init_ffn_connector(rank, vllm_config):
     return connector
 
 
-def test_camp2p_recv_attn_output_uses_original_contiguous_af_grouping(monkeypatch):
+def test_camp2p_recv_attn_output_uses_the_padded_a2e_tile_layout(monkeypatch):
     torch = pytest.importorskip("torch")
     monkeypatch.setattr(
         torch.ops.afd_ascend,
@@ -132,8 +132,10 @@ def test_camp2p_recv_attn_output_uses_original_contiguous_af_grouping(monkeypatc
         lambda *args: ("hidden", None, None, "atten-batch", "active-mask"),
         raising=False,
     )
-    # Even peers per group: A2E lays one FFN rank out as equal per-peer tiles.
-    dp_metadata_list = {0: _FakeDPMetadata([2, 2, 5, 5])}
+    # A2E pairs FFN rank r with Attention ranks r, r + ffn_size, ... and reads one
+    # equal tile per peer, so each FFN rank sizes the transfer from the largest
+    # count of its own peer group: F0 owns {A0, A2} and F1 owns {A1, A3}.
+    dp_metadata_list = {0: _FakeDPMetadata([2, 2, 5, 7])}
     rank0 = _init_ffn_connector(0, _vllm_config())
     rank1 = _init_ffn_connector(1, _vllm_config())
     rank0.dp_metadata_list = dp_metadata_list
@@ -142,11 +144,12 @@ def test_camp2p_recv_attn_output_uses_original_contiguous_af_grouping(monkeypatc
     context0 = rank0.recv_attn_output(ubatch_idx=0, layer_idx=3).context
     context1 = rank1.recv_attn_output(ubatch_idx=0, layer_idx=3).context
 
-    assert context0.metadata.seq_lens == [4]
-    assert context1.metadata.seq_lens == [10]
+    assert context0.metadata.seq_lens == [10]
+    assert context1.metadata.seq_lens == [14]
     assert isinstance(context0.states, CAMP2PTransferState)
     assert isinstance(context0.states, AFDTransferState)
-    assert context0.states.batch_size == 4
+    assert context0.states.batch_size == 10
+    assert context1.states.batch_size == 14
     assert context0.states.h == 16
     assert context0.states.k == 2
 
@@ -187,7 +190,8 @@ def test_camp2p_recv_attn_output_drives_the_operator_ids_mode(monkeypatch):
     )
 
     assert calls[0][-1] == 1
-    assert with_ids.input_ids.tolist() == [0, 2, 4, 6]
+    # F0 owns A0 and A2, which hold 2 and 5 tokens, so the padded tile is 5.
+    assert with_ids.input_ids.tolist() == [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
     assert calls[1][-1] == 0
     assert without_ids.input_ids is None
 
@@ -242,7 +246,8 @@ def test_camp2p_connector_uses_role_specific_core_num(monkeypatch):
     states = connector.recv_attn_output(ubatch_idx=0, layer_idx=3).context.states
 
     assert states.k == 2
-    assert states.batch_size == 4
+    # F0 owns A0 and A2, whose largest count is 5, and A2E reads two such tiles.
+    assert states.batch_size == 10
     # The ffn_core_num override applies because this is an FFN-role connector.
     assert states.aiv_num == 13
 
