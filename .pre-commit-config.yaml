@@ -30,8 +30,8 @@ repos:
     hooks:
       - id: typos
         # Copied upstream patch bodies keep upstream spelling, and one of them
-        # names a local `splitted_input`. The mypy wrapper excludes the same
-        # tree for the same reason.
+        # names a local variable with a spelling this checker rejects. The mypy
+        # wrapper excludes the same tree for the same reason.
         exclude: ^afd_plugin/compat/patches/
 
   - repo: https://github.com/rhysd/actionlint
