@@ -22,6 +22,7 @@ from afd_plugin.a2e_layout import (
     ffn_tile_count,
     flash_comm_shard,
     padded_tile_rows,
+    sharded_rows,
 )
 
 
