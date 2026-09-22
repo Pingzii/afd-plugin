@@ -33,6 +33,7 @@ ascend_kernels/
   e2a/{op_api,op_host,op_kernel}
   afd_async_*/{op_api,op_host,op_kernel}  # four routed-only ops
   grouped_matmul_swiglu_quant_v2_layered/{op_api,op_host,op_kernel}
+  grouped_matmul_layered/{op_api,op_host,op_kernel}
   utils/op_host/           # CAM host logging/check/tiling-base headers
   utils/op_kernel/         # comm_args.h, data_copy.h, moe_distribute_base.h, layered/
 ```
