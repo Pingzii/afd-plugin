@@ -215,11 +215,16 @@ the sender pads up to it and the receiver sizes the operator with it. It cannot
 compare the tile with the rows a traced forward produced, because that
 specializes the token dimension the compiled model declares dynamic and
 `torch.compile` rejects it with a constraint violation naming `input_ids`. The
-payload is therefore copied into a buffer of exactly the tile size: pad rows keep
-zeros for the hidden states and the sentinel the FFN maps back to token 0 for the
-ids, and the receive trims the returned tile with the reference tensor's row
-count. Two steps keep the rows their forward produced instead, because their
-metadata does not describe one tile for the whole step: an AFD ubatch, which
-reports per-stage counts, and a rank whose counts cannot describe every Attention
-rank. An Attention rank that produced more rows than the tile is the one case the
-layout cannot represent, and eager steps fail fast on it.
+control plane therefore also copies the counts into plain integers when it
+publishes them, and everything the connector derives from them (the tile, the
+rows an FFN rank computes on) comes from that snapshot: inside a traced forward
+the DP tensors are symbolic, and comparing those symbols fails with
+`Could not guard on data-dependent expression`. The payload is copied into a
+buffer of exactly the tile size: pad rows keep zeros for the hidden states and the
+sentinel the FFN maps back to token 0 for the ids, and the receive trims the
+returned tile with the reference tensor's row count. Two steps keep the rows their
+forward produced instead, because their metadata does not describe one tile for
+the whole step: an AFD ubatch, which reports per-stage counts, and a rank whose
+counts cannot describe every Attention rank. An Attention rank that produced more
+rows than the tile is the one case the layout cannot represent, and eager steps
+fail fast on it.

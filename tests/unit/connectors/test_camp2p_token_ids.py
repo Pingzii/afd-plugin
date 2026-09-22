@@ -109,6 +109,7 @@ def _vllm_stub() -> Iterator[None]:
 with _vllm_stub():
     from afd_plugin.config import AFDConfig
     from afd_plugin.connectors.metadata import (
+        AFDControlPayload,
         AFDTransferContext,
         AFDTransferMetadata,
     )
@@ -193,6 +194,26 @@ def _connector(*, role: str, rank: int) -> CAMP2pAFDConnector:
     connector.hccl_comm_name3 = ""
     connector.hccl_comm_name1 = "moe"
     return connector
+
+
+def _publish_dp_metadata(
+    connector: CAMP2pAFDConnector,
+    dp_metadata_list: dict[int, _FakeDPMetadata],
+) -> None:
+    """Publish DP metadata the way the control plane does.
+
+    The connector derives its A2E tile from an integer snapshot that the control
+    plane takes when it publishes a payload, so a test that wants a connector to
+    know the counts has to go through the same path.
+    """
+
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload(
+            dp_metadata_list=dp_metadata_list,
+            is_graph_capturing=False,
+            is_warmup=False,
+        ),
+    )
 
 
 def test_prepare_token_id_transfer_replicates_ids_across_columns():
@@ -330,7 +351,7 @@ def test_recv_attn_output_mode_and_ids_follow_the_receiver_declaration(monkeypat
     connector = _connector(role="ffn", rank=1)
     # FFN rank 1 owns attention ranks 1 and 3, so it computes on 6 + 6 tokens.
     # A2E lays those out as two equal tiles, so the peers have to agree.
-    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 6, 6])}
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([2, 3, 6, 6])})
 
     with_ids = connector.recv_attn_output(
         ubatch_idx=0,
@@ -419,7 +440,7 @@ def test_recv_attn_output_sizes_uneven_attention_peers_by_the_padded_tile(monkey
     )
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
     connector = _connector(role="ffn", rank=1)
-    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([2, 3, 5, 7])})
 
     payload = connector.recv_attn_output(ubatch_idx=0, layer_idx=0, recv_input_ids=True)
 
@@ -447,7 +468,7 @@ def test_recv_attn_output_follows_the_strided_attention_peer_group(monkeypatch):
     )
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
     connector = _connector(role="ffn", rank=0)
-    connector.dp_metadata_list = {0: _FakeDPMetadata([4, 8, 16, 16])}
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([4, 8, 16, 16])})
 
     connector.recv_attn_output(ubatch_idx=0, layer_idx=0, recv_input_ids=True)
 
@@ -466,7 +487,7 @@ def test_recv_attn_output_validates_hash_ids_when_enabled(monkeypatch):
     )
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
     connector = _connector(role="ffn", rank=1)
-    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 6, 6])}
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([2, 3, 6, 6])})
 
     with pytest.raises(RuntimeError, match=r"outside \[0, 256\)"):
         connector.recv_attn_output(ubatch_idx=0, layer_idx=0, recv_input_ids=True)
@@ -484,7 +505,7 @@ def test_recv_attn_output_skips_hash_id_validation_by_default(monkeypatch):
     )
     monkeypatch.setattr(camp2p_module, "torch", _CpuTorch())
     connector = _connector(role="ffn", rank=1)
-    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 6, 6])}
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([2, 3, 6, 6])})
 
     payload = connector.recv_attn_output(
         ubatch_idx=0,
@@ -631,7 +652,7 @@ def test_send_attn_output_pads_uneven_peers_to_the_group_tile(monkeypatch):
     forward_context = _eager_forward_context(num_tokens=4)
     monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
     connector = _connector(role="attention", rank=0)
-    connector.dp_metadata_list = {0: _FakeDPMetadata([4, 8, 16, 16])}
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([4, 8, 16, 16])})
     context = AFDTransferContext(
         metadata=AFDTransferMetadata.create_attention_metadata(
             layer_idx=0,
@@ -668,7 +689,7 @@ def test_send_attn_output_keeps_an_even_payload(monkeypatch):
     forward_context = _eager_forward_context(num_tokens=16)
     monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
     connector = _connector(role="attention", rank=0)
-    connector.dp_metadata_list = {0: _FakeDPMetadata([16, 16, 16, 16])}
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([16, 16, 16, 16])})
     context = AFDTransferContext(
         metadata=AFDTransferMetadata.create_attention_metadata(
             layer_idx=0,
