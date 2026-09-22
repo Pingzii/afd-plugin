@@ -1302,22 +1302,44 @@ def _register_camp2p_custom_ops() -> None:
         world_rank: int,
         aiv_num: int,
     ) -> torch.Tensor:
-        transfer_state = getattr(get_forward_context(), "cam_afdtransfer_state", None)
-        if transfer_state is None or transfer_state.atten_batch_size is None:
-            raise RuntimeError("CAMP2P Attention side is missing A2E handle data")
+        forward_context = get_forward_context()
+        transfer_state = getattr(forward_context, "cam_afdtransfer_state", None)
+        if transfer_state is None:
+            raise RuntimeError(
+                "CAMP2P Attention side is missing connector data: the A2E send did "
+                "not run in this forward context "
+                f"(num_tokens={getattr(forward_context, 'num_tokens', None)}, "
+                f"ubatch_idx={getattr(forward_context, 'ubatch_idx', None)}, "
+                "runtime_mode="
+                f"{getattr(forward_context, 'cudagraph_runtime_mode', None)})",
+            )
+        atten_batch_size = transfer_state.atten_batch_size
+        if atten_batch_size is None:
+            # The A2E call runs in the model forward, and a graph execution path
+            # does not re-run that Python, so the per-peer row count it publishes
+            # can be missing here. The E2A kernel accepts that tensor but never
+            # reads it (``csrc/npu/ascend_kernels/e2a/op_kernel/e2a.h`` binds
+            # ``attenBatchSize`` and nothing else), so size it from the tile this
+            # rank receives instead of failing the step.
+            atten_batch_size = torch.full(
+                (max(1, -(-int(attn_size) // max(1, int(ffn_size)))),),
+                int(batch_size),
+                dtype=torch.int32,
+                device=ref_tensor.device,
+            )
         transfer_state.batch_size = batch_size
         transfer_state.h = hidden_size
         transfer_state.k = topk
         transfer_state.aiv_num = aiv_num
         group_ep = _get_group_ep(
-            int(getattr(get_forward_context(), "ubatch_idx", 0)),
+            int(getattr(forward_context, "ubatch_idx", 0)),
             hccl_comm_name,
             hccl_comm_name2,
             hccl_comm_name3,
         )
         output = torch.ops.afd_ascend.e2a(
             ref_tensor,
-            transfer_state.atten_batch_size,
+            atten_batch_size,
             transfer_state.batch_size,
             transfer_state.h,
             transfer_state.k,
