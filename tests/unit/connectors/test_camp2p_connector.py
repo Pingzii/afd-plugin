@@ -53,7 +53,7 @@ def _vllm_config(
             tensor_parallel_size=1,
             num_ubatches=num_ubatches,
         ),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        scheduler_config=SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=64),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
                 hidden_size=16,
@@ -170,6 +170,103 @@ def test_camp2p_recv_attn_output_uses_the_padded_a2e_tile_layout(monkeypatch):
     assert context1.states.batch_size == 14
     assert context0.states.h == 16
     assert context0.states.k == 2
+
+
+def test_camp2p_recv_attn_output_divides_the_tile_by_the_flash_comm_shard(monkeypatch):
+    """FlashComm v1 hands one Attention rank only a share of its DP rank's rows.
+
+    A2E reads one equal tile per Attention peer, so an FFN rank that sized the
+    receive by the whole DP count would read rows the peer never wrote: past the
+    peer's ids and scales the window holds that peer's activations, which a
+    token-keyed router turns into a table read far outside the table.
+    """
+
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "a2e",
+        lambda *args: ("hidden", None, None, "atten-batch", "active-mask"),
+        raising=False,
+    )
+    connector = _init_ffn_connector(0, _vllm_config())
+    connector.attention_shard = 2
+    _publish_dp_metadata(connector, {0: _FakeDPMetadata([24, 24, 24, 24])})
+
+    context = connector.recv_attn_output(ubatch_idx=0, layer_idx=0).context
+
+    # F0 owns {A0, A2}, which hold 24 / 2 = 12 rows each under SP.
+    assert context.states.batch_size == 24
+    assert context.metadata.seq_lens == [24]
+
+
+def test_camp2p_sizes_a_missing_metadata_step_like_the_attention_rank(monkeypatch):
+    """Both roles have to derive the same tile when no counts arrived.
+
+    The FFN rank cannot learn the sender's row count from the transfer, so a step
+    whose metadata is unusable has to fall back to the run-level token count both
+    roles share. Falling back to a larger tile on the receiving side alone is what
+    makes A2E read past the rows the Attention rank wrote.
+    """
+
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "a2e",
+        lambda *args: ("hidden", None, None, "atten-batch", "active-mask"),
+        raising=False,
+    )
+    connector = _init_ffn_connector(0, _vllm_config())
+    connector.attention_shard = 2
+
+    context = connector.recv_attn_output(ubatch_idx=0, layer_idx=0).context
+
+    # Stage 0 has no counts: two tiles of ceil(max_num_batched_tokens / shard),
+    # which is exactly the tile the Attention ranks pad their payloads up to.
+    assert connector.max_num_tokens == 64
+    assert context.states.batch_size == 64
+
+
+def test_camp2p_attention_tile_equals_the_ffn_ranks_per_peer_rows(monkeypatch):
+    """Both roles have to derive the same tile from the same metadata.
+
+    A2E reads one equal tile per Attention peer and divides the FFN rank's total
+    by its peer ratio, so the rows the Attention rank writes and the rows the FFN
+    rank reads per peer have to be one number. The failure this pins is
+    asymmetric sizing: the Attention rank wrote its 12 FlashComm rows while the
+    FFN rank read 32, which left the peer's activations where the router expected
+    token ids.
+    """
+
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "a2e",
+        lambda *args: ("hidden", None, None, "atten-batch", "active-mask"),
+        raising=False,
+    )
+    vllm_config = _vllm_config()
+    attention = CAMP2pAFDConnector(
+        2,
+        0,
+        vllm_config,
+        _afd_config(role="attention"),
+        0,
+    )
+    attention._initialized = True
+    attention.attention_shard = 2
+    ffn = _init_ffn_connector(0, vllm_config)
+    ffn.attention_shard = 2
+    dp_metadata_list = {0: _FakeDPMetadata([24, 24, 24, 24])}
+    _publish_dp_metadata(attention, dp_metadata_list)
+    _publish_dp_metadata(ffn, dp_metadata_list)
+
+    tile = attention._padding_rows_for_step(0)
+    context = ffn.recv_attn_output(ubatch_idx=0, layer_idx=0).context
+
+    # F0 owns two tiles of A0's and A2's 24 / 2 = 12 rows each.
+    assert tile == 12
+    assert context.states.batch_size == 24
+    assert context.states.batch_size // 2 == tile
 
 
 def test_camp2p_recv_attn_output_drives_the_operator_ids_mode(monkeypatch):

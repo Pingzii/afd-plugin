@@ -15,7 +15,7 @@ from vllm.platforms import current_platform
 from vllm_ascend import ascend_forward_context as ascend_context
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, graph_capture
 
-from afd_plugin.a2e_layout import padded_ffn_token_counts
+from afd_plugin.a2e_layout import ffn_receive_rows
 from afd_plugin.compat.npu import (
     ascend_forward_context,
     fail_if_unsupported_npu_afd_features,
@@ -212,6 +212,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             attention_size=int(self.connector.attn_size),
             ffn_size=int(self.connector.ffn_size),
             fallback=int(self.max_num_tokens),
+            shard=int(self.connector.attention_shard),
         )
 
     def _ffn_forward(
@@ -554,16 +555,19 @@ def _ffn_token_counts_across_ranks(
     )
     # A2E hands one padded tile per Attention peer to every FFN rank, so this rank
     # computes on whole tiles even when the DP ranks hold different batch sizes.
-    # The connector sizes the same transfer from these counts.
-    ffn_counts = padded_ffn_token_counts(
-        counts,
-        attention_size=int(connector.attn_size),
-        ffn_size=int(connector.ffn_size),
-    )
-    if ffn_counts is None:
-        values = [max(1, int(fallback))] * int(connector.ffn_size)
-    else:
-        values = [max(1, int(count)) for count in ffn_counts]
+    # The connector sizes the same transfer from these counts, the FlashComm shard
+    # and this fallback, and the router rows have to be the rows that arrive.
+    values = [
+        ffn_receive_rows(
+            counts,
+            ffn_rank=ffn_rank,
+            attention_size=int(connector.attn_size),
+            ffn_size=int(connector.ffn_size),
+            shard=int(connector.attention_shard),
+            fallback=int(fallback),
+        )
+        for ffn_rank in range(int(connector.ffn_size))
+    ]
     return torch.tensor(values, dtype=torch.int32, device="cpu")
 
 
