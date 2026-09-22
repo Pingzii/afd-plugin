@@ -7,7 +7,7 @@ from __future__ import annotations
 import copy
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -64,7 +64,6 @@ from vllm_ascend.worker.model_runner_v1 import (
     PerLayerAttnMetadata,
 )
 
-from afd_plugin.a2e_layout import attention_tile_rows, ffn_rank_for_attention_rank
 from afd_plugin.compat.npu import (
     fail_if_unsupported_npu_afd_features,
 )
@@ -85,7 +84,6 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
 )
 from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
-from afd_plugin.connectors.npu.camp2p import CAMP2pAFDConnector
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
     ASYNC_MOE_UBATCH_METADATA_KEY,
     AsyncMoeUbatchMetadata,
@@ -114,16 +112,6 @@ from afd_plugin.v1.worker.npu.ubatch_utils import (
 )
 
 logger = init_logger(__name__)
-
-# One A2E tile report: the padded token count of the step, the DP counts it was
-# derived from, the tile rows they describe, and the tuple the connector recorded
-# while sending (``None`` when the send did not run on the host for this step).
-A2ETileReport = tuple[
-    int,
-    tuple[int, ...],
-    int,
-    tuple[int, int, int, int, tuple[int, ...]] | None,
-]
 
 # Upstream backend initialization creates builder 0 for full-batch metadata.
 # Async CAM extends that list, and stage ``ubid`` uses builder
@@ -171,9 +159,6 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_is_graph_replaying = False
         self._afd_pending_metadata: AFDForwardContextMetadata | None = None
         self._afd_suppress_metadata_send = False
-        # Last A2E send reported by this runner, so the per-step report is emitted
-        # once per distinct step instead of once per layer.
-        self._afd_reported_send: A2ETileReport | None = None
         self._afd_transaction_counter = 0
         self._afd_async_moe_ubatch_metadata: AsyncMoeUbatchMetadata | None = None
         self._afd_live_execution = False
@@ -257,7 +242,6 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 forward_context,
                 num_tokens_padded,
             )
-        self._report_a2e_send(forward_context, num_tokens_padded)
 
         # ### PATCH START: AFD defers FlashComm gather to model execution
         if (
@@ -1468,70 +1452,6 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         if padded_graph_tokens is not None and not ubatch_slices:
             dp_metadata = self._build_capture_dp_metadata(padded_graph_tokens)
         self._send_dp_metadata(dp_metadata, ubatch_slices)
-
-    def _report_a2e_send(
-        self,
-        forward_context: ForwardContext,
-        num_tokens_padded: int,
-    ) -> None:
-        """Report the A2E tile of a step, once per distinct step.
-
-        A2E reads a fixed number of rows per Attention peer, so the rows a rank
-        sends and the tile the FFN rank sizes its receive with have to be one
-        number. Every value here comes from host state -- the connector's integer
-        snapshot of the DP counts, the padded token count of this step, and the
-        tile derived from them with the same helper the connector and the FFN rank
-        call -- so the report reads no traced tensor and cannot change what the
-        compiled forward does.
-
-        ``last_send`` carries what the connector recorded while sending. A missing
-        entry means the send never ran on the host for this step, which is what a
-        send baked into a captured graph looks like.
-        """
-
-        # Only the DP-metadata connector sizes an A2E tile; the async connector
-        # has no control plane and no count snapshot to report.
-        if self.connector.control_plane is None:
-            return
-        connector = cast(CAMP2pAFDConnector, self.connector)
-        dp_counts = connector.dp_token_counts.get(0, ())
-        ffn_rank = ffn_rank_for_attention_rank(
-            connector.role_rank,
-            attention_size=int(connector.attn_size),
-            ffn_size=int(connector.ffn_size),
-        )
-        tile_rows = (
-            -1
-            if ffn_rank is None
-            else attention_tile_rows(
-                dp_counts,
-                ffn_rank=ffn_rank,
-                attention_size=int(connector.attn_size),
-                ffn_size=int(connector.ffn_size),
-                shard=int(connector.attention_shard),
-                fallback=int(connector.max_num_tokens),
-            )
-        )
-        report = (
-            int(num_tokens_padded),
-            tuple(int(count) for count in dp_counts),
-            int(tile_rows),
-            connector.last_a2e_send,
-        )
-        if report == self._afd_reported_send:
-            return
-        self._afd_reported_send = report
-        logger.warning(
-            "AFD NPU A2E tile; world_rank=%d padded_tokens=%d dp_counts=%s "
-            "tile_rows=%d last_send=%s graph_replaying=%s runtime_mode=%s",
-            connector.world_rank,
-            int(num_tokens_padded),
-            report[1],
-            int(tile_rows),
-            connector.last_a2e_send,
-            bool(self._afd_is_graph_replaying),
-            forward_context.cudagraph_runtime_mode,
-        )
 
     def _install_async_moe_ubatch_metadata_on_forward_context(
         self,
