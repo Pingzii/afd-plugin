@@ -460,3 +460,165 @@ def test_recv_attn_output_skips_hash_id_validation_by_default(monkeypatch):
 
     assert payload.input_ids is not None
     assert payload.input_ids[0].item() == 4096
+
+
+def _full_graph_forward_context(*, num_tokens: int) -> SimpleNamespace:
+    """Build the forward-context fields a padded CUDA graph step exposes."""
+
+    return SimpleNamespace(
+        num_tokens=num_tokens,
+        ubatch_slices=None,
+        cudagraph_runtime_mode="FULL",
+        batch_descriptor=SimpleNamespace(num_tokens=num_tokens),
+    )
+
+
+def test_send_attn_output_pads_the_payload_to_the_reported_graph_size(monkeypatch):
+    """A FULL graph reports the padded token count, so the send has to cover it.
+
+    A2E reads one equal tile per Attention peer and sends the same tile back. A
+    payload shorter than the reported count leaves the tail of this rank's ids
+    and hidden-state regions unwritten, and the receiving FFN reads the
+    neighbouring regions as token ids, which a Hash layer turns into an
+    out-of-range table lookup.
+    """
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    forward_context = _full_graph_forward_context(num_tokens=8)
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    connector = _connector(role="attention", rank=0)
+    hidden_states = torch.zeros(3, connector.hidden_size)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=3,
+        ),
+    )
+
+    connector.send_attn_output(
+        hidden_states,
+        context,
+        input_ids=torch.tensor([7, 11, 13], dtype=torch.int64),
+    )
+
+    (args,) = calls
+    sent_hidden_states, expert_ids = args[0], args[-2]
+    assert tuple(sent_hidden_states.shape) == (8, connector.hidden_size)
+    # The token count the operator is sized with has to be the padded one.
+    assert args[4] == 8
+    assert tuple(expert_ids.shape) == (8, connector.num_experts_per_tok)
+    assert expert_ids[:3, 0].tolist() == [7, 11, 13]
+    # Pad rows carry the sentinel the FFN maps back to token 0.
+    assert expert_ids[3:, 0].tolist() == [-1] * 5
+    # The receive side needs to know how many rows the model really produced.
+    assert forward_context.cam_afdtransfer_state.attention_rows == 3
+
+
+def test_send_attn_output_keeps_stage_rows_when_ubatching(monkeypatch):
+    """A ubatch stage reports per-stage counts, so it must not be padded.
+
+    The runner reports the padded count for the whole step only when it is not
+    split into ubatches; a stage keeps the rows its own slice produced.
+    """
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    forward_context = SimpleNamespace(
+        num_tokens=8,
+        ubatch_slices=[object()],
+        cudagraph_runtime_mode="FULL",
+    )
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    connector = _connector(role="attention", rank=0)
+    hidden_states = torch.zeros(3, connector.hidden_size)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=3,
+        ),
+    )
+
+    connector.send_attn_output(hidden_states, context)
+
+    (args,) = calls
+    assert tuple(args[0].shape) == (3, connector.hidden_size)
+    assert args[4] == 3
+    assert forward_context.cam_afdtransfer_state.attention_rows is None
+
+
+def test_send_attn_output_rejects_rows_beyond_the_reported_tile(monkeypatch):
+    """More rows than the reported count cannot be represented, so fail early."""
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    forward_context = _full_graph_forward_context(num_tokens=2)
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    connector = _connector(role="attention", rank=0)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=3,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be represented"):
+        connector.send_attn_output(torch.zeros(3, connector.hidden_size), context)
+
+    assert calls == []
+
+
+def test_recv_ffn_output_trims_a_padded_tile_back_to_the_model_rows(monkeypatch):
+    """A padded send returns a padded tile, so the model keeps its own rows."""
+
+    forward_context = SimpleNamespace()
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    connector = _connector(role="attention", rank=0)
+    forward_context.cam_afdtransfer_state = camp2p_module.CAMP2PTransferState(
+        aiv_num=connector.aiv_num,
+        batch_size=8,
+        h=connector.hidden_size,
+        k=connector.num_experts_per_tok,
+        attention_rows=3,
+    )
+    received_rows: list[int] = []
+
+    def fake_recv(destination: Any, *args: Any) -> Any:
+        received_rows.append(int(destination.shape[0]))
+        return torch.arange(
+            destination.numel(),
+            dtype=torch.float32,
+        ).reshape(destination.shape)
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_recv_ffn_output",
+        fake_recv,
+        raising=False,
+    )
+    ref_tensor = torch.zeros(3, connector.hidden_size)
+
+    result = connector.recv_ffn_output(ref_tensor, ubatch_idx=0)
+
+    # The operator receives the padded tile, and only the model's rows survive.
+    assert received_rows == [8]
+    assert tuple(result.shape) == (3, connector.hidden_size)
+    assert result[0, 0].item() == 0.0
