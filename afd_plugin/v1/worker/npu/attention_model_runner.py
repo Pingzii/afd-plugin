@@ -1818,7 +1818,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 self._sync_afd_metadata_across_dp(
                     num_tokens_unpadded=num_tokens,
                     num_tokens_padded=num_tokens_padded,
-                    uniform_decode=uniform_decode,
+                    uniform_decode=bool(uniform_decode),
                     cudagraph_mode=cudagraph_mode,
                     # A2E reads one equal tile per Attention peer, so the peers of
                     # one FFN rank have to run the same token count. Only a split

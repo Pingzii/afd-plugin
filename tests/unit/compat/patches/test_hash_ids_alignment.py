@@ -54,35 +54,39 @@ def _install_fake_modules(
     forward_context: _RecordingForwardContext,
     hash_calls: list[dict[str, Any]],
     with_selector: bool = True,
-) -> types.ModuleType:
-    """Install the vLLM and vLLM-Ascend surface the patch module imports."""
+) -> Any:
+    """Install the vLLM and vLLM-Ascend surface the patch module imports.
 
-    vllm = types.ModuleType("vllm")
-    vllm_distributed = types.ModuleType("vllm.distributed")
+    The fakes are module objects the patch imports by name, so they are typed
+    loosely: the attributes are the whole point of the fake.
+    """
+
+    vllm: Any = types.ModuleType("vllm")
+    vllm_distributed: Any = types.ModuleType("vllm.distributed")
     vllm_distributed.get_tp_group = lambda: SimpleNamespace(
         world_size=2,
         rank_in_group=0,
     )
-    vllm_forward_context = types.ModuleType("vllm.forward_context")
+    vllm_forward_context: Any = types.ModuleType("vllm.forward_context")
     vllm_forward_context.get_forward_context = lambda: forward_context
 
-    vllm_ascend = types.ModuleType("vllm_ascend")
-    ascend_forward_context = types.ModuleType("vllm_ascend.ascend_forward_context")
+    vllm_ascend: Any = types.ModuleType("vllm_ascend")
+    ascend_forward_context: Any = types.ModuleType("vllm_ascend.ascend_forward_context")
     ascend_forward_context.MoECommType = SimpleNamespace(ALLGATHER="allgather")
-    device_pkg = types.ModuleType("vllm_ascend.device")
-    device_op = types.ModuleType("vllm_ascend.device.device_op")
+    device_pkg: Any = types.ModuleType("vllm_ascend.device")
+    device_op: Any = types.ModuleType("vllm_ascend.device.device_op")
     device_op.DeviceOperator = SimpleNamespace(
         moe_gating_top_k=lambda *args, **kwargs: ("weights", "ids", None),
     )
-    distributed_pkg = types.ModuleType("vllm_ascend.distributed")
-    distributed_utils = types.ModuleType("vllm_ascend.distributed.utils")
+    distributed_pkg: Any = types.ModuleType("vllm_ascend.distributed")
+    distributed_utils: Any = types.ModuleType("vllm_ascend.distributed.utils")
     distributed_utils.split_tensor_along_first_dim = lambda tensor, num_partitions: (
         tensor.chunk(num_partitions)
     )
 
-    ops_pkg = types.ModuleType("vllm_ascend.ops")
-    fused_moe_pkg = types.ModuleType("vllm_ascend.ops.fused_moe")
-    selector = types.ModuleType("vllm_ascend.ops.fused_moe.experts_selector")
+    ops_pkg: Any = types.ModuleType("vllm_ascend.ops")
+    fused_moe_pkg: Any = types.ModuleType("vllm_ascend.ops.fused_moe")
+    selector: Any = types.ModuleType("vllm_ascend.ops.fused_moe.experts_selector")
 
     def fusion_selector(**kwargs: Any) -> tuple[Any, Any]:
         hash_calls.append(kwargs)
@@ -133,12 +137,12 @@ def _import_patch_module(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
 def _fake_hash_ops(hash_calls: list[dict[str, Any]]) -> SimpleNamespace:
     """Build the ``torch.ops`` surface the selector calls."""
 
+    def moe_gating_top_k_hash(**kwargs: Any) -> tuple[str, str, None]:
+        hash_calls.append(kwargs)
+        return "weights", "ids", None
+
     return SimpleNamespace(
-        _C_ascend=SimpleNamespace(
-            moe_gating_top_k_hash=lambda **kwargs: (
-                hash_calls.append(kwargs) or ("weights", "ids", None)
-            ),
-        ),
+        _C_ascend=SimpleNamespace(moe_gating_top_k_hash=moe_gating_top_k_hash),
     )
 
 

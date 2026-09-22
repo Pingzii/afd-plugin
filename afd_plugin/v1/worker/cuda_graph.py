@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from afd_plugin.a2e_layout import ffn_receive_rows
 
@@ -110,26 +110,29 @@ def make_ffn_graph_key(
     ffn_size: int | None = None,
     fallback: int = 1,
     shard: int = 1,
-) -> tuple[tuple[int, tuple]]:
+) -> tuple[tuple[int, tuple], ...]:
     """Extract the AFD FFN graph hashable key from DP metadata."""
 
+    attention_ranks = 0 if attention_size is None else int(attention_size)
+    ffn_ranks = 0 if ffn_size is None else int(ffn_size)
+    aggregated = _use_ffn_aggregated_key(attention_size, ffn_size)
     key_parts: list[tuple[int, tuple]] = []
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
         values = getattr(metadata, "num_tokens_across_dp_cpu", None)
         if values is None:
-            if _use_ffn_aggregated_key(attention_size, ffn_size):
-                values_tuple = tuple(
-                    max(1, int(fallback)) for _ in range(int(ffn_size))
+            if aggregated:
+                values_tuple: tuple = tuple(
+                    max(1, int(fallback)) for _ in range(ffn_ranks)
                 )
             else:
                 values_tuple = (repr(metadata),)
         else:
             values_tuple = _metadata_values_tuple(values)
-            if _use_ffn_aggregated_key(attention_size, ffn_size):
+            if aggregated:
                 values_tuple = _aggregate_ffn_values_tuple(
                     values_tuple,
-                    attention_size=int(attention_size),
-                    ffn_size=int(ffn_size),
+                    attention_size=attention_ranks,
+                    ffn_size=ffn_ranks,
                     fallback=int(fallback),
                     shard=int(shard),
                 )
@@ -155,15 +158,17 @@ def graph_run_mode(
 
 
 def _metadata_values_tuple(values: object) -> tuple[int, ...]:
+    items: Any = values
     tolist = getattr(values, "tolist", None)
+    item = getattr(values, "item", None)
     if callable(tolist):
-        values = tolist()
-    elif hasattr(values, "item"):
-        values = [values.item()]
+        items = tolist()
+    elif callable(item):
+        items = [item()]
     try:
-        return tuple(int(value) for value in values)
+        return tuple(int(value) for value in items)
     except TypeError:
-        return (int(values),)
+        return (int(items),)
 
 
 def _use_ffn_aggregated_key(
