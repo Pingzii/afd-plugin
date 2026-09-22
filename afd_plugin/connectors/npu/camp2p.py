@@ -596,25 +596,6 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
         forward_context = get_forward_context()
         reported_rows = _reported_attention_tokens(forward_context)
-        # Only values that cannot come from a traced tensor shape may be logged
-        # here: formatting anything derived from ``hidden_states``/``input_ids``
-        # size forces the token dimension the compiled model declares dynamic to
-        # a constant, which torch.compile rejects. That rules out the payload row
-        # count, so the FFN side prints the tile it reads instead.
-        if reported_rows is not None:
-            dp_metadata = getattr(forward_context, "dp_metadata", None)
-            dp_counts = getattr(dp_metadata, "num_tokens_across_dp_cpu", None)
-            logger.info_once(
-                "AFD CAMP2P send tile: rank=%d layer=%d stage=%d tile_rows=%d "
-                "graph_mode=%s ubatch=%s dp_counts=%s",
-                self.world_rank,
-                metadata.layer_idx,
-                metadata.stage_idx,
-                reported_rows,
-                getattr(forward_context, "cudagraph_runtime_mode", None),
-                bool(getattr(forward_context, "ubatch_slices", None)),
-                None if dp_counts is None else dp_counts.tolist(),
-            )
         padded_payload = False
         # Whenever the step reports a padded token count, hand the operator a
         # payload of exactly that many rows: A2E reads one equal tile per
@@ -892,18 +873,6 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # shape inference then multiplies by ``tiles``, so the declared capacity
         # cannot prove the tail rows arrived.
         written_tokens = tiles * (batch_size // tiles)
-        logger.info_once(
-            "AFD CAMP2P recv tile: rank=%d layer=%d stage=%d batch_size=%d "
-            "peer_counts=%s tiles=%d recv_batch_size=%d written_rows=%d",
-            self.world_rank,
-            layer_idx,
-            ubatch_idx,
-            batch_size,
-            attention_group,
-            tiles,
-            written_tokens // tiles,
-            written_tokens,
-        )
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=ubatch_idx,
