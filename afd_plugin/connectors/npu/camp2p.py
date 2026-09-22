@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Final, cast
 import torch
 import torch.distributed as dist
 from torch.distributed.distributed_c10d import ProcessGroup
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import DPMetadata, get_forward_context
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -234,27 +235,31 @@ class _CAMP2PTopology:
 
 
 def _reported_attention_tokens(forward_context: Any) -> int | None:
-    """Return the token count this step's Attention payload has to cover.
+    """Return the padded token count a FULL graph step reports for every rank.
 
-    Whenever a step pads its Attention batch, the runner reports that padded
-    count for this rank (``v1/worker/attention_model_runner.py`` passes
-    ``num_tokens_padded`` into the forward context and reports it to the FFN), and
-    the FFN turns the report into the single equal tile A2E reads from each
-    Attention peer. A rank that writes fewer rows than it is charged leaves the
-    tail of its ids and hidden-state regions unwritten, and the receiving FFN
-    reads the neighbouring regions as token ids; a rank that writes more loses
-    the extra tokens, because the FFN still reads only its tile.
+    Mirror the runner's own condition (``v1/worker/attention_model_runner.py``:
+    ``_full_cudagraph_padded_tokens(forward_context) is not None and not
+    ubatch_slices``): only a padded CUDA graph replaces the per-rank DP metadata
+    with one padded token count for all ranks, and that count is what the FFN
+    turns into the single equal tile A2E reads from each Attention peer.
 
-    Steps split into ubatches report per-stage counts instead, so they keep the
-    row count their forward produced and return ``None`` here.
+    ``forward_context.num_tokens`` is *not* a substitute: outside a FULL graph it
+    does not describe the payload of the current forward (a prefill step can carry
+    hundreds of rows while it holds a decode-sized value), so using it would
+    resize payloads that must keep the rows the forward produced.
+
+    Returns ``None`` when this step reports per-rank counts instead, in which case
+    the payload keeps the row count the forward produced.
     """
 
     if getattr(forward_context, "ubatch_slices", None):
         return None
-    num_tokens = getattr(forward_context, "num_tokens", None)
-    if num_tokens is None:
+    if getattr(forward_context, "cudagraph_runtime_mode", None) != CUDAGraphMode.FULL:
         return None
-    return max(1, int(num_tokens))
+    batch_descriptor = getattr(forward_context, "batch_descriptor", None)
+    if batch_descriptor is None:
+        return None
+    return max(1, int(batch_descriptor.num_tokens))
 
 
 def prepare_token_id_transfer(

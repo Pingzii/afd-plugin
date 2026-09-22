@@ -34,6 +34,7 @@ torch = pytest.importorskip("torch")
 
 _STUB_MODULES = (
     "vllm",
+    "vllm.config",
     "vllm.forward_context",
     "vllm.logger",
     "vllm.utils",
@@ -72,6 +73,10 @@ def _vllm_stub() -> Iterator[None]:
         sys.modules[name] = module
 
     make("vllm")
+    make(
+        "vllm.config",
+        CUDAGraphMode=type("CUDAGraphMode", (), {"FULL": "FULL", "NONE": "NONE"}),
+    )
     make(
         "vllm.forward_context",
         DPMetadata=type("DPMetadata", (), {}),
@@ -603,6 +608,51 @@ def test_send_attn_output_keeps_stage_rows_when_ubatching(monkeypatch):
     (args,) = calls
     assert tuple(args[0].shape) == (3, connector.hidden_size)
     assert args[4] == 3
+    assert forward_context.cam_afdtransfer_state.padded_payload is False
+
+
+def test_send_attn_output_keeps_a_large_payload_outside_a_full_graph(monkeypatch):
+    """Only a padded FULL graph reports one token count for every rank.
+
+    Outside it the forward context's own ``num_tokens`` does not describe this
+    forward's payload (a prefill step carries many more rows than a decode-sized
+    value), so resizing the payload to it would drop real tokens.
+    """
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    forward_context = SimpleNamespace(
+        num_tokens=16,
+        ubatch_slices=None,
+        cudagraph_runtime_mode="NONE",
+    )
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    connector = _connector(role="attention", rank=0)
+    payload = torch.zeros(64, connector.hidden_size)
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=0,
+            seq_len=64,
+        ),
+    )
+
+    connector.send_attn_output(
+        payload,
+        context,
+        input_ids=torch.arange(64, dtype=torch.int64),
+    )
+
+    (args,) = calls
+    sent_hidden_states, expert_ids = args[0], args[-2]
+    assert tuple(sent_hidden_states.shape) == (64, connector.hidden_size)
+    assert args[4] == 64
+    assert tuple(expert_ids.shape) == (64, connector.num_experts_per_tok)
     assert forward_context.cam_afdtransfer_state.padded_payload is False
 
 

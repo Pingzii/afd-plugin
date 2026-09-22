@@ -195,12 +195,16 @@ Three cause families are worth separating before touching the model:
   smaller than the id space. Turn it off after diagnosis: the check reads device
   tensors and synchronises.
 
-The alignment works both eagerly and inside `torch.compile`. It cannot compare
-the reported count with the rows a traced forward produced, because that
-specializes the token dimension the compiled model declares dynamic and
-`torch.compile` rejects it with a constraint violation naming `input_ids`. The
-payload is therefore copied into a buffer of exactly the reported size: pad rows
-keep zeros for the hidden states and the sentinel the FFN maps back to token 0 for
-the ids, and the receive trims the returned tile with the reference tensor's row
-count. An Attention rank that produced more rows than the step reports is the one
-case that cannot be represented, and eager steps fail fast on it.
+The alignment works both eagerly and inside `torch.compile`, and applies to the
+steps that report one padded token count for every Attention rank (a FULL CUDA
+graph without ubatch slices). It cannot compare the reported count with the rows a
+traced forward produced, because that specializes the token dimension the
+compiled model declares dynamic and `torch.compile` rejects it with a constraint
+violation naming `input_ids`. The payload is therefore copied into a buffer of
+exactly the reported size: pad rows keep zeros for the hidden states and the
+sentinel the FFN maps back to token 0 for the ids, and the receive trims the
+returned tile with the reference tensor's row count. Outside those steps the
+payload keeps the rows its forward produced, because the forward context's own
+`num_tokens` does not describe them (a prefill step carries many more rows than a
+decode-sized value). An Attention rank that produced more rows than the step
+reports is the one case the tile cannot represent, and eager steps fail fast on it.
