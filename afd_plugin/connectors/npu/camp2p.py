@@ -23,15 +23,18 @@ from typing import TYPE_CHECKING, Any, Final, cast
 import torch
 import torch.distributed as dist
 from torch.distributed.distributed_c10d import ProcessGroup
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import DPMetadata, get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from afd_plugin.a2e_layout import (
+    attention_rank_token_counts,
     attention_tile_rows,
     fallback_tile_rows,
     ffn_rank_for_attention_rank,
     ffn_receive_rows,
     flash_comm_shard,
+    sharded_rows,
 )
 from afd_plugin.compat.npu import ensure_cam_p2p_ops_available
 from afd_plugin.config import AFDConfig
@@ -236,6 +239,32 @@ class _CAMP2PTopology:
     def is_attn_top_min_size_rank(self) -> bool:
         """Return whether this is an Attention metadata-sender rank."""
         return self.ffn_size <= self.world_rank < self.ffn_size + self.min_size
+
+
+def _reported_attention_tokens(forward_context: Any) -> int | None:
+    """Return the row count a padded graph step sends, or ``None``.
+
+    Mirror the runner's own condition (``v1/worker/attention_model_runner.py``:
+    ``_full_cudagraph_padded_tokens(forward_context) is not None and not
+    ubatch_slices``): a padded graph runs the batch at its capture size, so the
+    payload of such a step holds that many rows whatever the forward produced.
+
+    ``forward_context.num_tokens`` is *not* a substitute: outside a padded graph it
+    does not describe the payload of the current forward (a prefill step can carry
+    hundreds of rows while it holds a decode-sized value).
+
+    Returns ``None`` for a step that is not a padded graph, which is the step an
+    eager forward produces its own rows for.
+    """
+
+    if getattr(forward_context, "ubatch_slices", None):
+        return None
+    if getattr(forward_context, "cudagraph_runtime_mode", None) != CUDAGraphMode.FULL:
+        return None
+    batch_descriptor = getattr(forward_context, "batch_descriptor", None)
+    if batch_descriptor is None:
+        return None
+    return max(1, int(batch_descriptor.num_tokens))
 
 
 def _flash_comm_sequence_parallel(vllm_config: VllmConfig, tp_size: int) -> bool:
@@ -602,6 +631,22 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             fallback=self.max_num_tokens,
         )
 
+    def _own_reported_rows(self, stage_idx: int) -> int | None:
+        """Return the token count reported for this Attention rank, or ``None``.
+
+        Only the connector's integer snapshot of the counts is read, never the
+        tensors themselves: this runs inside the traced model forward, where the
+        DP tensors are symbolic and any comparison against them fails.
+        """
+
+        counts = attention_rank_token_counts(
+            self.dp_token_counts.get(stage_idx, ()),
+            attention_size=self.attn_size,
+        )
+        if counts is None or self.role_rank >= len(counts):
+            return None
+        return counts[self.role_rank]
+
     def send_attn_output(
         self,
         hidden_states: torch.Tensor,
@@ -644,55 +689,84 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             )
         input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
         forward_context = get_forward_context()
-        wire_rows = self._padding_rows_for_step(metadata.stage_idx)
+        stage_idx = metadata.stage_idx
+        wire_rows = self._padding_rows_for_step(stage_idx)
+        # Rows this rank's payload holds, from the count snapshot rather than from
+        # the payload tensor: a traced or padded step reports its rows through the
+        # graph, and reading a symbol there is what makes the compiled path fail.
+        own_rows = self._own_reported_rows(stage_idx)
+        payload_rows = (
+            None
+            if own_rows is None
+            else sharded_rows(own_rows, shard=self.attention_shard)
+        )
+        graph_rows = _reported_attention_tokens(forward_context)
         if not torch.compiler.is_compiling():
             # Numbers of the last A2E send, for the runner to report once per step.
             # A graph-frozen send repeats the values it was captured with, so a
             # reporter can tell a per-step payload from a baked-in one.
             self.last_a2e_send = (
                 int(metadata.layer_idx),
-                int(metadata.stage_idx),
-                int(metadata.total_tokens),
+                int(stage_idx),
+                -1 if payload_rows is None else int(payload_rows),
                 int(wire_rows),
-                tuple(
-                    int(count)
-                    for count in self.dp_token_counts.get(metadata.stage_idx, ())
-                ),
+                tuple(int(count) for count in self.dp_token_counts.get(stage_idx, ())),
             )
-        if not torch.compiler.is_compiling() and wire_rows < int(metadata.total_tokens):
-            raise RuntimeError(
-                f"CAMP2P Attention rank sends {int(metadata.total_tokens)} tokens "
-                f"but this step reports a {wire_rows}-row tile per Attention rank "
-                f"(layer={metadata.layer_idx}, ubatch={metadata.stage_idx}). A2E "
-                "reads one equal tile per Attention peer and sends the same tile "
-                "back, so the extra tokens cannot be represented. Align the "
-                "reported token count with the rows the forward produces.",
-            )
-        # Hand the operator a payload of exactly the tile's rows when the forward
-        # produced fewer: A2E reads one equal tile per Attention peer, so a shorter
-        # payload would leave the tail of this rank's ids and hidden-state regions
-        # unwritten and the receiving FFN would read the neighbouring regions as
-        # token ids. A step whose rows already are the tile keeps its payload and
-        # its buffers untouched, which matters inside a captured graph, where a
-        # buffer allocated for the copy would be frozen at its capture address.
-        padded_payload = wire_rows > int(metadata.total_tokens)
-        if padded_payload:
-            hidden_states = self._wire_payload(
-                hidden_states,
-                wire_rows=wire_rows,
-                fill=0,
-            )
-            if input_ids is not None:
-                input_ids = self._wire_payload(
-                    input_ids.reshape(-1).to(torch.int32),
-                    wire_rows=wire_rows,
-                    fill=_PAD_HASH_TOKEN_ID,
+        if graph_rows is not None:
+            # A graph step sends the rows its captured graph holds and cannot pad
+            # them, so the tile the FFN rank sizes its receive with has to be
+            # exactly those rows. Every Attention peer of that FFN rank derives the
+            # tile from the published counts, so a peer that reports a different
+            # count is a step this layout cannot represent -- and one A2E reads
+            # past, into that peer's activations.
+            if graph_rows != int(wire_rows):
+                raise RuntimeError(
+                    f"CAMP2P Attention rank {self.role_rank} sends the {graph_rows} "
+                    f"rows of its graph while this step's A2E tile is {wire_rows} "
+                    f"rows (layer={metadata.layer_idx}, stage={stage_idx}, "
+                    f"dp_counts={self.dp_token_counts.get(stage_idx, ())}). A graph "
+                    "step cannot pad its payload, so the Attention peers of one FFN "
+                    "rank have to run the same padded token count.",
                 )
-            metadata = AFDTransferMetadata.create_attention_metadata(
-                layer_idx=metadata.layer_idx,
-                stage_idx=metadata.stage_idx,
-                seq_len=wire_rows,
-            )
+            padded_payload = False
+        else:
+            if (
+                not torch.compiler.is_compiling()
+                and payload_rows is not None
+                and wire_rows < payload_rows
+            ):
+                raise RuntimeError(
+                    f"CAMP2P Attention rank sends {payload_rows} tokens but this "
+                    f"step reports a {wire_rows}-row tile per Attention rank "
+                    f"(layer={metadata.layer_idx}, ubatch={stage_idx}). A2E reads one "
+                    "equal tile per Attention peer and sends the same tile back, so "
+                    "the extra tokens cannot be represented. Align the reported "
+                    "token count with the rows the forward produces.",
+                )
+            # Hand the operator a payload of exactly the tile's rows when the
+            # forward produced fewer: A2E reads one equal tile per Attention peer,
+            # so a shorter payload would leave the tail of this rank's ids and
+            # hidden-state regions unwritten and the receiving FFN would read the
+            # neighbouring regions as token ids. A step whose rows already are the
+            # tile keeps its payload and its buffers untouched.
+            padded_payload = payload_rows is None or wire_rows > payload_rows
+            if padded_payload:
+                hidden_states = self._wire_payload(
+                    hidden_states,
+                    wire_rows=wire_rows,
+                    fill=0,
+                )
+                if input_ids is not None:
+                    input_ids = self._wire_payload(
+                        input_ids.reshape(-1).to(torch.int32),
+                        wire_rows=wire_rows,
+                        fill=_PAD_HASH_TOKEN_ID,
+                    )
+                metadata = AFDTransferMetadata.create_attention_metadata(
+                    layer_idx=metadata.layer_idx,
+                    stage_idx=stage_idx,
+                    seq_len=wire_rows,
+                )
         expert_ids: torch.Tensor | None = None
         expert_scales: torch.Tensor | None = None
         compute_gate = 0
