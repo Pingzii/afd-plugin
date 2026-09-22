@@ -169,11 +169,15 @@ Three cause families are worth separating before touching the model:
 
 - **Uneven Attention peers.** When there are more Attention ranks than FFN ranks,
   one FFN rank serves several Attention peers, and A2E lays that rank's ids and
-  hidden states out as equal per-peer tiles. Peers that send different token
+  hidden states out as equal per-peer tiles. The kernel pairs an FFN rank `r` with
+  Attention ranks `r, r + ffn_size, ...`, and the receiver sizes its tile as
+  `batch_size / (attention_size / ffn_size)`, so peers that send different token
   counts shift every later peer's rows and leave the tail ids rows unwritten.
-  `CAMP2pAFDConnector` now refuses the transfer and reports the counts it saw, so
-  check the DP metadata (`num_tokens_across_dp_cpu`) that Attention sends and the
-  TP-to-AFD rank expansion it is read through.
+  `CAMP2pAFDConnector` now pads every peer of a group up to the largest count of
+  that group (`afd_plugin/a2e_layout.py`) and sizes the receiver from the same
+  padded tiles, so the transfer is aligned in eager steps as well as in graphs.
+  DP ranks hold independent batches, which is where uneven counts come from; check
+  `num_tokens_across_dp_cpu` and the TP-to-AFD rank expansion it is read through.
 - **A padded step that sends unpadded rows.** When the runner pads the Attention
   batch (FULL CUDA graphs, DP padding) it reports the padded token count for the
   rank, and A2E reads exactly `batch_size / attnToMoeRatio` rows per peer, in both
@@ -181,9 +185,8 @@ Three cause families are worth separating before touching the model:
   unwritten, and the receiver's over-read first crosses the zero-filled scales
   region and then the sender's activations, which a Hash layer reads as huge token
   ids. This is why a larger capture size faults where a smaller one does not: the
-  over-read grows with the tile. `CAMP2pAFDConnector` now pads the Attention
-  payload up to the reported count and trims the received tile back to the rows
-  the model produced.
+  over-read grows with the tile. `CAMP2pAFDConnector` pads the Attention payload up
+  to the tile and trims the received tile back to the rows the model produced.
 - **Ids that are not tokens.** Enable the value check on the FFN process:
 
   ```bash
@@ -192,19 +195,21 @@ Three cause families are worth separating before touching the model:
 
   The error names the offending row indices and values, which is what separates
   an id buffer that was never fully written from a `tid2eid` table that is
-  smaller than the id space. Turn it off after diagnosis: the check reads device
-  tensors and synchronises.
+  smaller than the id space. Pad rows carry the -1 sentinel the router maps back
+  to token 0, and the check skips exactly that value. Turn it off after diagnosis:
+  the check reads device tensors and synchronises.
 
-The alignment works both eagerly and inside `torch.compile`, and applies to the
-steps that report one padded token count for every Attention rank (a FULL CUDA
-graph without ubatch slices). It cannot compare the reported count with the rows a
-traced forward produced, because that specializes the token dimension the
-compiled model declares dynamic and `torch.compile` rejects it with a constraint
-violation naming `input_ids`. The payload is therefore copied into a buffer of
-exactly the reported size: pad rows keep zeros for the hidden states and the
-sentinel the FFN maps back to token 0 for the ids, and the receive trims the
-returned tile with the reference tensor's row count. Outside those steps the
-payload keeps the rows its forward produced, because the forward context's own
-`num_tokens` does not describe them (a prefill step carries many more rows than a
-decode-sized value). An Attention rank that produced more rows than the step
-reports is the one case the tile cannot represent, and eager steps fail fast on it.
+The padding is decided from `num_tokens_across_dp_cpu`, which the connector
+publishes to the FFN role before every send, so both sides derive the same tile:
+the sender pads up to it and the receiver sizes the operator with it. It cannot
+compare the tile with the rows a traced forward produced, because that
+specializes the token dimension the compiled model declares dynamic and
+`torch.compile` rejects it with a constraint violation naming `input_ids`. The
+payload is therefore copied into a buffer of exactly the tile size: pad rows keep
+zeros for the hidden states and the sentinel the FFN maps back to token 0 for the
+ids, and the receive trims the returned tile with the reference tensor's row
+count. Two steps keep the rows their forward produced instead, because their
+metadata does not describe one tile for the whole step: an AFD ubatch, which
+reports per-stage counts, and a rank whose counts cannot describe every Attention
+rank. An Attention rank that produced more rows than the tile is the one case the
+layout cannot represent, and eager steps fail fast on it.

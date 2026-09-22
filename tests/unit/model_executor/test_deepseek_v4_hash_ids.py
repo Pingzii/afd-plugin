@@ -397,6 +397,34 @@ def test_validate_hash_token_ids_names_the_offending_rows(monkeypatch):
     assert "max=4096" in message
 
 
+def test_validate_hash_token_ids_skips_the_padding_sentinel(monkeypatch):
+    """Pad rows never reach the table, so they are not invalid ids.
+
+    A padded CAMP2P transfer fills its tail rows with -1 and the router maps that
+    sentinel back to token 0 before the lookup, so the check must not report those
+    rows while still reporting genuinely out-of-range ids.
+    """
+
+    monkeypatch.setenv("AFD_VALIDATE_HASH_TOKEN_IDS", "1")
+
+    validate_hash_token_ids(
+        torch.tensor([3, -1, 7, -1], dtype=torch.int32),
+        table_rows=8,
+        context="DSV4 test routing",
+        padding_value=-1,
+    )
+
+    with pytest.raises(RuntimeError, match=r"outside \[0, 8\)") as excinfo:
+        validate_hash_token_ids(
+            torch.tensor([3, -1, 9], dtype=torch.int32),
+            table_rows=8,
+            context="DSV4 test routing",
+            padding_value=-1,
+        )
+
+    assert "rows=[2]" in str(excinfo.value)
+
+
 def test_validate_hash_token_ids_rejects_a_table_without_rows(monkeypatch):
     monkeypatch.setenv("AFD_VALIDATE_HASH_TOKEN_IDS", "1")
 
