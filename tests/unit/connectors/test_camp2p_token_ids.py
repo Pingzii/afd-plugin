@@ -517,18 +517,17 @@ def test_send_attn_output_pads_the_payload_to_the_reported_graph_size(monkeypatc
     assert expert_ids[:3, 0].tolist() == [7, 11, 13]
     # Pad rows carry the sentinel the FFN maps back to token 0.
     assert expert_ids[3:, 0].tolist() == [-1] * 5
-    # The receive side needs to know how many rows the model really produced.
-    assert forward_context.cam_afdtransfer_state.attention_rows == 3
+    # The receive side learns from this that the tile has to be trimmed back.
+    assert forward_context.cam_afdtransfer_state.padded_payload is True
 
 
-def test_send_attn_output_skips_alignment_while_compiling(monkeypatch):
-    """Branching on the token count would specialize a dynamic dimension.
+def test_send_attn_output_pads_inside_a_compiled_step(monkeypatch):
+    """The padding must survive torch.compile, so it cannot branch on the size.
 
-    The compiled model declares its token dimension dynamic, so comparing the
-    reported count against the produced rows inside the trace raises a dynamic
-    shape constraint violation. A compiled or captured step therefore keeps the
-    payload it produced and relies on the reported count being the count the
-    model executes.
+    Comparing the reported count with the produced rows inside a trace
+    specializes the dimension the compiled model declares dynamic, so the
+    payload is extended by copying it into a fixed-size buffer instead. That
+    keeps a captured step aligned with the tile A2E reads.
     """
 
     calls: list[tuple[Any, ...]] = []
@@ -561,9 +560,12 @@ def test_send_attn_output_skips_alignment_while_compiling(monkeypatch):
     )
 
     (args,) = calls
-    assert tuple(args[0].shape) == (3, connector.hidden_size)
-    assert args[4] == 3
-    assert forward_context.cam_afdtransfer_state.attention_rows is None
+    sent_hidden_states, expert_ids = args[0], args[-2]
+    assert tuple(sent_hidden_states.shape) == (8, connector.hidden_size)
+    assert args[4] == 8
+    assert expert_ids[:3, 0].tolist() == [7, 11, 13]
+    assert expert_ids[3:, 0].tolist() == [-1] * 5
+    assert forward_context.cam_afdtransfer_state.padded_payload is True
 
 
 def test_send_attn_output_keeps_stage_rows_when_ubatching(monkeypatch):
@@ -601,7 +603,7 @@ def test_send_attn_output_keeps_stage_rows_when_ubatching(monkeypatch):
     (args,) = calls
     assert tuple(args[0].shape) == (3, connector.hidden_size)
     assert args[4] == 3
-    assert forward_context.cam_afdtransfer_state.attention_rows is None
+    assert forward_context.cam_afdtransfer_state.padded_payload is False
 
 
 def test_send_attn_output_rejects_rows_beyond_the_reported_tile(monkeypatch):
@@ -642,7 +644,7 @@ def test_recv_ffn_output_trims_a_padded_tile_back_to_the_model_rows(monkeypatch)
         batch_size=8,
         h=connector.hidden_size,
         k=connector.num_experts_per_tok,
-        attention_rows=3,
+        padded_payload=True,
     )
     received_rows: list[int] = []
 

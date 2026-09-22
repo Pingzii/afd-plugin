@@ -205,10 +205,12 @@ Three cause families are worth separating before touching the model:
   smaller than the id space. Turn it off after diagnosis: the check reads device
   tensors and synchronises.
 
-The alignment runs outside `torch.compile`. Comparing the reported count with the
-rows a traced forward produced specializes the token dimension the compiled model
-declares dynamic, and `torch.compile` rejects that with a dynamic shape constraint
-violation naming `input_ids`. A compiled or captured step therefore keeps the rows
-its forward produced and relies on the runner reporting the count it executes,
-while eager steps get the padding and the checks above. Graph replay runs no
-Python at all, so on the compiled path the transfer size is whatever was captured.
+The alignment works both eagerly and inside `torch.compile`. It cannot compare
+the reported count with the rows a traced forward produced, because that
+specializes the token dimension the compiled model declares dynamic and
+`torch.compile` rejects it with a constraint violation naming `input_ids`. The
+payload is therefore copied into a buffer of exactly the reported size: pad rows
+keep zeros for the hidden states and the sentinel the FFN maps back to token 0 for
+the ids, and the receive trims the returned tile with the reference tensor's row
+count. An Attention rank that produced more rows than the step reports is the one
+case that cannot be represented, and eager steps fail fast on it.
