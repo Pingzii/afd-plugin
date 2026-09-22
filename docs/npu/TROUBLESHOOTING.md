@@ -159,3 +159,38 @@ export AFD_ASYNC_MOE_LAYOUT_LOG=1
 
 The log reports token extents, padding, CAM-local slices, and FFN result
 gathering. Disable it after diagnosis to keep normal service logs concise.
+
+## Hash routing fails with an AI Core address error
+
+A DSV4 Hash (token-keyed) layer indexes its token-to-expert table with the raw
+token ids of the rows it routes, and the CANN operator never validates them. Ids
+that do not belong to those rows therefore surface on device as:
+
+```text
+errorStr: The DDR address of the MTE instruction is out of range
+fault kernel_name=MoeGatingTopKHash_...
+```
+
+The lines after the first `MTE`/`VEC` error are the aborted-context cascade
+(`EnterFailureAbort`, `Stream Synchronize failed`, `aclnnInplaceCopy`,
+`507035`), so diagnose the first error rather than the last one.
+
+Two cause families are worth separating before touching the model:
+
+- **Uneven Attention peers.** When there are more Attention ranks than FFN ranks,
+  one FFN rank serves several Attention peers, and A2E lays that rank's ids and
+  hidden states out as equal per-peer tiles. Peers that send different token
+  counts shift every later peer's rows and leave the tail ids rows unwritten.
+  `CAMP2pAFDConnector` now refuses the transfer and reports the counts it saw, so
+  check the DP metadata (`num_tokens_across_dp_cpu`) that Attention sends and the
+  TP-to-AFD rank expansion it is read through.
+- **Ids that are not tokens.** Enable the value check on the FFN process:
+
+  ```bash
+  export AFD_VALIDATE_HASH_TOKEN_IDS=1
+  ```
+
+  The error names the offending row indices and values, which is what separates
+  an id buffer that was never fully written from a `tid2eid` table that is
+  smaller than the id space. Turn it off after diagnosis: the check reads device
+  tensors and synchronises.

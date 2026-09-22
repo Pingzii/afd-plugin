@@ -276,33 +276,48 @@ def received_token_ids(
     sim_expert_ids: torch.Tensor,
     *,
     expected_tokens: int,
+    written_tokens: int,
 ) -> torch.Tensor:
     """Collapse the A2E ids channel back to a token-aligned id vector.
 
-    The operator returns ``(N, topk)`` with every column of a row repeating that
-    token's id, and sizes ``N`` to the capacity it was given, so this trims to
-    the tokens the FFN rank actually computes on.
+    Every column of a row repeats that token's id. The operator sizes the output
+    to the capacity it was given rather than to the rows it writes, and its host
+    inference multiplies that capacity by the number of Attention peers, so the
+    shape alone cannot prove which rows arrived. The caller therefore states the
+    written row count explicitly.
 
     Args:
         sim_expert_ids: The operator's ids output.
         expected_tokens: Token count derived from the FFN rank's DP metadata,
             which is what the FFN compute will actually run on.
+        written_tokens: Rows the transfer writes, which A2E derives as
+            ``peers * (batch_size // peers)`` and never exceeds
+            ``expected_tokens`` unless the peers are even.
 
     Returns:
         A one-dimensional ``int32`` tensor of length ``expected_tokens``.
 
     Raises:
-        ValueError: If fewer ids arrived than the FFN rank computes on. That is
-            the misalignment this channel has to catch: a token-keyed router
-            would otherwise select experts for the wrong tokens.
+        ValueError: If the operator's capacity cannot hold the written rows, or
+            if fewer rows are written than the FFN rank computes on. The second
+            case is the dangerous one: the remaining rows hold uninitialised
+            device memory, and a token-keyed router turns each of them into an
+            out-of-range table lookup.
     """
 
-    received_tokens = int(sim_expert_ids.shape[0])
-    if received_tokens < expected_tokens:
+    declared_tokens = int(sim_expert_ids.shape[0])
+    if declared_tokens < written_tokens:
         raise ValueError(
-            f"received {received_tokens} token ids but the FFN rank computes on "
-            f"{expected_tokens} tokens; the ids channel is not aligned with the "
-            "FFN token layout",
+            f"A2E declared {declared_tokens} id rows but the transfer writes "
+            f"{written_tokens}; the ids channel is not sized for this topology",
+        )
+    if written_tokens < expected_tokens:
+        raise ValueError(
+            f"received {written_tokens} token ids but the FFN rank computes on "
+            f"{expected_tokens} tokens; the last "
+            f"{expected_tokens - written_tokens} rows hold uninitialised device "
+            "memory, which a token-keyed router reads as an out-of-range id. The "
+            "ids channel is not aligned with the FFN token layout",
         )
     # The columns are replicas of the same id, so the first one carries it.
     return sim_expert_ids[:expected_tokens, 0].contiguous()
@@ -382,6 +397,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.hidden_size = hf_config.hidden_size
         self.num_experts_per_tok = hf_config.num_experts_per_tok
         self.num_routed_experts = hf_config.n_routed_experts
+        # Row count of the model's token-to-expert (Hash) tables: token ids the
+        # ids channel carries are indices into them.
+        self.vocab_size = int(hf_config.vocab_size)
         self.control_plane = CAMP2pAFDControlPlane(self)
 
     @property
@@ -642,7 +660,9 @@ class CAMP2pAFDConnector(AFDConnectorBase):
 
         Raises:
             RuntimeError: If communication is not ready, transfer information
-                is missing, or the requested ubatch group does not exist.
+                is missing, the requested ubatch group does not exist, or the
+                Attention peers of this FFN rank have uneven token counts, which
+                A2E's equal-tile layout cannot represent.
             ValueError: If ids were requested but do not align with the FFN
                 rank's token layout.
         """
@@ -660,6 +680,29 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             ffn_size=self.ffn_size,
             fallback=max_num_tokens,
         )
+        # A2E lays this rank's ids and hidden states out as one tile per
+        # Attention peer, so the group's counts have to be even before the
+        # transfer is issued rather than after the device faults or the FFN
+        # computes on a shifted row order.
+        attention_group = _attention_group_token_counts(
+            self.dp_metadata_list.get(ubatch_idx),
+            ffn_rank=self.role_rank,
+            attention_size=self.attn_size,
+            ffn_size=self.ffn_size,
+        )
+        tiles = 1
+        if attention_group:
+            _check_a2e_token_layout(
+                attention_group,
+                ffn_rank=self.role_rank,
+                attention_size=self.attn_size,
+                ffn_size=self.ffn_size,
+            )
+            tiles = len(attention_group)
+        # A2E writes ``tiles * (batch_size // tiles)`` id rows, which its host
+        # shape inference then multiplies by ``tiles``, so the declared capacity
+        # cannot prove the tail rows arrived.
+        written_tokens = tiles * (batch_size // tiles)
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=ubatch_idx,
@@ -711,6 +754,19 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             received_ids = received_token_ids(
                 outputs[1],
                 expected_tokens=batch_size,
+                written_tokens=written_tokens,
+            )
+            # The check belongs to the model's Hash routing contract, so it is
+            # deferred here rather than importing the model package from this
+            # connector at module load.
+            from afd_plugin.model_executor.models.npu import (
+                deepseek_v4_attention_gate,
+            )
+
+            deepseek_v4_attention_gate.validate_hash_token_ids(
+                received_ids,
+                table_rows=self.vocab_size,
+                context="CAMP2P FFN-side Hash routing",
             )
         return AFDA2FTransferPayload(
             hidden_states=outputs[0],
@@ -888,6 +944,92 @@ def build_camp2p_topology(
     )
 
 
+def _attention_token_counts(
+    dp_metadata: DPMetadata | AFDDPMetadata | None,
+    *,
+    attention_size: int,
+) -> list[int] | None:
+    """Return the per-Attention-rank token counts of one stage.
+
+    ``num_tokens_across_dp_cpu`` holds one count per DP rank, but the Attention
+    role also contains the TP workers of each DP rank. Each DP count is
+    replicated across its TP workers, which makes the result positional in
+    Attention rank order. Returns ``None`` when the metadata cannot describe
+    every Attention rank, so callers fall back instead of inventing counts.
+    """
+
+    if dp_metadata is None:
+        return None
+    counts = dp_metadata.num_tokens_across_dp_cpu.flatten().tolist()
+    if not counts:
+        return None
+    if len(counts) < attention_size and attention_size % len(counts) == 0:
+        tp_size = attention_size // len(counts)
+        counts = [counts[idx // tp_size] for idx in range(attention_size)]
+    if len(counts) < attention_size:
+        return None
+    return [int(count) for count in counts[:attention_size]]
+
+
+def _attention_group_token_counts(
+    dp_metadata: DPMetadata | AFDDPMetadata | None,
+    *,
+    ffn_rank: int,
+    attention_size: int,
+    ffn_size: int,
+) -> list[int] | None:
+    """Return the token counts of the Attention ranks one FFN rank serves.
+
+    Returns ``None`` for a topology this helper does not describe, which leaves
+    the caller's fallback path unchanged.
+    """
+
+    counts = _attention_token_counts(dp_metadata, attention_size=attention_size)
+    if counts is None:
+        return None
+    if ffn_size <= 0 or attention_size < ffn_size or attention_size % ffn_size != 0:
+        return None
+    group_size = attention_size // ffn_size
+    start_idx = ffn_rank * group_size
+    return counts[start_idx : start_idx + group_size]
+
+
+def _check_a2e_token_layout(
+    group_counts: list[int],
+    *,
+    ffn_rank: int,
+    attention_size: int,
+    ffn_size: int,
+) -> None:
+    """Fail fast when A2E cannot lay out this FFN rank's Attention group.
+
+    A2E splits the ids, scales, and hidden-state regions of one FFN rank into
+    ``attention_size // ffn_size`` tiles of ``batch_size // tiles`` rows, while
+    each Attention rank writes its regions using its own token count
+    (``csrc/npu/ascend_kernels/a2e/op_kernel/a2e.h``). The two agree only when
+    every Attention peer sends the same number of tokens: one uneven peer shifts
+    every later peer's rows and leaves the tail rows of ``simulate_expert_ids``
+    unwritten. Those rows hold uninitialised device memory, and a DSV4 Hash layer
+    turns each of them into an out-of-range ``tid2eid`` read on device.
+
+    Raises:
+        RuntimeError: If the peers of this FFN rank have different token counts.
+    """
+
+    tiles = len(group_counts)
+    if tiles <= 1 or len(set(group_counts)) == 1:
+        return
+    raise RuntimeError(
+        f"CAMP2P FFN rank {ffn_rank} of {ffn_size} serves {tiles} Attention "
+        f"ranks (attention_size={attention_size}) with uneven token counts "
+        f"{group_counts}. A2E lays this rank out as {tiles} equal tiles, so "
+        "uneven peers misalign every later peer's rows and leave the tail ids "
+        "rows unwritten; a token-keyed router then reads uninitialised device "
+        "memory as token ids. Make every Attention peer of an FFN rank send the "
+        "same token count, or fix the A2E per-sender layout.",
+    )
+
+
 def _num_tokens_for_ffn_rank(
     dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
     stage_idx: int,
@@ -914,26 +1056,15 @@ def _num_tokens_for_ffn_rank(
     Returns:
         The number of tokens this FFN rank should receive, always at least one.
     """
-    dp_metadata = dp_metadata_list[stage_idx]
-    if dp_metadata is None:
+    group_counts = _attention_group_token_counts(
+        dp_metadata_list[stage_idx],
+        ffn_rank=ffn_rank,
+        attention_size=attention_size,
+        ffn_size=ffn_size,
+    )
+    if group_counts is None:
         return max(1, fallback)
-    token_counts = dp_metadata.num_tokens_across_dp_cpu
-    counts = token_counts.flatten().tolist()
-    # Expand DP-level counts to AFD-level when TP > 1.
-    # num_tokens_across_dp_cpu has dp_size entries, but attention_size
-    # = num_attention_ranks includes TP workers.  Each DP rank's count
-    # is replicated tp_size times.
-    if len(counts) < attention_size and attention_size % len(counts) == 0:
-        tp_size = attention_size // len(counts)
-        counts = [counts[i // tp_size] for i in range(attention_size)]
-    if len(counts) < attention_size:
-        return max(1, fallback)
-    if attention_size >= ffn_size and attention_size % ffn_size == 0:
-        group_size = attention_size // ffn_size
-        start_idx = ffn_rank * group_size
-        end_idx = start_idx + group_size
-        return max(1, sum(counts[start_idx:end_idx]))
-    return max(1, fallback)
+    return max(1, sum(group_counts))
 
 
 def _get_group_ep(

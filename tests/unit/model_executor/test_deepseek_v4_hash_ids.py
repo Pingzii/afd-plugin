@@ -80,6 +80,7 @@ with _vllm_stub():
     from afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate import (
         hash_input_ids_from_context,
         local_hash_input_ids,
+        validate_hash_token_ids,
     )
 
 
@@ -308,3 +309,57 @@ def test_remote_moe_without_context_ids_raises_instead_of_sending_activations_on
         layer.forward(torch.zeros(3, 8))
 
     assert layer.sent == []
+
+
+def test_validate_hash_token_ids_stays_off_by_default(monkeypatch):
+    """The check reads device tensors, so a default run must not pay for it."""
+
+    monkeypatch.delenv("AFD_VALIDATE_HASH_TOKEN_IDS", raising=False)
+
+    validate_hash_token_ids(
+        torch.tensor([4096, -3], dtype=torch.int64),
+        table_rows=8,
+        context="DSV4 test routing",
+    )
+
+
+def test_validate_hash_token_ids_accepts_in_range_ids(monkeypatch):
+    monkeypatch.setenv("AFD_VALIDATE_HASH_TOKEN_IDS", "1")
+
+    validate_hash_token_ids(
+        torch.tensor([0, 7], dtype=torch.int32),
+        table_rows=8,
+        context="DSV4 test routing",
+    )
+
+
+def test_validate_hash_token_ids_names_the_offending_rows(monkeypatch):
+    """The message has to identify the rows, not just that something was wrong.
+
+    Which ids are out of range is what distinguishes a table that is smaller than
+    the id space from an id buffer whose tail rows were never written.
+    """
+
+    monkeypatch.setenv("AFD_VALIDATE_HASH_TOKEN_IDS", "1")
+    ids = torch.tensor([1, 4096, 7, -1], dtype=torch.int64)
+
+    with pytest.raises(RuntimeError, match=r"outside \[0, 8\)") as excinfo:
+        validate_hash_token_ids(ids, table_rows=8, context="DSV4 test routing")
+
+    message = str(excinfo.value)
+    assert "2 of 4" in message
+    assert "rows=[1, 3]" in message
+    assert "values=[4096, -1]" in message
+    assert "min=-1" in message
+    assert "max=4096" in message
+
+
+def test_validate_hash_token_ids_rejects_a_table_without_rows(monkeypatch):
+    monkeypatch.setenv("AFD_VALIDATE_HASH_TOKEN_IDS", "1")
+
+    with pytest.raises(RuntimeError, match="has 0 rows"):
+        validate_hash_token_ids(
+            torch.tensor([1], dtype=torch.int64),
+            table_rows=0,
+            context="DSV4 test routing",
+        )
