@@ -60,6 +60,12 @@ class AFDConnectorBase(ABC):
     control_plane: AFDControlPlane | None = None
     attn_size: int = 0
     ffn_size: int = 0
+    # Numbers of the most recent A2E tile send and receive, for the runners to
+    # report once per step: a payload whose rows do not match the tile the
+    # receiver sized itself with is what makes a transport read past a peer's
+    # rows. Connectors that keep a count-per-rank layout leave them ``None``.
+    last_a2e_send: tuple[int, int, int, int, tuple[int, ...]] | None = None
+    last_a2e_recv: tuple[int, int, tuple[int, ...]] | None = None
     # How many rows one Attention rank holds per token count reported for its DP
     # rank. Transports that move one equal tile per Attention peer derive their
     # tile from this divisor, because a rank holding a share of the DP count

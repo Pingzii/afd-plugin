@@ -161,6 +161,11 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_is_graph_replaying = False
         self._afd_pending_metadata: AFDForwardContextMetadata | None = None
         self._afd_suppress_metadata_send = False
+        # Last A2E send reported by this runner, so the per-step report is emitted
+        # once per distinct step instead of once per layer.
+        self._afd_reported_send: tuple[int, int, int, int, tuple[int, ...]] | None = (
+            None
+        )
         self._afd_transaction_counter = 0
         self._afd_async_moe_ubatch_metadata: AsyncMoeUbatchMetadata | None = None
         self._afd_live_execution = False
@@ -244,6 +249,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 forward_context,
                 num_tokens_padded,
             )
+        self._report_a2e_send(forward_context, num_tokens_padded)
 
         # ### PATCH START: AFD defers FlashComm gather to model execution
         if (
@@ -1454,6 +1460,42 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         if padded_graph_tokens is not None and not ubatch_slices:
             dp_metadata = self._build_capture_dp_metadata(padded_graph_tokens)
         self._send_dp_metadata(dp_metadata, ubatch_slices)
+
+    def _report_a2e_send(
+        self,
+        forward_context: ForwardContext,
+        num_tokens_padded: int,
+    ) -> None:
+        """Report the A2E tile of a step that actually sent one.
+
+        A2E reads a fixed number of rows per Attention peer, so the rows a rank
+        reports and the tile the FFN rank sizes its receive with have to be the
+        same number. Reporting both here, once per distinct step, shows whether a
+        step sent fewer rows than the receiver read -- the case that puts a peer's
+        activations where a Hash router expects token ids. The reported tuple is
+        the last send of this forward, so a FULL graph that bakes its send into
+        the capture keeps repeating the values it was captured with.
+        """
+
+        send = self.connector.last_a2e_send
+        if send is None or send == self._afd_reported_send:
+            return
+        self._afd_reported_send = send
+        layer_idx, stage_idx, reported_rows, tile_rows, dp_counts = send
+        logger.warning(
+            "AFD NPU A2E send; world_rank=%d layer=%d stage=%d reported_rows=%d "
+            "tile_rows=%d padded_tokens=%d dp_counts=%s graph_replaying=%s "
+            "runtime_mode=%s",
+            self.connector.world_rank,
+            layer_idx,
+            stage_idx,
+            reported_rows,
+            tile_rows,
+            int(num_tokens_padded),
+            dp_counts,
+            bool(getattr(self, "_afd_is_graph_replaying", False)),
+            forward_context.cudagraph_runtime_mode,
+        )
 
     def _install_async_moe_ubatch_metadata_on_forward_context(
         self,

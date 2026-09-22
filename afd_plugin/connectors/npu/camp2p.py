@@ -645,6 +645,20 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
         forward_context = get_forward_context()
         wire_rows = self._padding_rows_for_step(metadata.stage_idx)
+        if not torch.compiler.is_compiling():
+            # Numbers of the last A2E send, for the runner to report once per step.
+            # A graph-frozen send repeats the values it was captured with, so a
+            # reporter can tell a per-step payload from a baked-in one.
+            self.last_a2e_send = (
+                int(metadata.layer_idx),
+                int(metadata.stage_idx),
+                int(metadata.total_tokens),
+                int(wire_rows),
+                tuple(
+                    int(count)
+                    for count in self.dp_token_counts.get(metadata.stage_idx, ())
+                ),
+            )
         if not torch.compiler.is_compiling() and wire_rows < int(metadata.total_tokens):
             raise RuntimeError(
                 f"CAMP2P Attention rank sends {int(metadata.total_tokens)} tokens "
@@ -876,6 +890,11 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             ffn_size=self.ffn_size,
             shard=self.attention_shard,
             fallback=self.max_num_tokens,
+        )
+        self.last_a2e_recv = (
+            int(ubatch_idx),
+            int(batch_size),
+            tuple(int(count) for count in self.dp_token_counts.get(ubatch_idx, ())),
         )
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,

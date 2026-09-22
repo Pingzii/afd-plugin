@@ -15,7 +15,7 @@ from vllm.platforms import current_platform
 from vllm_ascend import ascend_forward_context as ascend_context
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, graph_capture
 
-from afd_plugin.a2e_layout import ffn_receive_rows
+from afd_plugin.a2e_layout import ffn_receive_rows, ffn_tile_count
 from afd_plugin.compat.npu import (
     ascend_forward_context,
     fail_if_unsupported_npu_afd_features,
@@ -97,6 +97,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         )
         self.prof = create_afd_npu_profiler("ffn")
         self._is_shutdown = False
+        # Last A2E receive reported by this runner, so the per-step report is
+        # emitted once per distinct step instead of once per layer.
+        self._afd_reported_recv: tuple[int, int, tuple[int, ...]] | None = None
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -313,7 +316,39 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         context,
                         stage_idx=stage_idx,
                     )
+        self._report_a2e_recv()
         return rank_ffn_output
+
+    def _report_a2e_recv(self) -> None:
+        """Report the A2E tile this FFN rank sized its receive with, once per step.
+
+        The operator reads one equal tile per Attention peer, so this rank's rows
+        have to be the rows those peers wrote. Reporting the tile next to the DP
+        counts it came from shows a step whose metadata describes a different tile
+        than the Attention ranks padded their payloads up to -- the case that
+        makes the receive read past a peer's ids into its activations.
+        """
+
+        recv = self.connector.last_a2e_recv
+        if recv is None or recv == self._afd_reported_recv:
+            return
+        self._afd_reported_recv = recv
+        stage_idx, a2e_rows, dp_counts = recv
+        tiles = ffn_tile_count(
+            attention_size=int(self.connector.attn_size),
+            ffn_size=int(self.connector.ffn_size),
+        )
+        logger.warning(
+            "AFD NPU A2E recv; world_rank=%d stage=%d a2e_rows=%d rows_per_peer=%d "
+            "tiles=%d shard=%d dp_counts=%s",
+            self.connector.world_rank,
+            stage_idx,
+            a2e_rows,
+            a2e_rows // max(1, tiles),
+            tiles,
+            int(self.connector.attention_shard),
+            dp_counts,
+        )
 
     def _ffn_forward_connector_driven(
         self,
