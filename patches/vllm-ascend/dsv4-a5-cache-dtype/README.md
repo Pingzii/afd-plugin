@@ -26,6 +26,9 @@
 |---|---|---|---|
 | 1 | `0001-indexer-kv-dtype.patch` | 解决问题 ① | **上游 PR #17635**（2026-10-08 合入 main）。我们 pin 的 commit 比它早 11 天，所以没带上 |
 | 2 | `0002-cache-dtype.patch` | 解决问题 ② | **我们自己写的**。上游至今未修 |
+| — | `combined.patch` | 上面两个的拼接（逐字节相同，只是合成一个文件） | 一次 `git apply` 用 |
+
+**`combined.patch` 是给"一次打完"用的；拆分的两个请一并保留** —— 哪天升级到含 `#17635` 的 vllm-ascend，只需要 apply `0002`，而那时 `0001` 反而会冲突。
 
 `0001` 能干净地打到 `8d4409d62` 上（`git apply --check` 退出码 0），所以直接用上游代码，不自己重写。
 
@@ -33,10 +36,14 @@
 
 ```bash
 cd /home/s00988495/AFD/vllm-ascend          # 路径按实际环境调整
+PATCHES=/home/s00988495/AFD/afd-plugin/patches/vllm-ascend/dsv4-a5-cache-dtype
 
-# 按顺序打
-git apply /home/s00988495/AFD/afd-plugin/patches/vllm-ascend/dsv4-a5-cache-dtype/0001-indexer-kv-dtype.patch
-git apply /home/s00988495/AFD/afd-plugin/patches/vllm-ascend/dsv4-a5-cache-dtype/0002-cache-dtype.patch
+# 一次打完（等价于下面按顺序打两个）
+git apply $PATCHES/combined.patch
+
+# 或者按顺序打（升级过 #17635 之后只需要打 0002）
+git apply $PATCHES/0001-indexer-kv-dtype.patch
+git apply $PATCHES/0002-cache-dtype.patch
 
 # 确认
 git status --porcelain

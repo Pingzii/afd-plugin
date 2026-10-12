@@ -1,0 +1,284 @@
+diff --git a/tests/ut/models/test_deepseek_v4_indexer.py b/tests/ut/models/test_deepseek_v4_indexer.py
+index bbed1bdbf1b3..934ad3e49491 100644
+--- a/tests/ut/models/test_deepseek_v4_indexer.py
++++ b/tests/ut/models/test_deepseek_v4_indexer.py
+@@ -9,12 +9,14 @@
+ import torch
+ 
+ from vllm_ascend.device.device_op import DeviceOperator
++from vllm_ascend.device.hardware_profile import HardwareCapability
+ from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata
+ from vllm_ascend.models.deepseek_v4.indexer import (
+     AscendIndexerMetadata,
+     AscendIndexerOps,
+     DeepseekV4Indexer,
+     IndexerOverlapPlan,
++    get_indexer_k_dtype,
+     hadamard_linear,
+     hadamard_scale,
+     rotate_activation,
+@@ -454,3 +456,73 @@ def test_quantize_scatter_then_select_topk(self):
+         assert qli_kwargs["layout_k"] == "PA_BBND"
+         assert qli_kwargs["mask_mode"] == 3
+         assert qli_kwargs["cmp_ratio"] == 4
++
++
++def _make_vllm_config_for_k_dtype(indexer_kv_dtype: str) -> SimpleNamespace:
++    attention_config = SimpleNamespace(indexer_kv_dtype=indexer_kv_dtype)
++    attention_config.resolve_indexer_kv_dtype = lambda default: (
++        default if attention_config.indexer_kv_dtype == "auto" else attention_config.indexer_kv_dtype
++    )
++    return SimpleNamespace(
++        attention_config=attention_config,
++        model_config=SimpleNamespace(dtype=torch.bfloat16),
++    )
++
++
++class TestGetIndexerKDtype:
++    @pytest.mark.parametrize(
++        ("indexer_kv_dtype", "supports_compressed_cache", "expected_dtype"),
++        [
++            ("auto", False, torch.int8),
++            ("int8", False, torch.int8),
++            ("auto", True, torch.float8_e4m3fn),
++            ("fp8", True, torch.float8_e4m3fn),
++        ],
++    )
++    def test_resolves_auto_to_platform_default_and_keeps_explicit_values(
++        self,
++        indexer_kv_dtype: str,
++        supports_compressed_cache: bool,
++        expected_dtype: torch.dtype,
++    ):
++        vllm_config = _make_vllm_config_for_k_dtype(indexer_kv_dtype)
++
++        with patch(
++            "vllm_ascend.models.deepseek_v4.indexer.get_current_hardware_profile",
++            return_value=SimpleNamespace(
++                supports=lambda capability: (
++                    supports_compressed_cache and capability == HardwareCapability.DSV4_COMPRESSED_CACHE
++                )
++            ),
++        ):
++            actual = get_indexer_k_dtype(vllm_config)
++
++        assert actual == expected_dtype
++
++    @pytest.mark.parametrize(
++        ("indexer_kv_dtype", "supports_compressed_cache"),
++        [
++            ("bf16", False),
++            ("fp8", False),
++            ("int8", True),
++        ],
++    )
++    def test_rejects_unsupported_dtype_with_actionable_error(
++        self,
++        indexer_kv_dtype: str,
++        supports_compressed_cache: bool,
++    ):
++        vllm_config = _make_vllm_config_for_k_dtype(indexer_kv_dtype)
++
++        with (
++            patch(
++                "vllm_ascend.models.deepseek_v4.indexer.get_current_hardware_profile",
++                return_value=SimpleNamespace(
++                    supports=lambda capability: (
++                        supports_compressed_cache and capability == HardwareCapability.DSV4_COMPRESSED_CACHE
++                    )
++                ),
++            ),
++            pytest.raises(ValueError, match="is not supported by the DeepSeek V4"),
++        ):
++            get_indexer_k_dtype(vllm_config)
+diff --git a/vllm_ascend/models/deepseek_v4/indexer.py b/vllm_ascend/models/deepseek_v4/indexer.py
+index 0fb3764fea42..b2af97efd24c 100644
+--- a/vllm_ascend/models/deepseek_v4/indexer.py
++++ b/vllm_ascend/models/deepseek_v4/indexer.py
+@@ -95,6 +95,36 @@ def _is_mxfp8_dynamic(linear) -> bool:
+     return isinstance(inner_method, AscendW8A8MXFP8DynamicLinearMethod)
+ 
+ 
++def get_indexer_k_dtype(vllm_config: VllmConfig) -> torch.dtype:
++    """Resolve the DeepSeek V4 indexer K cache dtype.
++
++    The indexer K cache has no bf16 write path: the Non-A5 scatter
++    (``npu_scatter_nd_update_sk``) only accepts int8 updates, and A5
++    quantizes to fp8 inside ``indexer_compress_epilog_v2``. Resolve
++    ``indexer_kv_dtype="auto"`` to the platform default and reject
++    unsupported combinations early instead of failing later with a
++    cryptic ACLNN dtype mismatch error.
++    """
++    supports_compressed_cache = get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
++    default_kv_dtype = "fp8" if supports_compressed_cache else "int8"
++    indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(default_kv_dtype)
++    expected_dtype = torch.float8_e4m3fn if supports_compressed_cache else torch.int8
++    error_msg = (
++        f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the DeepSeek V4 "
++        f"indexer on this platform; expected {default_kv_dtype!r}."
++    )
++    try:
++        k_dtype = kv_cache_dtype_str_to_dtype(indexer_kv_dtype, vllm_config.model_config)
++        dtype_is_supported = k_dtype == expected_dtype
++    except KeyError:
++        # Unknown indexer_kv_dtype string (e.g. not present in
++        # STR_DTYPE_TO_TORCH_DTYPE for this vllm version).
++        dtype_is_supported = False
++    if not dtype_is_supported:
++        raise ValueError(error_msg)
++    return k_dtype
++
++
+ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
+     def __init__(
+         self,
+@@ -304,9 +334,7 @@ def __init__(
+             prefix=f"{prefix}.weights_proj",
+             return_bias=False,
+         )
+-        k_dtype = kv_cache_dtype_str_to_dtype(
+-            self.vllm_config.attention_config.indexer_kv_dtype, vllm_config.model_config
+-        )
++        k_dtype = get_indexer_k_dtype(vllm_config)
+ 
+         if self.compress_ratio == 4:
+             # TODO(cmq): change the dtype of cache
+warning: in the working copy of 'tests/ut/test_platform_dsv4_cache_dtype.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/tests/ut/test_platform_dsv4_cache_dtype.py b/tests/ut/test_platform_dsv4_cache_dtype.py
+new file mode 100644
+index 000000000..7a76f5ec6
+--- /dev/null
++++ b/tests/ut/test_platform_dsv4_cache_dtype.py
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
++
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from vllm_ascend.device.hardware_profile import HardwareCapability
++from vllm_ascend.platform import _configure_deepseek_v4_a5_cache_dtype
++
++
++def _vllm_config(*, architectures, cache_dtype):
++    return SimpleNamespace(
++        model_config=SimpleNamespace(
++            hf_config=SimpleNamespace(architectures=list(architectures)),
++        ),
++        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
++    )
++
++
++def _hardware_profile(*, supports_compressed_cache):
++    return SimpleNamespace(
++        supports=lambda capability: (
++            supports_compressed_cache and capability == HardwareCapability.DSV4_COMPRESSED_CACHE
++        ),
++    )
++
++
++class TestConfigureDeepseekV4A5CacheDtype:
++    @pytest.mark.parametrize(
++        ("architectures", "cache_dtype", "supports_compressed_cache", "expected"),
++        [
++            # A5 DeepSeek V4 left at the default resolves to the only built path.
++            (("DeepseekV4ForCausalLM",), "auto", True, "fp8"),
++            (("DeepseekV41ForCausalLM",), "auto", True, "fp8"),
++            # Explicit user values are preserved, even unsupported ones.
++            (("DeepseekV4ForCausalLM",), "bf16", True, "bf16"),
++            (("DeepseekV4ForCausalLM",), "fp8_e5m2", True, "fp8_e5m2"),
++            (("DeepseekV4ForCausalLM",), "int8", True, "int8"),
++            # Without the compressed-cache capability the platform default stands.
++            (("DeepseekV4ForCausalLM",), "auto", False, "auto"),
++            # Other models keep their configured dtype.
++            (("Qwen3MoeForCausalLM",), "auto", True, "auto"),
++            ((), "auto", True, "auto"),
++        ],
++    )
++    def test_resolves_auto_only_for_deepseek_v4_on_a5(
++        self,
++        architectures,
++        cache_dtype,
++        supports_compressed_cache,
++        expected,
++    ):
++        vllm_config = _vllm_config(architectures=architectures, cache_dtype=cache_dtype)
++
++        with patch(
++            "vllm_ascend.platform.get_current_hardware_profile",
++            return_value=_hardware_profile(supports_compressed_cache=supports_compressed_cache),
++        ):
++            _configure_deepseek_v4_a5_cache_dtype(vllm_config)
++
++        assert vllm_config.cache_config.cache_dtype == expected
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index 6d9700b2c..a9730609f 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -82,6 +82,12 @@ _MINIMAX_M3_ARCHITECTURES = frozenset(
+         "MiniMaxM3SparseForConditionalGeneration",
+     }
+ )
++_DEEPSEEK_V4_ARCHITECTURES = frozenset(
++    {
++        "DeepseekV4ForCausalLM",
++        "DeepseekV41ForCausalLM",
++    }
++)
+ 
+ 
+ class NPUPlatform(Platform):
+@@ -711,6 +717,43 @@ def _configure_minimax_m3_a5_mixed_kv_cache(vllm_config: VllmConfig) -> None:
+     )
+ 
+ 
++def _configure_deepseek_v4_a5_cache_dtype(vllm_config: VllmConfig) -> None:
++    """Pin the DeepSeek V4 KV cache dtype to the platform's only implementation.
++
++    The A5 DeepSeek V4 sparse-attention path ships a single KV cache
++    implementation: ``kv_compress_epilog``, whose binding accepts only E5M2 or
++    E4M3, while the bf16 alternative needs ``sparse_flash_mla``, which the
++    ascend950 operator set does not build. ``cache_dtype`` nevertheless defaults
++    to ``"auto"``, which vLLM resolves to the model dtype (bf16) -- an answer
++    this hardware rejects -- and that value is read by the sparse-attention plan
++    selection, by ``ascend_config`` and by every KV cache spec. Resolve it once
++    here, before any of them run. Explicit user values are left untouched so an
++    unsupported request keeps failing on its own error rather than being
++    silently rewritten.
++    """
++    model_config = vllm_config.model_config
++    cache_config = vllm_config.cache_config
++    if (
++        model_config is None
++        or cache_config is None
++        or cache_config.cache_dtype != "auto"
++        or not get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
++    ):
++        return
++
++    # ModelConfig.architecture is populated later in vLLM initialization. Read
++    # the source-of-truth HF architectures here because this hook runs early.
++    hf_config = getattr(model_config, "hf_config", None)
++    architectures = getattr(hf_config, "architectures", None) or ()
++    if not _DEEPSEEK_V4_ARCHITECTURES.intersection(architectures):
++        return
++
++    cache_config.cache_dtype = "fp8"
++    logger.info_once(
++        "Using fp8 KV cache for DeepSeek V4 on Ascend A5; the bf16 KV cache path is not built for ascend950."
++    )
++
++
+ def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
+     """
+     Check and correct parameters in VllmConfig that are incompatible with Ascend NPU.
+@@ -746,6 +789,7 @@ def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
+             vllm_config.cache_config.calculate_kv_scales = False
+ 
+         _configure_minimax_m3_a5_mixed_kv_cache(vllm_config)
++        _configure_deepseek_v4_a5_cache_dtype(vllm_config)
+ 
+     # ==================== 3. MultiModal Config ====================
+     multimodal_config = getattr(model_config, "multimodal_config", None) if model_config else None
