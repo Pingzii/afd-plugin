@@ -1,10 +1,9 @@
-warning: in the working copy of 'tests/ut/test_platform_dsv4_cache_dtype.py', LF will be replaced by CRLF the next time Git touches it
 diff --git a/tests/ut/test_platform_dsv4_cache_dtype.py b/tests/ut/test_platform_dsv4_cache_dtype.py
 new file mode 100644
-index 000000000..7a76f5ec6
+index 000000000..c8a691d2f
 --- /dev/null
 +++ b/tests/ut/test_platform_dsv4_cache_dtype.py
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,95 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 +
@@ -17,11 +16,12 @@ index 000000000..7a76f5ec6
 +from vllm_ascend.platform import _configure_deepseek_v4_a5_cache_dtype
 +
 +
-+def _vllm_config(*, architectures, cache_dtype):
++def _vllm_config(*, cache_dtype, architectures=(), model_type=None):
++    hf_config = SimpleNamespace(architectures=list(architectures))
++    if model_type is not None:
++        hf_config.model_type = model_type
 +    return SimpleNamespace(
-+        model_config=SimpleNamespace(
-+            hf_config=SimpleNamespace(architectures=list(architectures)),
-+        ),
++        model_config=SimpleNamespace(hf_config=hf_config),
 +        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
 +    )
 +
@@ -38,9 +38,14 @@ index 000000000..7a76f5ec6
 +    @pytest.mark.parametrize(
 +        ("architectures", "cache_dtype", "supports_compressed_cache", "expected"),
 +        [
-+            # A5 DeepSeek V4 left at the default resolves to the only built path.
++            # Every spelling the registry declares for the family. Missing one
++            # leaves that checkpoint on the bf16 default this hardware cannot run.
 +            (("DeepseekV4ForCausalLM",), "auto", True, "fp8"),
 +            (("DeepseekV41ForCausalLM",), "auto", True, "fp8"),
++            (("DeepseekV41ForConditionalGeneration",), "auto", True, "fp8"),
++            (("DeepseekV41DSparkModel",), "auto", True, "fp8"),
++            (("DeepSeekV4MTPModel",), "auto", True, "fp8"),
++            (("DSparkV41DraftModel", "DeepseekV41DSparkModel"), "auto", True, "fp8"),
 +            # Explicit user values are preserved, even unsupported ones.
 +            (("DeepseekV4ForCausalLM",), "bf16", True, "bf16"),
 +            (("DeepseekV4ForCausalLM",), "fp8_e5m2", True, "fp8_e5m2"),
@@ -49,6 +54,7 @@ index 000000000..7a76f5ec6
 +            (("DeepseekV4ForCausalLM",), "auto", False, "auto"),
 +            # Other models keep their configured dtype.
 +            (("Qwen3MoeForCausalLM",), "auto", True, "auto"),
++            (("DeepseekV3ForCausalLM",), "auto", True, "auto"),
 +            ((), "auto", True, "auto"),
 +        ],
 +    )
@@ -68,27 +74,69 @@ index 000000000..7a76f5ec6
 +            _configure_deepseek_v4_a5_cache_dtype(vllm_config)
 +
 +        assert vllm_config.cache_config.cache_dtype == expected
++
++    @pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41", "deepseek_v41_text"])
++    def test_model_type_identifies_the_family(self, model_type):
++        """SpeculativeConfig can overwrite instance model_type for a draft."""
++        vllm_config = _vllm_config(cache_dtype="auto", model_type=model_type)
++
++        with patch(
++            "vllm_ascend.platform.get_current_hardware_profile",
++            return_value=_hardware_profile(supports_compressed_cache=True),
++        ):
++            _configure_deepseek_v4_a5_cache_dtype(vllm_config)
++
++        assert vllm_config.cache_config.cache_dtype == "fp8"
++
++    @pytest.mark.parametrize("model_type", ["qwen3_moe", "deepseek_v3", ""])
++    def test_other_model_types_are_untouched(self, model_type):
++        vllm_config = _vllm_config(cache_dtype="auto", model_type=model_type)
++
++        with patch(
++            "vllm_ascend.platform.get_current_hardware_profile",
++            return_value=_hardware_profile(supports_compressed_cache=True),
++        ):
++            _configure_deepseek_v4_a5_cache_dtype(vllm_config)
++
++        assert vllm_config.cache_config.cache_dtype == "auto"
 diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
-index 6d9700b2c..a9730609f 100644
+index d55c1b670..e8e5be753 100644
 --- a/vllm_ascend/platform.py
 +++ b/vllm_ascend/platform.py
-@@ -82,6 +82,12 @@ _MINIMAX_M3_ARCHITECTURES = frozenset(
+@@ -85,6 +85,10 @@ _MINIMAX_M3_ARCHITECTURES = frozenset(
          "MiniMaxM3SparseForConditionalGeneration",
      }
  )
-+_DEEPSEEK_V4_ARCHITECTURES = frozenset(
-+    {
-+        "DeepseekV4ForCausalLM",
-+        "DeepseekV41ForCausalLM",
-+    }
-+)
++_DEEPSEEK_V4_MODEL_TYPE_PREFIX = "deepseek_v4"
++# The registry spells the family with two capitalisations ("DeepseekV4..." and
++# "DeepSeekV4...").
++_DEEPSEEK_V4_ARCHITECTURE_PREFIX = "deepseekv4"
  
  
  class NPUPlatform(Platform):
-@@ -711,6 +717,43 @@ def _configure_minimax_m3_a5_mixed_kv_cache(vllm_config: VllmConfig) -> None:
+@@ -733,6 +737,61 @@ def _configure_minimax_m3_a5_mixed_kv_cache(vllm_config: VllmConfig) -> None:
      )
  
  
++def _is_deepseek_v4_checkpoint(hf_config: Any) -> bool:
++    """Whether ``hf_config`` describes a DeepSeek V4 family checkpoint.
++
++    The registry spells the family several ways -- ``DeepseekV4ForCausalLM``,
++    the V4.1 ``DeepseekV41ForCausalLM``, its VL spelling
++    ``DeepseekV41ForConditionalGeneration`` and the DSpark draft
++    ``DeepseekV41DSparkModel``. Enumerating those names means a checkpoint whose
++    spelling is missing silently keeps the bf16 default this hardware cannot
++    run, so match the family instead. ``SpeculativeConfig`` can overwrite the
++    instance ``model_type`` for a draft, which is why the declared
++    architectures are checked as well.
++    """
++    model_type = (getattr(hf_config, "model_type", "") or "").lower()
++    if model_type.startswith(_DEEPSEEK_V4_MODEL_TYPE_PREFIX):
++        return True
++    architectures = getattr(hf_config, "architectures", None) or ()
++    return any(architecture.lower().startswith(_DEEPSEEK_V4_ARCHITECTURE_PREFIX) for architecture in architectures)
++
++
 +def _configure_deepseek_v4_a5_cache_dtype(vllm_config: VllmConfig) -> None:
 +    """Pin the DeepSeek V4 KV cache dtype to the platform's only implementation.
 +
@@ -114,10 +162,9 @@ index 6d9700b2c..a9730609f 100644
 +        return
 +
 +    # ModelConfig.architecture is populated later in vLLM initialization. Read
-+    # the source-of-truth HF architectures here because this hook runs early.
++    # the source-of-truth HF config here because this hook runs early.
 +    hf_config = getattr(model_config, "hf_config", None)
-+    architectures = getattr(hf_config, "architectures", None) or ()
-+    if not _DEEPSEEK_V4_ARCHITECTURES.intersection(architectures):
++    if hf_config is None or not _is_deepseek_v4_checkpoint(hf_config):
 +        return
 +
 +    cache_config.cache_dtype = "fp8"
@@ -129,7 +176,7 @@ index 6d9700b2c..a9730609f 100644
  def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
      """
      Check and correct parameters in VllmConfig that are incompatible with Ascend NPU.
-@@ -746,6 +789,7 @@ def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
+@@ -768,6 +827,7 @@ def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
              vllm_config.cache_config.calculate_kv_scales = False
  
          _configure_minimax_m3_a5_mixed_kv_cache(vllm_config)
