@@ -5,37 +5,23 @@ Attention/FFN disaggregation. It lets Attention workers compute MoE routing and
 exchange routed-expert activations with independent FFN expert ranks
 through CAM async dispatch/combine operators.
 
-This guide describes the supported deployment shape, configuration contract,
-rank mapping, data flow, startup requirements, and current limitations. The
-[DeepSeek-V3.2 recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md)
-retains historical v0.26 launch scripts and v0.19 multi-node measurements
-for provenance. The current dependency pair is recorded in the
-[root installation instructions](../../README.md#ascend-npu-installation);
-v0.30 evidence covers V2-Lite ordinary Async CAM and DSV4 Flash W4A8 layered
-off/on, each with a representative 300-question comparison. See the
-[NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
-
-The linked upgrade record predates MRV2 Async CAM support and records a DSV2
-SP defect with TP-sharded shared experts. Its results retain that baseline
-scope; see the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
+Use the pinned dependency pair in the
+[root installation instructions](../../README.md#ascend-npu-installation).
+Current runtime constraints and validation evidence are summarized in the
+[runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
 
 > [!WARNING]
-> CAM async remains experimental. The following evidence is historical v0.26. The linked PCP8 recipe and
-> its measurements belong to the former vLLM/vLLM-Ascend 0.19.1 environment;
-> v0.26 model runner v1 uses the DP+TP/SP topology documented below. The
-> DP3TP2/EP2 matrix passed before the metadata-ownership fix. After that fix,
-> the full 61-layer DeepSeek-V3.2 DP2TP8+EP16 token-split deployment scored
-> `0.9522` strict match on the complete GSM8K evaluation.
+> CAM async is experimental. The native DBO path requires target-device model
+> validation; configuration acceptance and executor tests alone do not qualify
+> model accuracy or performance.
 
 ## When to use this connector
 
-The retained implementation describes an asynchronous Ascend NPU inference path
-with the following code-level constraints. Hardware evidence is limited to
-the models and configurations recorded above:
+Use this connector for eager asynchronous Ascend inference with these requirements:
 
-- CAM operator packages are installed on every node;
+- plugin-owned Ascend operators are built and installed on every node;
 - Attention performs MoE gating before dispatch to FFN ranks;
-- execution is eager and AFD async-DP is enabled; **`async=true` is required**;
+- execution is eager and AFD async-DP is enabled; **`async_dp=true` is required**;
 - regular prefill and autoregressive decode steps use the same CAM path;
 - optional ubatching uses exactly two native DBO microbatches in MRV1 and MRV2,
   including Attention DP1.
@@ -56,7 +42,7 @@ The V2 Async CAM contract is:
 
 - registered DeepSeek-V2/V3 MLA or DeepSeek-V4 models;
 - `--enforce-eager` and `--enable-expert-parallel` on both roles, with
-  `async=true` and `compute_gate_on_attention=true`;
+  `async_dp=true` and `compute_gate_on_attention=true`;
 - PP=PCP=DCP=1, static expert placement, and each role's configured rank count
   equal to its DP x TP size;
 - `attn_ranks_per_dp` equal to Attention TP, and Attention
@@ -68,22 +54,18 @@ Attention-local FlashComm1/SP is supported. Set
 DeepSeek-V2/V3 Attention with effective model SP automatically selects Ascend
 shared-expert DP: shared weights are replicated per rank, which computes its
 local tokens. Without model SP, this automatic override is not applied.
-Attention TP/SP and routed-expert parallelism are unchanged. MRV2 retains its
-existing rejection of explicit `enable_shared_expert_dp=true` and finegrained
-TP configuration. For V2-Lite MLA Attention,
-explicitly set `--block-size=128`; do not apply this setting to V4.
+Attention TP/SP and routed-expert parallelism are unchanged. MRV2 rejects
+explicit `enable_shared_expert_dp=true` and finegrained TP configuration.
+Use `--block-size=128` for V2-Lite MLA Attention; for V4,
+use the model-specific settings in the
+[DSV4 E2E profiles](../../tests/e2e/models/deepseek_v4_flash/config.py).
 
-At every Attention DP size, `async_moe_ubatching=true` enables native DBO: native
-child preparation, ordinary per-ubatch model forwards, and native output merge.
-There is no separate Async splitting policy or model-local stage loop. Native
+At every Attention DP size, `--enable-dbo` uses native child preparation,
+per-ubatch model forwards, and output merge. Native
 splitting can divide one request across microbatches. For DeepSeek-V2/V3, pass
 `--enable-chunked-prefill` so a request crossing the microbatch boundary can
 attend to its prefix KV. Native draft-model/MTP paths are also
 unsupported.
-
-These are configuration and implementation limits, not accuracy or performance
-guarantees for every model and topology. Historical V1 and layered-GMM results
-above retain their original scope.
 
 ## CAM async data flow
 
@@ -139,7 +121,7 @@ The role rank is runtime state, not public configuration. vLLM's global DP
 rank already includes `data_parallel_start_rank`, and the connector factory
 uses one shared resolver before constructing any connector.
 
-For example, the DP3TP2 Attention + DP2TP1/EP2 test topology uses:
+For example, a DP3TP2 Attention + DP2TP1/EP2 FFN topology uses:
 
 ```text
 num_attention_ranks = 3 * 2 = 6
@@ -156,7 +138,9 @@ FFN ranks follow expert parallel placement. The runtime derives experts per rank
 from the model routed-expert count and `num_ffn_ranks`; use a model/topology in
 which routed experts divide evenly across FFN ranks. All roles must use the same
 model, routed-expert layout, quantization, HCCL address, rank counts, CAM
-settings, and ubatching settings. In an async deployment, every Attention (A)
+settings. Enable native DBO only on Attention; FFN must not receive
+`--enable-dbo` or native ubatching flags. Legacy connector flags may remain in
+shared JSON because their normalization is Attention-only. In an async deployment, every Attention (A)
 and FFN (F) process must also set `--max-num-batched-tokens` to the same value.
 
 ## AFD configuration
@@ -170,7 +154,7 @@ There is no separate `--afd-config` option.
   "afd": {
     "role": "attention",
     "connector": "CAMAsyncAFDConnector",
-    "async": true,
+    "async_dp": true,
     "host": "10.0.0.1",
     "port": 6239,
     "num_attention_ranks": 6,
@@ -179,8 +163,6 @@ There is no separate `--afd-config` option.
     "connector_extra_config": {
       "dynamicQuant": 1,
       "attn_ranks_per_dp": 2,
-      "async_moe_ubatching": true,
-      "async_moe_num_ubatches": 2,
       "hccl_buffer_size": 4096
     }
   }
@@ -196,15 +178,15 @@ There is no separate `--afd-config` option.
 | `async` / `async_dp` | `bool` | `false` | Must be `true`. `async` is the accepted compatibility alias for canonical `async_dp`. |
 | `host` | `str` | `"127.0.0.1"` | **Must be the IP address of the node that owns Attention rank 0.** Every rank must use the same reachable value. |
 | `port` | `int` | `1239` | HCCL rendezvous port in `1..65535`; it must be free and reachable. |
+| `afd_process_group_timeout_s` | `int` | `120` | Positive AFD group rendezvous timeout in seconds; also bounds the NPU native DBO startup barrier, not device receive polling. |
 | `num_attention_ranks` | `int` | `1` | Total Attention ranks across all DP and TP groups. |
 | `num_ffn_ranks` | `int` | `1` | Total FFN expert ranks. |
 | `compute_gate_on_attention` | `bool` | `false` | Must be `true`; CAM async runs MoE routing on Attention before dispatching to FFN ranks. |
 | `connector_extra_config` | `dict` | `{}` | Connector-specific settings. Unknown top-level AFD fields are rejected. |
 
-Compatibility aliases `afd_role`, `afd_connector`, `afd_host`, and `afd_port`
-are also accepted. New configurations should use the canonical names shown
-above, except `async`, which is retained as the documented compatibility
-spelling used by the recipes.
+Compatibility aliases `afd_role`, `afd_connector`, `afd_host`, `afd_port`,
+and `async` are accepted. New configurations should use canonical names,
+including `async_dp`; enable DBO through the Attention CLI flags below.
 
 ### CAM async `connector_extra_config`
 
@@ -230,7 +212,7 @@ consumes expert-routed CAM work items and may independently use TP1.
 For eager DeepSeek-V2/V3 MLA or DeepSeek-V4 Attention at any DP size, enable
 native DBO explicitly or retain `async_moe_ubatching=true` as its alias:
 
-```bash
+```text
 --enable-dbo
 --dbo-decode-token-threshold <N>
 --dbo-prefill-token-threshold <N>
@@ -256,71 +238,20 @@ group rather than retrying inside the executor.
 DP1 uses the same native slicing, child attention metadata, execution and merge
 as DP > 1. The Ascend adapter extends native factory and threshold selection to
 DP1 because upstream otherwise returns early there. Async child contexts start
-with `dp_metadata=None`; FFN DP coordination belongs to the connector. The old
-Async planner, metadata sidecar and model-local two-stage schedule are removed.
-
-This migration changes the legacy `request` boundary policy to native DBO
-boundaries. The current refactor has local checks only; earlier hardware and
-accuracy results below do not validate this DP1 migration.
+with `dp_metadata=None`; FFN DP coordination belongs to the connector.
+DP1 model correctness still needs the hardware checks in the
+[NPU validation guide](TESTING.md#native-dbo-contracts-and-device-execution).
 
 For shape-only runtime diagnostics, set
 `AFD_ASYNC_MOE_LAYOUT_LOG=1` on Attention. The log reports the parent token
 extent, CAM-local slice, padding, and whether the FFN result is TP all-gathered.
 It does not inspect tensor values or force a device synchronization.
 
-### Validation evidence
-
-The full DeepSeek-V3.2 deployment uses two 16-NPU nodes:
-Attention DP2TP8 with FlashComm1/SP and FFN EP16 without FlashComm1. Launch it
-through the checked-in
-[v0.26 accuracy recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/v0_26_accuracy/README.md),
-using the complete 61-layer checkpoint.
-
-Historical v0.26 hardware evidence is recorded at two scopes:
-
-- the six-case DP3TP2/EP2 matrix passed before the metadata-ownership fix;
-- after the fix, the full 61-layer DP2TP8+EP16 token-split deployment reached
-  `0.9522` strict match on the complete GSM8K evaluation.
-
-The second result validates the corrected metadata path on that v0.26
-full-model deployment and dataset; it does not validate the integrated v0.30
-runtime.
-
-For the legacy alias, Attention can use:
-
-```json
-{
-  "compute_gate_on_attention": true,
-  "connector_extra_config": {
-    "async_moe_ubatching": true,
-    "async_moe_num_ubatches": 2
-  }
-}
-```
-
-Prefill or decode context parallel size greater than one is rejected because
-the current Async CAM path supports DP+TP/SP, not PCP/DCP.
-
 ## Requirements
 
-Use the current target source pair from the
-[root installation instructions](../../README.md#ascend-npu-installation).
-The following list records the historical v0.26 validation environment:
-
-- Ascend 910C;
-- Python 3.12;
-- CANN 9.0.1;
-- runtime image build `nightly-main-a3-openeuler-20260801230444_aarch64`;
-- vLLM v0.26.0 at commit `568afb3a1`;
-- vLLM-Ascend branch `releases/v0.26.0rc` at commit `80d8c194f`;
-- plugin-owned source-built Ascend operators.
-
-The nightly image identifier records the intended validation environment; it
-is not a promise of a stable public pull tag. Some development package metadata
-in that image still reports a `0.19.1rc2.dev1327` version. The source commits
-above identify that historical port, not the current install target. The recorded validation
-evidence is scoped to the topologies and sample counts stated above; other
-combinations require their own NPU validation.
+Use Ascend 910C, the pinned stack from the
+[root installation instructions](../../README.md#ascend-npu-installation),
+and plugin-owned source-built operators on every node.
 
 Build the AFD operators from the repository root inside the container:
 
@@ -331,15 +262,21 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 The loader configures the packaged `afd-plugin` vendor directory and loads
 `afd_plugin._C_ascend`. No external CAM wheel or vendor library is required.
-Async CAM sends routed experts only. Attention owns native shared MLP weights
-and computes shared outputs in the model's token layout. Shared weights use
-the native replicated SP contract, so TP ranks do not add partial shared
-outputs across different token shards. Their memory is included in profiling.
+Async CAM sends routed experts only. Attention owns shared MLP weights and
+computes shared outputs in the model's token layout. DeepSeek-V2/V3 with
+effective model SP selects replicated shared weights. DeepSeek-V4 preserves
+the native shared-expert policy through `AFDDeepseekV4SharedExperts`, including
+all-gather/reduce-scatter for TP-sharded weights with SP and all-reduce without
+SP. Replicated weights use local SP tokens or split/gather full tokens. Shared
+weights and intermediates are included in Attention memory profiling.
 
 Set `connector_extra_config.hccl_buffer_size` when the CAM domain needs a
-larger buffer than unrelated TP, DP, or EP process groups. `HCCL_BUFFSIZE`
-remains a process-wide fallback and should be used only when all HCCL domains
-in the process should share the same size.
+larger buffer. Also set `HCCL_BUFFSIZE` to that same effective size on every
+rank: Async CAM host tiling reads the environment, whereas HCCL allocation
+can use the domain override. For the JSON example above, export
+`HCCL_BUFFSIZE=4096`. Changing only `hccl_buffer_size` can misalign the window
+capacity and tail-state address. `HCCL_BUFFSIZE` also affects unrelated groups
+without explicit overrides; see the [operator window contract](CAM_ASYNC_ROUTED_OPS.md#communication-window-configuration).
 
 For the experimental FlashComm1/SP cases, set
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention. Set it to `0` for plain TP
@@ -361,10 +298,6 @@ actual vendor library path. Missing source operators fail startup.
 - ModelRunnerV2 rejects PP, PCP, and DCP; V1 PCP and async MoE context
   parallelism remain unsupported.
 - Routed experts should divide evenly across FFN ranks.
-- Historical v0.26 post-fix full-model token-split accuracy reached `0.9522`
-  strict match on the complete GSM8K evaluation. Other Ascend hardware, model families,
-  CAM/CANN/container versions, cross-version combinations, and topologies
-  outside the documented matrices should be treated as unverified.
 
 For startup, HCCL, CAM operator, and shutdown failures, see the
 [NPU troubleshooting guide](TROUBLESHOOTING.md).
@@ -378,8 +311,8 @@ log must show `actual=layered` to confirm that the new path is active.
 
 ```bash
 # Use the same checkpoint, topology, capacity, and requests for both runs.
-AFD_ASYNC_CAM_LAYERED_GMM=0 bash <W4A8-FFN-launch-script>
-AFD_ASYNC_CAM_LAYERED_GMM=1 bash <W4A8-FFN-launch-script>
+AFD_ASYNC_CAM_LAYERED_GMM=0 bash /path/to/W4A8-FFN-launch-script.sh
+AFD_ASYNC_CAM_LAYERED_GMM=1 bash /path/to/W4A8-FFN-launch-script.sh
 ```
 
 The intended configuration is Ascend 910C / `ascend910_93`, async CAM FFN,
@@ -391,10 +324,10 @@ SiLU activation, quantization layout, and scaling semantics. The extractor
 can represent per-channel and per-group parameters, but the pinned Ascend
 loader rejects positive `group_size`; the current target is limited to
 per-channel W4A8. DSV4 Flash has layered off/on 300-question comparisons and
-real INT8-activation/INT4-weight operator traces in the validation record above.
-The [SwiGLU write-back synchronization fix](https://github.com/vllm-project/afd-plugin/issues/429)
-also passes the original per-group operator regression without changing its
-tolerance; this does not extend the checkpoint loader to per-group weights.
+real INT8-activation/INT4-weight operator traces in the
+[runtime validation record](../design/module/execution_platforms.md#tested-runtime-matrix).
+Per-group operator coverage does not extend the checkpoint loader to
+per-group weights.
 Shared experts remain on Attention. DSV4 applies routed scaling in top-k, so
 FFN does not apply it again.
 
