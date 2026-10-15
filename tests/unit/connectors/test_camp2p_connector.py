@@ -366,7 +366,24 @@ def test_camp2p_send_attn_output_mxfp8_pads_the_scale_with_the_activation(
         4,
     )
 
-    activation, _, _, batch, _, _, _, _, _, _, _, _, _, scale, quant_mode = sent[-1]
+    a2e_args = sent[-1]
+    assert len(a2e_args) == 14
+    (
+        activation,
+        _expert_ids,
+        _expert_scales,
+        batch,
+        _hidden_size,
+        _topk,
+        _ffn_size,
+        _attn_size,
+        _world_rank,
+        _group_ep,
+        _aiv_num,
+        _compute_gate,
+        scale,
+        quant_mode,
+    ) = a2e_args
     assert quant_mode == 4
     assert batch == physical
     assert activation.shape == (physical, 16)
@@ -423,8 +440,10 @@ def test_camp2p_recv_attn_output_mxfp8_requests_both_payloads(monkeypatch):
     payload = connector.recv_attn_output(ubatch_idx=0, layer_idx=0)
 
     args = received[-1]
-    assert args[14] == 4
-    assert args[13] is None
+    assert len(args) == 14
+    # Trailing a2e arguments: x_scale then quant_mode.
+    assert args[12] is None
+    assert args[13] == 4
     assert args[0].dtype == torch.float8_e4m3fn
     assert args[0].shape == (0, args[4])
 
