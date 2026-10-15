@@ -80,6 +80,10 @@ _A2E_MX_GROUP_SIZE: Final[int] = 32
 # pair to use the same activation dtype.
 _A2E_MX_ACTIVATION_DTYPE: Final[torch.dtype] = torch.float8_e4m3fn
 
+# Topology the A5 A2E MXFP8 transport contract is defined for: equal positive
+# Attention and FFN rank counts, and at most this many ranks in total.
+A2E_MX_MAX_TOTAL_RANKS: Final[int] = 64
+
 _CAMP2P_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "core_num",

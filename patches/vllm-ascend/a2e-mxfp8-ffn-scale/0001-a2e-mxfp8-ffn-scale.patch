@@ -1,0 +1,46 @@
+diff --git a/vllm_ascend/ops/fused_moe/prepare_finalize.py b/vllm_ascend/ops/fused_moe/prepare_finalize.py
+index f654befd5..eee70c733 100644
+--- a/vllm_ascend/ops/fused_moe/prepare_finalize.py
++++ b/vllm_ascend/ops/fused_moe/prepare_finalize.py
+@@ -405,11 +405,18 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
+         if quant_type == QuantType.W8A8:
+             hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+         elif quant_type in (QuantType.W8A8MXFP, QuantType.W4A8MXFP):
+-            hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+-                hidden_states,
+-                dst_type=torch.float8_e4m3fn,
+-                scale_alg=self.dynamic_mx_quant_scale_alg,
+-            )
++            if hidden_states.dtype == torch.float8_e4m3fn:
++                # The activation already carries MXFP8 quantization from an
++                # upstream producer, which also supplies its paired MX scale on
++                # the routed-experts layer. Quantizing an already-quantized
++                # activation here would silently change its value.
++                pertoken_scale = None
++            else:
++                hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
++                    hidden_states,
++                    dst_type=torch.float8_e4m3fn,
++                    scale_alg=self.dynamic_mx_quant_scale_alg,
++                )
+         elif quant_type == QuantType.W4A4MXFP:
+             hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                 hidden_states,
+diff --git a/vllm_ascend/ops/fused_moe/routed_experts.py b/vllm_ascend/ops/fused_moe/routed_experts.py
+index b5d2245d8..76962615d 100644
+--- a/vllm_ascend/ops/fused_moe/routed_experts.py
++++ b/vllm_ascend/ops/fused_moe/routed_experts.py
+@@ -699,7 +699,12 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
+             enable_force_load_balance=enable_force_load_balance,
+             input_ids=input_ids,
+         )
+-        self.ascend_pertoken_scale = pertoken_scale
++        if pertoken_scale is not None:
++            # Keep a scale an upstream producer already installed on this layer.
++            # The A2E MXFP8 transport quantizes the activation before it reaches
++            # the MoE and hands over the paired MX scale, so prepare returns no
++            # scale of its own.
++            self.ascend_pertoken_scale = pertoken_scale
+         self.ascend_mc2_mask = mc2_mask
+         try:
+             fused_experts_results: FusedExpertsResult = self.quant_method.apply(

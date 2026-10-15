@@ -458,7 +458,12 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 # topk_weights, which CAM applies during combine-recv.
                 routed_scale_applied_in_topk=True,
             )
-        # Target Hash MoE takes explicit token IDs from the CAM transfer.
+        # Target Hash MoE takes explicit token IDs from the CAM transfer. When the
+        # A2E MXFP8 transport delivered an already-quantized activation, pin its
+        # paired MX scale on the routed-experts layer so the MoE's prepare step
+        # reuses it instead of quantizing the activation a second time.
+        if dynamic_scales is not None:
+            self.mlp.experts.ascend_pertoken_scale = dynamic_scales
         return self.mlp(hidden_states, input_ids=get_forward_context().input_ids)
 
 

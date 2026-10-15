@@ -355,6 +355,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
+                        dynamic_scales=states.x_scale,
                     )
                     _send_ffn_output(
                         self.connector,
