@@ -2724,50 +2724,163 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypat
     assert calls == [("bind", worker.device), "step", "sync"]
 
 
-def test_npu_feature_validation_rejects_unsupported_switches():
-    for extra_config, message in [
-        ({"compute_gate_on_attention": True}, "compute_gate_on_attention"),
-        ({"quant_mode": 1}, "quant_mode=0"),
-    ]:
-        with pytest.raises((RuntimeError, ValueError), match=message):
-            fail_if_unsupported_npu_afd_features(
-                _vllm_config(extra_config=extra_config),
-            )
+TWO_UBATCH_DBO = dict(
+    enable_dbo=True, use_ubatching=True, num_ubatches=2, ubatch_size=4
+)
+MLA_DBO = dict(use_mla=True, **TWO_UBATCH_DBO)
+ASYNC_CAM = dict(connector="CAMAsyncAFDConnector", async_dp=True)
 
 
-def test_npu_feature_validation_uses_selected_connector_extra_info_parser():
-    with pytest.raises(ValueError, match="does not support connector_extra_config"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="P2pNcclAFDConnector",
-                extra_config={"core_num": 8},
-            ),
-        )
+@pytest.mark.parametrize(
+    ("config_kwargs", "model_overrides", "max_num_batched_tokens", "error"),
+    [
+        pytest.param({}, {"enforce_eager": False}, None, None, id="graph"),
+        pytest.param(TWO_UBATCH_DBO, {}, None, None, id="two-ubatches"),
+        pytest.param(
+            {**TWO_UBATCH_DBO, "num_ubatches": 4},
+            {},
+            None,
+            "exactly two ubatches",
+            id="four-ubatches",
+        ),
+        pytest.param(
+            {"extra_config": {"compute_gate_on_attention": True}},
+            {},
+            None,
+            "compute_gate_on_attention",
+            id="gate-on-attention",
+        ),
+        pytest.param(
+            {"extra_config": {"quant_mode": 1}}, {}, None, "quant_mode=0", id="quant"
+        ),
+        pytest.param(
+            {"connector": "P2pNcclAFDConnector", "extra_config": {"core_num": 8}},
+            {},
+            None,
+            "does not support connector_extra_config",
+            id="connector-extra-parser",
+        ),
+        pytest.param(
+            {**MLA_DBO, "cudagraph_mode": "FULL_DECODE_ONLY"},
+            {},
+            None,
+            None,
+            id="mla-dbo-full-decode-only",
+        ),
+        pytest.param(
+            {**MLA_DBO, "cudagraph_mode": "FULL"},
+            {},
+            None,
+            "FULL_DECODE_ONLY",
+            id="mla-dbo-full",
+        ),
+        pytest.param(
+            {**MLA_DBO, "cudagraph_mode": "FULL_AND_PIECEWISE"},
+            {},
+            None,
+            "FULL_DECODE_ONLY",
+            id="mla-dbo-full-and-piecewise",
+        ),
+        pytest.param(
+            {**MLA_DBO, "cudagraph_mode": "FULL"},
+            {"hf_text_config": SimpleNamespace(index_topk=8)},
+            None,
+            None,
+            id="sparse-mla-dbo-full",
+        ),
+        # Compressor models such as DeepSeek V4 select the DSA backend, whose
+        # graph-params update is a no-op, so the MLA DBO graph rules do not apply.
+        pytest.param(
+            {**MLA_DBO, "cudagraph_mode": "FULL"},
+            {
+                "hf_text_config": SimpleNamespace(
+                    index_topk=512, compress_ratios=[0, 4, 128]
+                )
+            },
+            None,
+            None,
+            id="compressor-mla-dbo-full",
+        ),
+        pytest.param(
+            {
+                **MLA_DBO,
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "speculative_config": object(),
+            },
+            {},
+            None,
+            "does not support speculative decoding",
+            id="speculative-mla-dbo",
+        ),
+        pytest.param(
+            {**ASYNC_CAM, "async_dp": False}, {}, None, "async=true", id="async-off"
+        ),
+        pytest.param(
+            ASYNC_CAM, {"enforce_eager": False}, None, "only eager", id="async-graph"
+        ),
+        pytest.param(
+            {**ASYNC_CAM, "use_ubatching": True},
+            {},
+            None,
+            "DBO requires exactly two ubatches",
+            id="async-native-ubatching",
+        ),
+        pytest.param(
+            {**ASYNC_CAM, "enable_dbo": True},
+            {},
+            None,
+            "DBO requires exactly two ubatches",
+            id="async-native-dbo",
+        ),
+        pytest.param(
+            {**ASYNC_CAM, "extra_config": {"dynamicQuant": "1"}},
+            {},
+            None,
+            None,
+            id="async-dynamic-quant-1",
+        ),
+        pytest.param(
+            {**ASYNC_CAM, "extra_config": {"dynamicQuant": 2}},
+            {},
+            None,
+            "dynamicQuant",
+            id="async-dynamic-quant-2",
+        ),
+        pytest.param(
+            {
+                **ASYNC_CAM,
+                "compute_gate_on_attention": True,
+                "use_v2_model_runner": True,
+                "use_mla": True,
+                "tensor_parallel_size": 2,
+                "num_attention_ranks": 2,
+                "extra_config": {"attn_ranks_per_dp": 2},
+            },
+            {},
+            5,
+            "divisible by attn_ranks_per_dp",
+            id="async-mrv2-fractional-tp-capacity",
+        ),
+    ],
+)
+def test_npu_feature_validation(
+    config_kwargs, model_overrides, max_num_batched_tokens, error
+):
+    config = _vllm_config(**config_kwargs)
+    for name, value in model_overrides.items():
+        setattr(config.model_config, name, value)
+    if max_num_batched_tokens is not None:
+        config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+
+    if error is None:
+        fail_if_unsupported_npu_afd_features(config)
+    else:
+        with pytest.raises((RuntimeError, ValueError), match=error):
+            fail_if_unsupported_npu_afd_features(config)
 
 
-def test_npu_feature_validation_allows_two_ubatches_only():
-    config = _vllm_config(
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-    fail_if_unsupported_npu_afd_features(config)
-    assert npu_afd_num_ubatches(config) == 2
-
-    with pytest.raises(RuntimeError, match="exactly two ubatches"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                enable_dbo=True,
-                use_ubatching=True,
-                num_ubatches=4,
-                ubatch_size=4,
-            ),
-        )
-
-    config = _vllm_config()
-    config.model_config.enforce_eager = False
-    fail_if_unsupported_npu_afd_features(config)
+def test_npu_afd_num_ubatches_reads_two_ubatch_dbo():
+    assert npu_afd_num_ubatches(_vllm_config(**TWO_UBATCH_DBO)) == 2
 
 
 def test_npu_ubatch_output_merge_preserves_aux_hidden_states():
@@ -2865,107 +2978,6 @@ def test_npu_ubatch_wrapper_reuses_synchronized_stage_dp_metadata(
         assert observed == [stage_metadata]
 
 
-@pytest.mark.parametrize("cudagraph_mode", ["FULL", "FULL_AND_PIECEWISE"])
-def test_npu_feature_validation_requires_decode_only_full_graph_for_mla_dbo(
-    cudagraph_mode,
-):
-    config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode=cudagraph_mode,
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-
-    with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
-        fail_if_unsupported_npu_afd_features(config)
-
-    fail_if_unsupported_npu_afd_features(
-        _vllm_config(
-            use_mla=True,
-            cudagraph_mode="FULL_DECODE_ONLY",
-            enable_dbo=True,
-            use_ubatching=True,
-            num_ubatches=2,
-            ubatch_size=4,
-        ),
-    )
-
-    sparse_config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode="FULL",
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-    sparse_config.model_config.hf_text_config = SimpleNamespace(index_topk=8)
-    fail_if_unsupported_npu_afd_features(sparse_config)
-
-    # A compressor model such as DeepSeek V4 selects the DSA backend, whose
-    # graph-params update is a no-op, so the MLA DBO full graph rules do not
-    # apply to it either.
-    compressor_config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode="FULL",
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-    compressor_config.model_config.hf_text_config = SimpleNamespace(
-        index_topk=512,
-        compress_ratios=[0, 4, 128],
-    )
-    fail_if_unsupported_npu_afd_features(compressor_config)
-
-
-def test_npu_feature_validation_rejects_speculative_mla_dbo_full_graph():
-    config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode="FULL_DECODE_ONLY",
-        speculative_config=object(),
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-
-    with pytest.raises(RuntimeError, match="does not support speculative decoding"):
-        fail_if_unsupported_npu_afd_features(config)
-
-
-def test_npu_async_feature_validation_requires_async_config_and_eager():
-    with pytest.raises(RuntimeError, match="async=true"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(connector="CAMAsyncAFDConnector", async_dp=False),
-        )
-
-    config = _vllm_config(connector="CAMAsyncAFDConnector", async_dp=True)
-    config.model_config.enforce_eager = False
-    with pytest.raises(RuntimeError, match="only eager"):
-        fail_if_unsupported_npu_afd_features(config)
-
-
-@pytest.mark.parametrize(
-    "parallel_override",
-    [
-        {"use_ubatching": True},
-        {"enable_dbo": True},
-    ],
-)
-def test_npu_async_feature_validation_requires_two_native_ubatches(parallel_override):
-    with pytest.raises(RuntimeError, match="DBO requires exactly two ubatches"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="CAMAsyncAFDConnector",
-                async_dp=True,
-                **parallel_override,
-            ),
-        )
-
-
 @pytest.mark.parametrize("use_v2_model_runner", [False, True])
 @pytest.mark.parametrize(
     ("method", "rejected"),
@@ -3046,25 +3058,6 @@ def test_npu_async_feature_validation_checks_receive_capacity(
             fail_if_unsupported_npu_afd_features(config)
     else:
         fail_if_unsupported_npu_afd_features(config)
-
-
-def test_npu_async_feature_validation_allows_dynamic_quant_zero_or_one():
-    fail_if_unsupported_npu_afd_features(
-        _vllm_config(
-            connector="CAMAsyncAFDConnector",
-            async_dp=True,
-            extra_config={"dynamicQuant": "1"},
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="dynamicQuant"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="CAMAsyncAFDConnector",
-                async_dp=True,
-                extra_config={"dynamicQuant": 2},
-            ),
-        )
 
 
 @pytest.mark.parametrize(
@@ -3518,22 +3511,6 @@ def test_npu_async_mrv2_features_allow_model_layouts(
     config.model_config.hf_text_config.model_type = model_type
     config.additional_config["enable_flashcomm1"] = use_sp
     fail_if_unsupported_npu_afd_features(config)
-
-
-def test_npu_async_mrv2_rejects_fractional_tp_capacity():
-    config = _vllm_config(
-        connector="CAMAsyncAFDConnector",
-        async_dp=True,
-        compute_gate_on_attention=True,
-        use_v2_model_runner=True,
-        use_mla=True,
-        tensor_parallel_size=2,
-        num_attention_ranks=2,
-        extra_config={"attn_ranks_per_dp": 2},
-    )
-    config.scheduler_config.max_num_batched_tokens = 5
-    with pytest.raises(RuntimeError, match="divisible by attn_ranks_per_dp"):
-        fail_if_unsupported_npu_afd_features(config)
 
 
 @pytest.mark.parametrize(

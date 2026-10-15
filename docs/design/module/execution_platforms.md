@@ -35,7 +35,6 @@ validation_paths:
   - "tests/unit/v1/worker/test_cuda_graph.py"
   - "tests/unit/v1/worker/test_dbo.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
-  - "tests/unit/v1/worker/test_npu_device_contract.py"
   - "tests/unit/v1/worker/test_npu_mla_graph.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_npu_model_runner_v2.py"

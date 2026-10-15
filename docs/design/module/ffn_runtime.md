@@ -25,7 +25,6 @@ validation_paths:
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
-  - "tests/unit/v1/worker/test_npu_device_contract.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/compat/patches/test_engine_core.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
