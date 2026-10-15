@@ -24,6 +24,7 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 
+from afd_plugin.compat.patches.npu.moe_mxfp8_scale import AFD_MXFP8_SCALE_ATTR
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
@@ -460,10 +461,15 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             )
         # Target Hash MoE takes explicit token IDs from the CAM transfer. When the
         # A2E MXFP8 transport delivered an already-quantized activation, pin its
-        # paired MX scale on the routed-experts layer so the MoE's prepare step
-        # reuses it instead of quantizing the activation a second time.
+        # paired MX scale on the routed-experts layer under AFD's own attribute:
+        # the MoE overwrites ``ascend_pertoken_scale`` from its prepare output, so
+        # the vLLM-Ascend side resolves this name instead.
         if dynamic_scales is not None:
-            self.mlp.experts.ascend_pertoken_scale = dynamic_scales
+            setattr(
+                self.mlp.experts,
+                AFD_MXFP8_SCALE_ATTR,
+                dynamic_scales,
+            )
         return self.mlp(hidden_states, input_ids=get_forward_context().input_ids)
 
 

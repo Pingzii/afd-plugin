@@ -28,6 +28,9 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from afd_plugin.compat.npu import ensure_cam_p2p_ops_available
+from afd_plugin.compat.patches.npu.moe_mxfp8_scale import (
+    apply_afd_moe_mxfp8_scale_patch,
+)
 from afd_plugin.config import AFDConfig
 from afd_plugin.config_utils import (
     coerce_extra_bool,
@@ -408,11 +411,17 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         extra_info = cast(CAMP2PExtraInfo, self.extra_info)
         self.aiv_num = extra_info.aiv_num_for_role(afd_config.role)
         self.quant_mode = extra_info.quant_mode
-        if self.quant_mode == _A2E_QUANT_MODE_MXFP8 and self.aiv_num < 3:
-            raise RuntimeError(
-                "A2E MXFP8 requires at least 3 AIV cores, got "
-                f"{self.aiv_num} for the {afd_config.role} role",
-            )
+        if self.quant_mode == _A2E_QUANT_MODE_MXFP8:
+            if self.aiv_num < 3:
+                raise RuntimeError(
+                    "A2E MXFP8 requires at least 3 AIV cores, got "
+                    f"{self.aiv_num} for the {afd_config.role} role",
+                )
+            if not apply_afd_moe_mxfp8_scale_patch():
+                raise RuntimeError(
+                    "A2E MXFP8 needs the vLLM-Ascend MoE MXFP8 scale resolver, "
+                    "which this vLLM-Ascend build does not provide",
+                )
         self.hccl_buffer_size_mb = extra_info.hccl_buffer_size
         hf_config = vllm_config.model_config.hf_config
         self.hidden_size = hf_config.hidden_size
