@@ -1050,9 +1050,14 @@ def mx_quantize_a2e_activation(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize an Attention activation into the A2E MXFP8 transport pair.
 
-    Returns the E4M3 activation and its E8M0 MX scale. The scale is shaped
-    ``[tokens, ceil(hidden_size / A2E_MX_GROUP_SIZE)]``, which is the layout the
-    A2E operator validates and the layout the FFN consumer expects.
+    Returns the E4M3 activation and its E8M0 MX scale, shaped
+    ``[tokens, ceil(hidden_size / A2E_MX_GROUP_SIZE)]``.
+
+    ``npu_dynamic_mx_quant`` returns the scale with its group axis already split
+    into ``[tokens, num_groups // 2, 2]``, the layout the fused GMM ops consume.
+    The A2E contract and its packet layout are two-dimensional, so collapse the
+    trailing pair here; the FFN side re-splits it through
+    ``maybe_normalize_mxfp_scale_layout`` before it reaches the GMM.
 
     The scale algorithm is read from vLLM-Ascend rather than chosen here, so the
     Attention and FFN sides derive MX scales the same way. A mismatch would still
@@ -1062,11 +1067,60 @@ def mx_quantize_a2e_activation(
     import torch_npu
     from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
 
-    return torch_npu.npu_dynamic_mx_quant(
+    quantized, scale = torch_npu.npu_dynamic_mx_quant(
         hidden_states,
         dst_type=_A2E_MX_ACTIVATION_DTYPE,
         scale_alg=get_dynamic_mx_quant_scale_alg(),
     )
+    scale = scale.flatten(-2)
+    _check_a2e_mx_transport_pair(quantized, scale, int(hidden_states.shape[-1]))
+    return quantized, scale
+
+
+def _check_a2e_mx_transport_pair(
+    quantized: torch.Tensor,
+    scale: torch.Tensor,
+    hidden_size: int,
+) -> None:
+    """Mirror the A2E operator's ``x_scale`` contract and name both sides.
+
+    The operator reports one opaque ``TORCH_CHECK`` for six conditions, which
+    says nothing about what actually arrived. Checking here turns that into a
+    message carrying the observed shapes and dtypes.
+    """
+
+    import torch_npu
+
+    groups = (hidden_size + _A2E_MX_GROUP_SIZE - 1) // _A2E_MX_GROUP_SIZE
+    problems: list[str] = []
+
+    if quantized.dtype != _A2E_MX_ACTIVATION_DTYPE:
+        problems.append(
+            f"activation dtype {quantized.dtype} != {_A2E_MX_ACTIVATION_DTYPE}",
+        )
+    if scale.dtype != torch_npu.float8_e8m0fnu:
+        problems.append(f"scale dtype {scale.dtype} != float8_e8m0fnu")
+    if scale.dim() != 2:
+        problems.append(f"scale dim {scale.dim()} != 2")
+    if not scale.is_contiguous():
+        problems.append("scale is not contiguous")
+    if scale.shape[0] != quantized.shape[0]:
+        problems.append(
+            f"scale rows {scale.shape[0]} != activation rows {quantized.shape[0]}",
+        )
+    if scale.dim() == 2 and scale.shape[1] != groups:
+        problems.append(
+            f"scale cols {scale.shape[1]} != "
+            f"ceil({hidden_size}/{_A2E_MX_GROUP_SIZE})={groups}",
+        )
+
+    if problems:
+        raise RuntimeError(
+            "npu_dynamic_mx_quant output violates the A2E MXFP8 transport "
+            f"contract: {'; '.join(problems)}"
+            f" | activation {tuple(quantized.shape)} {quantized.dtype}"
+            f" | scale {tuple(scale.shape)} {scale.dtype}",
+        )
 
 
 def _register_camp2p_custom_ops() -> None:
