@@ -777,8 +777,16 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         custom_states.atten_batch_size = outputs[3]
         custom_states.x_active_mask = outputs[4]
         custom_states.cam_p2p_ep_name = self.hccl_comm_name1
+        received_activation = outputs[0]
         if self.quant_mode == _A2E_QUANT_MODE_MXFP8:
-            custom_states.x_scale = outputs[5]
+            # The FFN's expert-parallel dispatch carries bf16/fp16 activations
+            # only, and it runs before the MoE quantizes for its GMM. Restoring
+            # the model dtype here keeps every downstream path unchanged; the
+            # transport saving is what MXFP8 mode buys.
+            received_activation = mx_dequantize_a2e_activation(
+                received_activation,
+                outputs[5],
+            )
         # The ids slot is only written in the operator's ids mode, so the mode has
         # to match the sending rank's ``compute_gate``. It is declared here by the
         # receiving FFN rank through ``recv_input_ids`` rather than inferred from
@@ -793,7 +801,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 expected_tokens=batch_size,
             )
         return AFDA2FTransferPayload(
-            hidden_states=outputs[0],
+            hidden_states=received_activation,
             context=context,
             input_ids=received_ids,
         )
@@ -1135,6 +1143,32 @@ def _check_a2e_mx_transport_pair(
             f" | activation {tuple(quantized.shape)} {quantized.dtype}"
             f" | scale {tuple(scale.shape)} {scale.dtype}",
         )
+
+
+def mx_dequantize_a2e_activation(
+    activation: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Restore the model dtype from an A2E MXFP8 transport pair.
+
+    The FFN's expert-parallel dispatch accepts bf16/fp16 activations only and it
+    runs before the MoE quantizes for its GMM, so the pair has to be expanded
+    again rather than fed onward. Only the transport is quantized; every stage
+    after the receive keeps the layout and dtype it has in BF16 mode.
+
+    E8M0 scales are powers of two and an E4M3 value is representable in bf16, so
+    both conversions are exact and the multiply loses nothing.
+    """
+
+    hidden = int(activation.shape[-1])
+    scaling = scale.to(torch.bfloat16).repeat_interleave(
+        _A2E_MX_GROUP_SIZE,
+        dim=-1,
+    )
+    # A hidden size that is not a multiple of the group leaves a short last
+    # group, which the operator still sizes as ceil(hidden / group).
+    scaling = scaling[:, :hidden]
+    return activation.to(torch.bfloat16) * scaling
 
 
 def _register_camp2p_custom_ops() -> None:
