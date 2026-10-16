@@ -1059,6 +1059,10 @@ def mx_quantize_a2e_activation(
     trailing pair here; the FFN side re-splits it through
     ``maybe_normalize_mxfp_scale_layout`` before it reaches the GMM.
 
+    It also returns the scale as ``uint8``, while the operator checks for a
+    ``float8_e8m0fnu`` tensor and maps that to ``ACL_FLOAT8_E8M0``. E8M0 is a
+    one-byte format, so reinterpret the bits instead of converting the values.
+
     The scale algorithm is read from vLLM-Ascend rather than chosen here, so the
     Attention and FFN sides derive MX scales the same way. A mismatch would still
     transport correctly but feed the FFN a differently rounded scale.
@@ -1073,6 +1077,8 @@ def mx_quantize_a2e_activation(
         scale_alg=get_dynamic_mx_quant_scale_alg(),
     )
     scale = scale.flatten(-2)
+    if scale.dtype != torch_npu.float8_e8m0fnu:
+        scale = scale.view(torch_npu.float8_e8m0fnu)
     _check_a2e_mx_transport_pair(quantized, scale, int(hidden_states.shape[-1]))
     return quantized, scale
 
