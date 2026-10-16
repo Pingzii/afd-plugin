@@ -17,6 +17,12 @@ from afd_plugin.compat.patches.npu.moe_mxfp8_scale import (
     AFD_MXFP8_SCALE_ATTR,
     apply_afd_moe_mxfp8_scale_patch,
 )
+from afd_plugin.envs import (
+    A2E_QUANT_MODE_BF16,
+    A2E_QUANT_MODE_MXFP8,
+    AFD_NPU_CAMP2P_QUANT_MODE,
+    camp2p_quant_mode,
+)
 
 _A2E_MX_MAX_TOTAL_RANKS = 64
 
@@ -90,3 +96,28 @@ class TestA2eMxfp8ScaleResolver:
 
         assert isinstance(first, bool)
         assert second is first or (first and second)
+
+
+class TestA2eMxfp8QuantModeSelection:
+    """Deployment selects MXFP8 through the environment when the config cannot."""
+
+    def test_defaults_to_bf16_without_the_variable(self, monkeypatch):
+        monkeypatch.delenv(AFD_NPU_CAMP2P_QUANT_MODE, raising=False)
+
+        assert camp2p_quant_mode() == A2E_QUANT_MODE_BF16
+
+    def test_reads_the_configured_mode(self, monkeypatch):
+        monkeypatch.setenv(AFD_NPU_CAMP2P_QUANT_MODE, "4")
+
+        assert camp2p_quant_mode() == A2E_QUANT_MODE_MXFP8
+
+    def test_blank_value_falls_back_to_bf16(self, monkeypatch):
+        monkeypatch.setenv(AFD_NPU_CAMP2P_QUANT_MODE, "   ")
+
+        assert camp2p_quant_mode() == A2E_QUANT_MODE_BF16
+
+    def test_rejects_a_non_integer(self, monkeypatch):
+        monkeypatch.setenv(AFD_NPU_CAMP2P_QUANT_MODE, "mxfp8")
+
+        with pytest.raises(ValueError, match="must be an integer"):
+            camp2p_quant_mode()

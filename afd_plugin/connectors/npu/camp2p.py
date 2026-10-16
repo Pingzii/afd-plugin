@@ -58,6 +58,7 @@ from afd_plugin.distributed import (
     init_afd_process_group,
     topology_from_config,
 )
+from afd_plugin.envs import camp2p_quant_mode
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -160,7 +161,7 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
                 field_name="hccl_buffer_size",
             ),
             quant_mode=coerce_extra_int(
-                raw.get("quant_mode", 0),
+                raw.get("quant_mode", camp2p_quant_mode()),
                 field_name="quant_mode",
             ),
         )
