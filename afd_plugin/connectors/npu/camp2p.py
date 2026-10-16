@@ -84,6 +84,11 @@ _A2E_MX_GROUP_SIZE: Final[int] = 32
 # pair to use the same activation dtype.
 _A2E_MX_ACTIVATION_DTYPE: Final[torch.dtype] = torch.float8_e4m3fn
 
+# Scale dtype the A2E operator validates. Use the PyTorch dtype rather than
+# ``torch_npu.float8_e8m0fnu``, which is the ScalarType enum value exposed as an
+# int and therefore cannot label a tensor.
+_A2E_MX_SCALE_DTYPE: Final[torch.dtype] = torch.float8_e8m0fnu
+
 # Topology the A5 A2E MXFP8 transport contract is defined for: equal positive
 # Attention and FFN rank counts, and at most this many ranks in total.
 A2E_MX_MAX_TOTAL_RANKS: Final[int] = 64
@@ -1063,6 +1068,11 @@ def mx_quantize_a2e_activation(
     ``float8_e8m0fnu`` tensor and maps that to ``ACL_FLOAT8_E8M0``. E8M0 is a
     one-byte format, so reinterpret the bits instead of converting the values.
 
+    Use ``torch.float8_e8m0fnu``, not ``torch_npu.float8_e8m0fnu``: the latter
+    is the ``ScalarType`` enum value exposed as an ``int``, which satisfies the
+    kernels' ``*_scale_dtype`` arguments but is not a ``torch.dtype`` and cannot
+    label a tensor.
+
     The scale algorithm is read from vLLM-Ascend rather than chosen here, so the
     Attention and FFN sides derive MX scales the same way. A mismatch would still
     transport correctly but feed the FFN a differently rounded scale.
@@ -1077,8 +1087,8 @@ def mx_quantize_a2e_activation(
         scale_alg=get_dynamic_mx_quant_scale_alg(),
     )
     scale = scale.flatten(-2)
-    if scale.dtype != torch_npu.float8_e8m0fnu:
-        scale = scale.view(torch_npu.float8_e8m0fnu)
+    if scale.dtype != _A2E_MX_SCALE_DTYPE:
+        scale = scale.view(_A2E_MX_SCALE_DTYPE)
     _check_a2e_mx_transport_pair(quantized, scale, int(hidden_states.shape[-1]))
     return quantized, scale
 
@@ -1095,8 +1105,6 @@ def _check_a2e_mx_transport_pair(
     message carrying the observed shapes and dtypes.
     """
 
-    import torch_npu
-
     groups = (hidden_size + _A2E_MX_GROUP_SIZE - 1) // _A2E_MX_GROUP_SIZE
     problems: list[str] = []
 
@@ -1104,8 +1112,8 @@ def _check_a2e_mx_transport_pair(
         problems.append(
             f"activation dtype {quantized.dtype} != {_A2E_MX_ACTIVATION_DTYPE}",
         )
-    if scale.dtype != torch_npu.float8_e8m0fnu:
-        problems.append(f"scale dtype {scale.dtype} != float8_e8m0fnu")
+    if scale.dtype != _A2E_MX_SCALE_DTYPE:
+        problems.append(f"scale dtype {scale.dtype} != {_A2E_MX_SCALE_DTYPE}")
     if scale.dim() != 2:
         problems.append(f"scale dim {scale.dim()} != 2")
     if not scale.is_contiguous():
