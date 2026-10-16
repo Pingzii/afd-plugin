@@ -433,6 +433,17 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         self.hidden_size = hf_config.hidden_size
         self.num_experts_per_tok = hf_config.num_experts_per_tok
         self.num_routed_experts = hf_config.n_routed_experts
+        # One line per worker so a run's transport mode is readable rather than
+        # inferred: an inactive MXFP8 selection and a free one look identical in
+        # both accuracy and throughput.
+        logger.info(
+            "AFD NPU CAMP2P connector: role=%s quant_mode=%d aiv_num=%d "
+            "hidden_size=%d",
+            afd_config.role,
+            self.quant_mode,
+            self.aiv_num,
+            self.hidden_size,
+        )
         self.control_plane = CAMP2pAFDControlPlane(self)
 
     @property
