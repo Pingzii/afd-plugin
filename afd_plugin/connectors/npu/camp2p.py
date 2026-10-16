@@ -1156,19 +1156,20 @@ def mx_dequantize_a2e_activation(
     again rather than fed onward. Only the transport is quantized; every stage
     after the receive keeps the layout and dtype it has in BF16 mode.
 
-    E8M0 scales are powers of two and an E4M3 value is representable in bf16, so
-    both conversions are exact and the multiply loses nothing.
+    E8M0 scales hold the biased float32 exponent in one byte, so shifting that
+    byte into the exponent field reconstructs the scale exactly. CANN's Cast
+    kernel rejects E8M0 as a source dtype, which rules out ``scale.to(...)``.
+    An E4M3 value is representable in bf16, so that conversion loses nothing.
     """
 
     hidden = int(activation.shape[-1])
-    scaling = scale.to(torch.bfloat16).repeat_interleave(
-        _A2E_MX_GROUP_SIZE,
-        dim=-1,
-    )
+    exponents = scale.view(torch.uint8).to(torch.int32)
+    scaling = (exponents << 23).view(torch.float32)
+    scaling = scaling.repeat_interleave(_A2E_MX_GROUP_SIZE, dim=-1)
     # A hidden size that is not a multiple of the group leaves a short last
     # group, which the operator still sizes as ceil(hidden / group).
     scaling = scaling[:, :hidden]
-    return activation.to(torch.bfloat16) * scaling
+    return activation.to(torch.bfloat16) * scaling.to(torch.bfloat16)
 
 
 def _register_camp2p_custom_ops() -> None:
