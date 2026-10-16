@@ -1170,16 +1170,31 @@ def mx_dequantize_a2e_activation(
     byte into the exponent field reconstructs the scale exactly. CANN's Cast
     kernel rejects E8M0 as a source dtype, which rules out ``scale.to(...)``.
     An E4M3 value is representable in bf16, so that conversion loses nothing.
+
+    Broadcast the scale over a ``[tokens, groups, group_size]`` view instead of
+    materializing an expanded ``[tokens, hidden]`` scale: this runs once per
+    layer, and the expanded form costs an extra full-size write and read for
+    every layer of the model.
     """
 
+    row = int(activation.shape[0])
     hidden = int(activation.shape[-1])
+    groups = int(scale.shape[-1])
+
     exponents = scale.view(torch.uint8).to(torch.int32)
-    scaling = (exponents << 23).view(torch.float32)
-    scaling = scaling.repeat_interleave(_A2E_MX_GROUP_SIZE, dim=-1)
+    scaling = (exponents << 23).view(torch.float32).to(torch.bfloat16)
+
+    restored = activation.to(torch.bfloat16)
     # A hidden size that is not a multiple of the group leaves a short last
-    # group, which the operator still sizes as ceil(hidden / group).
-    scaling = scaling[:, :hidden]
-    return activation.to(torch.bfloat16) * scaling.to(torch.bfloat16)
+    # group, which the operator still sizes as ceil(hidden / group). Pad so the
+    # view is exact, then trim.
+    padded = groups * _A2E_MX_GROUP_SIZE
+    if padded != hidden:
+        restored = torch.nn.functional.pad(restored, (0, padded - hidden))
+
+    grouped = restored.view(row, groups, _A2E_MX_GROUP_SIZE)
+    scaled = grouped * scaling.unsqueeze(-1)
+    return scaled.reshape(row, padded)[:, :hidden]
 
 
 def _register_camp2p_custom_ops() -> None:
