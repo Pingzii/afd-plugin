@@ -71,8 +71,8 @@ def fail_if_unsupported_npu_afd_features(
         )
     if afd_config.connector == CAMP2P_CONNECTOR:
         from afd_plugin.connectors.npu.camp2p import (
-            _A2E_MX_MAX_TOTAL_RANKS,
             _A2E_QUANT_MODE_MXFP8,
+            A2E_MX_MAX_TOTAL_RANKS,
             CAMP2PExtraInfo,
         )
 
@@ -83,7 +83,7 @@ def fail_if_unsupported_npu_afd_features(
             )
         extra_info.validate_supported()
         if extra_info.quant_mode == _A2E_QUANT_MODE_MXFP8:
-            _fail_if_unsupported_a2e_mxfp8(afd_config, _A2E_MX_MAX_TOTAL_RANKS)
+            _fail_if_unsupported_a2e_mxfp8(afd_config, A2E_MX_MAX_TOTAL_RANKS)
 
     uses_ubatching = bool(vllm_config.parallel_config.use_ubatching)
     if uses_ubatching and int(vllm_config.parallel_config.num_ubatches) != 2:
