@@ -70,7 +70,17 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         same reason the framework gathers for ranks that have nothing to send.
         Ranks with no scale therefore join with a neutral dummy and discard the
         result.
+
+        That leaves one hard requirement: this hook is not entered by the same set
+        of DP ranks on every step, so a collective launched from here can never be
+        relied on to line up. Keep it inert unless the direct path is switched on,
+        which is a single process-wide decision and therefore consistent.
         """
+
+        from afd_plugin.envs import camp2p_mxfp8_direct_enabled
+
+        if not camp2p_mxfp8_direct_enabled():
+            return None
 
         import torch
         from vllm.distributed import get_dp_group
