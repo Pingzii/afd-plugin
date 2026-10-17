@@ -867,7 +867,10 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         received_activation = outputs[0]
         received_activation_fp32: torch.Tensor | None = None
         if self.quant_mode == _A2E_QUANT_MODE_MXFP8:
-            direct = not self._moe_requires_model_dtype(batch_size)
+            direct = (
+                not self._moe_requires_model_dtype(batch_size)
+                and camp2p_mxfp8_direct_enabled()
+            )
             # The routed-expert router reads the activation itself, so the model
             # dtype is needed either way; what differs is whether the experts get
             # it. The dispatch based paths carry the activation through a token
