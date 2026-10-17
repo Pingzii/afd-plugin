@@ -71,16 +71,18 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         dp_group = get_dp_group()
         if dp_group.world_size <= 1:
             return scale
+        # Stay on the byte view for both steps: HCCL has no e8m0 collective, and
+        # 127 is 2^0, which leaves the zero-padded activation rows at zero.
+        raw = scale.view(torch.uint8)
         target_rows = getattr(_EXTRA_CTX, "max_tokens_across_dp", None)
-        rows = int(scale.shape[0])
+        rows = int(raw.shape[0])
         if target_rows is not None and int(target_rows) > rows:
-            # Pad on the byte view: an e8m0 tensor has no float zero, and 127 is
-            # 2^0, which leaves the zero-padded activation rows at zero.
-            raw = scale.view(torch.uint8)
-            pad_shape = (0, 0, 0, 0, 0, int(target_rows) - rows)
-            raw = torch.nn.functional.pad(raw, pad_shape, value=127)
-            scale = raw.view(torch.float8_e8m0fnu)
-        return dp_group.all_gather(scale, dim=0)
+            raw = torch.nn.functional.pad(
+                raw,
+                (0, 0, 0, 0, 0, int(target_rows) - rows),
+                value=127,
+            )
+        return dp_group.all_gather(raw, dim=0).view(torch.float8_e8m0fnu)
 
     # Patch reason: ``AscendRoutedExperts`` assigns ``ascend_pertoken_scale`` from
     # the MoE prepare output, which is ``None`` on the DP path, so it overwrites
