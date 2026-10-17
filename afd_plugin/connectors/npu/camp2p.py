@@ -15,6 +15,7 @@ examples.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -65,6 +66,21 @@ if TYPE_CHECKING:
 
 _CAMP2P_CUSTOM_OPS_REGISTERED = False
 logger = init_logger(__name__)
+
+
+def _trace(message: str, *args: object) -> None:
+    """Write a CAMP2P diagnostic to stderr, bypassing the worker's log filtering.
+
+    The NPU worker processes suppress ``logger.info`` in this deployment, which
+    made an inert MXFP8 transport indistinguishable from a working one: neither a
+    receive that dequantized nor a MoE path that chose a dispatch method left any
+    trace, so a run could not be read from its own output.
+    """
+
+    if args:
+        message = message % args
+    print(f"AFD NPU CAMP2P {message}", file=sys.stderr, flush=True)
+
 
 # A2E transport quantization modes accepted by ``torch.ops.afd_ascend.a2e``.
 # ``BF16`` is the original five-output contract; ``MXFP8`` moves a pre-quantized
@@ -442,8 +458,8 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # One line per worker so a run's transport mode is readable rather than
         # inferred: an inactive MXFP8 selection and a free one look identical in
         # both accuracy and throughput.
-        logger.info(
-            "AFD NPU CAMP2P connector: role=%s quant_mode=%d aiv_num=%d hidden_size=%d",
+        _trace(
+            "connector: role=%s quant_mode=%d aiv_num=%d hidden_size=%d",
             afd_config.role,
             self.quant_mode,
             self.aiv_num,
@@ -710,9 +726,8 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         comm_type = select_moe_comm_method(batch_size, self.vllm_config)
         requires = comm_type is not MoECommType.ALLGATHER
         self._moe_model_dtype_by_batch[batch_size] = requires
-        logger.info(
-            "AFD NPU CAMP2P MoE path: batch=%d topk=%d comm_type=%s "
-            "requires_model_dtype=%s",
+        _trace(
+            "MoE path: batch=%d topk=%d comm_type=%s requires_model_dtype=%s",
             batch_size,
             self.num_experts_per_tok,
             comm_type,
@@ -732,8 +747,8 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         if key in self._mxfp8_receive_logged:
             return
         self._mxfp8_receive_logged.add(key)
-        logger.info(
-            "AFD NPU CAMP2P MXFP8 receive: batch=%d tokens=%s",
+        _trace(
+            "MXFP8 receive: batch=%d tokens=%s",
             batch_size,
             "consumed directly by the all-gather MoE"
             if direct
@@ -876,8 +891,8 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 )
                 if batch_size not in self._mxfp8_shape_logged:
                     self._mxfp8_shape_logged.add(batch_size)
-                    logger.info(
-                        "AFD NPU CAMP2P MXFP8 direct shapes: batch=%d topk=%d "
+                    _trace(
+                        "MXFP8 direct shapes: batch=%d topk=%d "
                         "activation=%s/%s scale_in=%s/%s scale_pinned=%s/%s",
                         batch_size,
                         self.num_experts_per_tok,
