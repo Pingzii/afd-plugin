@@ -865,6 +865,20 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                     if groups % 2 == 0
                     else outputs[5]
                 )
+                if batch_size not in self._mxfp8_shape_logged:
+                    self._mxfp8_shape_logged.add(batch_size)
+                    logger.info(
+                        "AFD NPU CAMP2P MXFP8 direct shapes: batch=%d topk=%d "
+                        "activation=%s/%s scale_in=%s/%s scale_pinned=%s/%s",
+                        batch_size,
+                        self.num_experts_per_tok,
+                        tuple(received_activation.shape),
+                        received_activation.dtype,
+                        tuple(outputs[5].shape),
+                        outputs[5].dtype,
+                        tuple(custom_states.x_scale.shape),
+                        custom_states.x_scale.dtype,
+                    )
                 received_activation_fp32 = dequantized
             else:
                 received_activation = dequantized
