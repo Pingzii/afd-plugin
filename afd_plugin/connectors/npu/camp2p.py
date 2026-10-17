@@ -421,7 +421,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # the decisions already reported, so the receive path neither re-runs
         # the selector on every layer nor logs the same pair repeatedly.
         self._moe_model_dtype_by_batch: dict[int, bool] = {}
-        self._mxfp8_receive_logged: set[int] = set()
+        self._mxfp8_receive_logged: set[tuple[int, bool]] = set()
         if self.quant_mode == _A2E_QUANT_MODE_MXFP8:
             if self.aiv_num < 3:
                 raise RuntimeError(
@@ -841,21 +841,34 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         custom_states.x_active_mask = outputs[4]
         custom_states.cam_p2p_ep_name = self.hccl_comm_name1
         received_activation = outputs[0]
+        received_activation_fp32: torch.Tensor | None = None
         if self.quant_mode == _A2E_QUANT_MODE_MXFP8:
-            # The FFN always needs the model dtype here, so the transported pair
-            # has to be expanded even where the MoE would accept a pre-quantized
-            # activation: the routed-expert router reads the activation itself
-            # (``DeepseekV4MoE.forward`` falls back to ``hidden_states`` when no
-            # ``hidden_states_fp32`` is supplied) and an E4M3 tensor carries
-            # neither the block scale nor the model's precision. Dequantizing for
-            # the router costs about as much as the quantization it would save, so
-            # passing the pair onward is only worth it where Attention owns the
-            # routing -- which the synchronous CAMP2P path does not support.
-            received_activation = mx_dequantize_a2e_activation(
-                received_activation,
-                outputs[5],
-            )
-            self._log_mxfp8_receive(batch_size)
+            direct = not self._moe_requires_model_dtype(batch_size)
+            # The routed-expert router reads the activation itself, so the model
+            # dtype is needed either way; what differs is whether the experts get
+            # it. The dispatch based paths carry the activation through a token
+            # dispatch that accepts bf16/fp16 only and quantize afterwards, so
+            # they need the restored tensor. The all-gather path lets the experts
+            # consume the transported pair as-is and pin its scale, which removes
+            # a whole quantization at the cost of this copy.
+            dequantized = mx_dequantize_a2e_activation(received_activation, outputs[5])
+            if direct:
+                # The routing op takes a pre-quantized MX scale as
+                # [rows, ceil(hidden / 64), 2] of e8m0, while the transport
+                # carries one byte per 32-wide group, i.e. ceil(hidden / 32)
+                # columns. Halve the columns so both the routing op and the GMM
+                # see the layout they declare; a 3-D scale passes through
+                # maybe_normalize_mxfp_scale_layout unchanged.
+                groups = int(outputs[5].shape[-1])
+                custom_states.x_scale = (
+                    outputs[5].view(int(outputs[5].shape[0]), groups // 2, 2)
+                    if groups % 2 == 0
+                    else outputs[5]
+                )
+                received_activation_fp32 = dequantized
+            else:
+                received_activation = dequantized
+            self._log_mxfp8_receive(batch_size, direct=direct)
         # The ids slot is only written in the operator's ids mode, so the mode has
         # to match the sending rank's ``compute_gate``. It is declared here by the
         # receiving FFN rank through ``recv_input_ids`` rather than inferred from
@@ -873,6 +886,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             hidden_states=received_activation,
             context=context,
             input_ids=received_ids,
+            hidden_states_fp32=received_activation_fp32,
         )
 
     def send_ffn_output(
