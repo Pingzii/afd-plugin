@@ -87,18 +87,27 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             return transported
         target_rows = int(target_rows)
 
+        # Derive the group layout from the layer's weights rather than from a
+        # per-forward attribute: every rank holds the same weights, while the
+        # attribute is only written on ranks that ran the FFN for this step. A
+        # rank that skipped it would otherwise contribute a different shape and
+        # HCCL would reject the collective.
+        weight = getattr(layer, "w13_weight", None)
+        if weight is None:
+            raise RuntimeError(
+                "A2E MXFP8 direct path needs the routed-experts weight to size "
+                "the MX scale collective",
+            )
+        hidden = int(weight.shape[-1])
+        columns = -(-hidden // 64)
+
         if transported is None:
-            scale_columns = getattr(layer, AFD_MXFP8_SCALE_COLUMNS_ATTR, None)
-            if scale_columns is None:
-                return None
-            device = getattr(layer, "w13_weight", None)
-            device = device.device if device is not None else "npu"
             # 127 is 2^0, matching the neutral padding the transport uses.
             dummy = torch.full(
-                (target_rows, int(scale_columns) // 2, 2),
+                (target_rows, columns, 2),
                 127,
                 dtype=torch.uint8,
-                device=device,
+                device=weight.device,
             )
             dp_group.all_gather(dummy, dim=0)
             return None
