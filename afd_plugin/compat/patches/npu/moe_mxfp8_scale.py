@@ -54,13 +54,42 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
 
     original = fused_experts.build_fused_experts_input
 
+    def _expand_scale_to_dp_rows(scale: Any) -> Any:
+        """Apply the transformation ``_prepare_with_dp_group`` applies to x.
+
+        That helper pads the activation to ``max_tokens_across_dp`` and then
+        all-gathers it across the DP group, so the routing op sees
+        ``dp_size * max_tokens_across_dp`` rows. A transport scale covers only the
+        rows this rank received, so it has to follow the same pad-then-gather
+        path or its first dimension will not match the activation's.
+        """
+
+        import torch
+        from vllm.distributed import get_dp_group
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        dp_group = get_dp_group()
+        if dp_group.world_size <= 1:
+            return scale
+        target_rows = getattr(_EXTRA_CTX, "max_tokens_across_dp", None)
+        rows = int(scale.shape[0])
+        if target_rows is not None and int(target_rows) > rows:
+            # Pad on the byte view: an e8m0 tensor has no float zero, and 127 is
+            # 2^0, which leaves the zero-padded activation rows at zero.
+            raw = scale.view(torch.uint8)
+            pad_shape = (0, 0, 0, 0, 0, int(target_rows) - rows)
+            raw = torch.nn.functional.pad(raw, pad_shape, value=127)
+            scale = raw.view(torch.float8_e8m0fnu)
+        return dp_group.all_gather(scale, dim=0)
+
     # Patch reason: ``AscendRoutedExperts`` assigns ``ascend_pertoken_scale`` from
     # the MoE prepare output, which is ``None`` on the DP path, so it overwrites
     # the scale the A2E MXFP8 transport pinned on the layer. The MoE would then
     # quantize an already-quantized activation a second time and drop the
     # delivered scale.
     # Patch functionality: substitute the AFD-owned scale when the layer carries
-    # one, and otherwise keep the caller's argument unchanged.
+    # one, expanded to the same DP row layout as the activation, and otherwise
+    # keep the caller's argument unchanged.
     # Signature: matches upstream; no added parameters.
     def build_fused_experts_input(*args: Any, **kwargs: Any) -> Any:
         layer = kwargs.get("layer")
@@ -68,7 +97,7 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         if layer is not None:
             transported_scale = getattr(layer, AFD_MXFP8_SCALE_ATTR, None)
             if transported_scale is not None:
-                kwargs["pertoken_scale"] = transported_scale
+                kwargs["pertoken_scale"] = _expand_scale_to_dp_rows(transported_scale)
         # ### PATCH END: prefer the A2E MXFP8 transport scale
         return original(*args, **kwargs)
 
