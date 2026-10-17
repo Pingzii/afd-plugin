@@ -431,6 +431,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         dynamic_scales_shared: torch.Tensor | None = None,
         topk_scales: torch.Tensor | None = None,
         group_list_type: int = 1,
+        hidden_states_fp32: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | AFDF2ATransferPayload:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
@@ -470,7 +471,11 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 AFD_MXFP8_SCALE_ATTR,
                 dynamic_scales,
             )
-        return self.mlp(hidden_states, input_ids=get_forward_context().input_ids)
+        return self.mlp(
+            hidden_states,
+            input_ids=get_forward_context().input_ids,
+            hidden_states_fp32=hidden_states_fp32,
+        )
 
 
 @native.support_torch_compile
