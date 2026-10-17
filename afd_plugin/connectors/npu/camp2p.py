@@ -417,6 +417,11 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         extra_info = cast(CAMP2PExtraInfo, self.extra_info)
         self.aiv_num = extra_info.aiv_num_for_role(afd_config.role)
         self.quant_mode = extra_info.quant_mode
+        # Memoizes vLLM-Ascend's MoE communication choice per token count, and
+        # the decisions already reported, so the receive path neither re-runs
+        # the selector on every layer nor logs the same pair repeatedly.
+        self._moe_model_dtype_by_batch: dict[int, bool] = {}
+        self._mxfp8_receive_logged: set[int] = set()
         if self.quant_mode == _A2E_QUANT_MODE_MXFP8:
             if self.aiv_num < 3:
                 raise RuntimeError(
@@ -678,6 +683,54 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             transfer_state.aiv_num,
         )
 
+    def _moe_requires_model_dtype(self, batch_size: int) -> bool:
+        """Whether this forward carries the activation through a token dispatch.
+
+        Only the all-gather MoE path lets the transported MXFP8 pair reach the
+        GMM; the dispatch based paths move bf16/fp16 activations and quantize
+        afterwards, so they need the model dtype restored first.
+
+        Ask vLLM-Ascend's own selector rather than restating its rule here: the
+        choice depends on the hardware profile, the EP world size and the token
+        count, and a local copy would drift silently on an upgrade. One of the
+        two failure directions reports itself at once (a dispatch given float8);
+        the other only wastes a dequantization, which is why the answer is also
+        logged.
+        """
+
+        cached = self._moe_model_dtype_by_batch.get(batch_size)
+        if cached is not None:
+            return cached
+        from vllm_ascend.ascend_forward_context import (
+            MoECommType,
+            select_moe_comm_method,
+        )
+
+        comm_type = select_moe_comm_method(batch_size, self.vllm_config)
+        requires = comm_type is not MoECommType.ALLGATHER
+        self._moe_model_dtype_by_batch[batch_size] = requires
+        return requires
+
+    def _log_mxfp8_receive(self, batch_size: int, direct: bool) -> None:
+        """Report each distinct batch/decision pair once, so a run is readable.
+
+        Without it the two outcomes differ only by whether a dequantization
+        happened, which is invisible in the logs and would leave an ineffective
+        direct path indistinguishable from a working one.
+        """
+
+        key = (batch_size, direct)
+        if key in self._mxfp8_receive_logged:
+            return
+        self._mxfp8_receive_logged.add(key)
+        logger.info(
+            "AFD NPU CAMP2P MXFP8 receive: batch=%d tokens=%s",
+            batch_size,
+            "consumed directly by the all-gather MoE"
+            if direct
+            else "dequantized for the token dispatch",
+        )
+
     def recv_attn_output(
         self, ubatch_idx: int = 0, **kwargs: Any
     ) -> AFDA2FTransferPayload:
@@ -789,14 +842,20 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         custom_states.cam_p2p_ep_name = self.hccl_comm_name1
         received_activation = outputs[0]
         if self.quant_mode == _A2E_QUANT_MODE_MXFP8:
-            # The FFN's expert-parallel dispatch carries bf16/fp16 activations
-            # only, and it runs before the MoE quantizes for its GMM. Restoring
-            # the model dtype here keeps every downstream path unchanged; the
-            # transport saving is what MXFP8 mode buys.
+            # The FFN always needs the model dtype here, so the transported pair
+            # has to be expanded even where the MoE would accept a pre-quantized
+            # activation: the routed-expert router reads the activation itself
+            # (``DeepseekV4MoE.forward`` falls back to ``hidden_states`` when no
+            # ``hidden_states_fp32`` is supplied) and an E4M3 tensor carries
+            # neither the block scale nor the model's precision. Dequantizing for
+            # the router costs about as much as the quantization it would save, so
+            # passing the pair onward is only worth it where Attention owns the
+            # routing -- which the synchronous CAMP2P path does not support.
             received_activation = mx_dequantize_a2e_activation(
                 received_activation,
                 outputs[5],
             )
+            self._log_mxfp8_receive(batch_size)
         # The ids slot is only written in the operator's ids mode, so the mode has
         # to match the sending rank's ``compute_gate``. It is declared here by the
         # receiving FFN rank through ``recv_input_ids`` rather than inferred from
