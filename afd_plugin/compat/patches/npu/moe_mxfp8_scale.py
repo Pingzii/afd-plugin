@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 AFD_MXFP8_SCALE_ATTR = "afd_mxfp8_scale"
+AFD_MXFP8_SCALE_COLUMNS_ATTR = "afd_mxfp8_scale_columns"
 AFD_MXFP8_SHARED_INPUT_ATTR = "afd_mxfp8_shared_input"
 _MXFP8_SCALE_PATCH_ATTR = "_afd_plugin_moe_mxfp8_scale_patch_state"
 
@@ -54,7 +55,7 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
 
     original = fused_experts.build_fused_experts_input
 
-    def _expand_scale_to_dp_rows(scale: Any) -> Any:
+    def _expand_scale_to_dp_rows(layer: Any) -> Any:
         """Apply the transformation ``_prepare_with_dp_group`` applies to x.
 
         That helper pads the activation to ``max_tokens_across_dp`` and then
@@ -62,24 +63,54 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         ``dp_size * max_tokens_across_dp`` rows. A transport scale covers only the
         rows this rank received, so it has to follow the same pad-then-gather
         path or its first dimension will not match the activation's.
+
+        Every DP rank must enter the collective. A rank without tokens still runs
+        this layer on padding, so gating the gather on whichever ranks happen to
+        hold a transported scale would leave the others waiting forever -- the
+        same reason the framework gathers for ranks that have nothing to send.
+        Ranks with no scale therefore join with a neutral dummy and discard the
+        result.
         """
 
         import torch
         from vllm.distributed import get_dp_group
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
+        transported = getattr(layer, AFD_MXFP8_SCALE_ATTR, None)
         dp_group = get_dp_group()
         if dp_group.world_size <= 1:
-            return scale
+            return transported
+        target_rows = getattr(_EXTRA_CTX, "max_tokens_across_dp", None)
+        if target_rows is None:
+            # Without a shared row count the ranks cannot agree on the collective
+            # shape; stay local rather than risk a deadlock.
+            return transported
+        target_rows = int(target_rows)
+
+        if transported is None:
+            scale_columns = getattr(layer, AFD_MXFP8_SCALE_COLUMNS_ATTR, None)
+            if scale_columns is None:
+                return None
+            device = getattr(layer, "w13_weight", None)
+            device = device.device if device is not None else "npu"
+            # 127 is 2^0, matching the neutral padding the transport uses.
+            dummy = torch.full(
+                (target_rows, int(scale_columns) // 2, 2),
+                127,
+                dtype=torch.uint8,
+                device=device,
+            )
+            dp_group.all_gather(dummy, dim=0)
+            return None
+
         # Stay on the byte view for both steps: HCCL has no e8m0 collective, and
         # 127 is 2^0, which leaves the zero-padded activation rows at zero.
-        raw = scale.view(torch.uint8)
-        target_rows = getattr(_EXTRA_CTX, "max_tokens_across_dp", None)
+        raw = transported.view(torch.uint8)
         rows = int(raw.shape[0])
-        if target_rows is not None and int(target_rows) > rows:
+        if target_rows > rows:
             raw = torch.nn.functional.pad(
                 raw,
-                (0, 0, 0, 0, 0, int(target_rows) - rows),
+                (0, 0, 0, 0, 0, target_rows - rows),
                 value=127,
             )
         return dp_group.all_gather(raw, dim=0).view(torch.float8_e8m0fnu)
@@ -91,15 +122,16 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
     # delivered scale.
     # Patch functionality: substitute the AFD-owned scale when the layer carries
     # one, expanded to the same DP row layout as the activation, and otherwise
-    # keep the caller's argument unchanged.
+    # keep the caller's argument unchanged. The expansion runs on every rank so
+    # the collective stays symmetric.
     # Signature: matches upstream; no added parameters.
     def build_fused_experts_input(*args: Any, **kwargs: Any) -> Any:
         layer = kwargs.get("layer")
         # ### PATCH START: prefer the A2E MXFP8 transport scale
         if layer is not None:
-            transported_scale = getattr(layer, AFD_MXFP8_SCALE_ATTR, None)
-            if transported_scale is not None:
-                kwargs["pertoken_scale"] = _expand_scale_to_dp_rows(transported_scale)
+            expanded = _expand_scale_to_dp_rows(layer)
+            if expanded is not None:
+                kwargs["pertoken_scale"] = expanded
         # ### PATCH END: prefer the A2E MXFP8 transport scale
         return original(*args, **kwargs)
 
