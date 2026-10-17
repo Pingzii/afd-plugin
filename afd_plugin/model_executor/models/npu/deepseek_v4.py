@@ -24,7 +24,10 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 
-from afd_plugin.compat.patches.npu.moe_mxfp8_scale import AFD_MXFP8_SCALE_ATTR
+from afd_plugin.compat.patches.npu.moe_mxfp8_scale import (
+    AFD_MXFP8_SCALE_ATTR,
+    AFD_MXFP8_SHARED_INPUT_ATTR,
+)
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
@@ -465,12 +468,22 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # paired MX scale on the routed-experts layer under AFD's own attribute:
         # the MoE overwrites ``ascend_pertoken_scale`` from its prepare output, so
         # the vLLM-Ascend side resolves this name instead.
-        if dynamic_scales is not None:
-            setattr(
-                self.mlp.experts,
-                AFD_MXFP8_SCALE_ATTR,
-                dynamic_scales,
-            )
+        #
+        # The scale goes on ``experts.routed_experts`` because that is the layer
+        # the quantization scheme receives, while the model-dtype copy goes on the
+        # runner itself, which is what hands ``shared_experts_input`` down: the
+        # shared experts quantize their input unconditionally and would reject the
+        # transported activation.
+        setattr(
+            self.mlp.experts.routed_experts,
+            AFD_MXFP8_SCALE_ATTR,
+            dynamic_scales,
+        )
+        setattr(
+            self.mlp.experts,
+            AFD_MXFP8_SHARED_INPUT_ATTR,
+            hidden_states_fp32,
+        )
         return self.mlp(
             hidden_states,
             input_ids=get_forward_context().input_ids,

@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 AFD_MXFP8_SCALE_ATTR = "afd_mxfp8_scale"
+AFD_MXFP8_SHARED_INPUT_ATTR = "afd_mxfp8_shared_input"
 _MXFP8_SCALE_PATCH_ATTR = "_afd_plugin_moe_mxfp8_scale_patch_state"
 
 # Every module that binds ``build_fused_experts_input`` by name at import time.
@@ -88,10 +89,54 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
 
     fused_experts.build_fused_experts_input = build_fused_experts_input
     setattr(fused_experts, _MXFP8_SCALE_PATCH_ATTR, original)
+
+    try:
+        from vllm_ascend.ops.fused_moe import fused_moe
+    except ImportError:
+        return True
+
+    runner = getattr(fused_moe, "AscendMoERunner", None)
+    if runner is None or hasattr(runner, _MXFP8_SCALE_PATCH_ATTR):
+        return True
+
+    original_forward = runner.forward
+
+    # Patch reason: the shared experts quantize their input unconditionally, so
+    # they reject an already-quantized activation. ``AscendMoERunner.forward``
+    # already accepts ``shared_experts_input`` and routes it to them
+    # (``shared_hidden_states = shared_experts_input or hidden_states``), but no
+    # caller supplies it on the AFD path.
+    # Patch functionality: fall back to the AFD-pinned model-dtype copy, which
+    # the transport receiver already produces for the router.
+    # Signature: matches upstream; no added parameters.
+    def forward(
+        self: Any,
+        hidden_states: Any,
+        router_logits: Any,
+        input_ids: Any = None,
+        shared_experts_input: Any = None,
+    ) -> Any:
+        # ### PATCH START: give the shared experts the model-dtype copy
+        if shared_experts_input is None:
+            transported_input = getattr(self, AFD_MXFP8_SHARED_INPUT_ATTR, None)
+            if transported_input is not None:
+                shared_experts_input = transported_input
+        # ### PATCH END: give the shared experts the model-dtype copy
+        return original_forward(
+            self,
+            hidden_states,
+            router_logits,
+            input_ids,
+            shared_experts_input,
+        )
+
+    runner.forward = forward
+    setattr(runner, _MXFP8_SCALE_PATCH_ATTR, original_forward)
     return True
 
 
 __all__ = [
     "AFD_MXFP8_SCALE_ATTR",
+    "AFD_MXFP8_SHARED_INPUT_ATTR",
     "apply_afd_moe_mxfp8_scale_patch",
 ]
