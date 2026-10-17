@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 AFD_MXFP8_SCALE_ATTR = "afd_mxfp8_scale"
-AFD_MXFP8_SCALE_COLUMNS_ATTR = "afd_mxfp8_scale_columns"
+AFD_MXFP8_SCALE_EXPANDED_ATTR = "afd_mxfp8_scale_expanded"
 AFD_MXFP8_SHARED_INPUT_ATTR = "afd_mxfp8_shared_input"
 _MXFP8_SCALE_PATCH_ATTR = "_afd_plugin_moe_mxfp8_scale_patch_state"
 
@@ -55,26 +55,24 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
 
     original = fused_experts.build_fused_experts_input
 
-    def _expand_scale_to_dp_rows(layer: Any) -> Any:
-        """Apply the transformation ``_prepare_with_dp_group`` applies to x.
+    def _expand_scale_for_layer(layer: Any) -> Any:
+        """Gather the transported scale onto the DP row layout the routing op sees.
 
-        That helper pads the activation to ``max_tokens_across_dp`` and then
-        all-gathers it across the DP group, so the routing op sees
-        ``dp_size * max_tokens_across_dp`` rows. A transport scale covers only the
-        rows this rank received, so it has to follow the same pad-then-gather
-        path or its first dimension will not match the activation's.
+        ``_prepare_with_dp_group`` pads the activation to ``max_tokens_across_dp``
+        and all-gathers it, so the routing op sees ``dp_size * max_tokens_across_dp``
+        rows. A transport scale covers only the rows this rank received, so it has
+        to follow the same pad-then-gather path or its first dimension will not
+        match the activation's.
 
-        Every DP rank must enter the collective. A rank without tokens still runs
-        this layer on padding, so gating the gather on whichever ranks happen to
-        hold a transported scale would leave the others waiting forever -- the
-        same reason the framework gathers for ranks that have nothing to send.
-        Ranks with no scale therefore join with a neutral dummy and discard the
-        result.
+        This runs from ``forward_impl`` -- entered once per layer by every rank that
+        reaches the MoE, which is what makes the collective symmetric -- and never
+        from ``build_fused_experts_input``, whose caller set varies between steps.
+        A collective launched there never lines up and HCCL rejects it with
+        "execute kernel param invalid". Ranks holding no scale still join with a
+        neutral dummy and discard the result.
 
-        That leaves one hard requirement: this hook is not entered by the same set
-        of DP ranks on every step, so a collective launched from here can never be
-        relied on to line up. Keep it inert unless the direct path is switched on,
-        which is a single process-wide decision and therefore consistent.
+        Returns ``None`` when the expansion cannot be done, so the caller keeps the
+        upstream behavior instead of guessing.
         """
 
         from afd_plugin.envs import camp2p_mxfp8_direct_enabled
@@ -92,24 +90,15 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             return transported
         target_rows = getattr(_EXTRA_CTX, "max_tokens_across_dp", None)
         if target_rows is None:
-            # Without a shared row count the ranks cannot agree on the collective
-            # shape; stay local rather than risk a deadlock.
-            return transported
+            return None
         target_rows = int(target_rows)
 
-        # Derive the group layout from the layer's weights rather than from a
-        # per-forward attribute: every rank holds the same weights, while the
-        # attribute is only written on ranks that ran the FFN for this step. A
-        # rank that skipped it would otherwise contribute a different shape and
-        # HCCL would reject the collective.
+        # Take the group layout from the layer weights: every rank holds them,
+        # so the contributed shape cannot depend on per-rank forward state.
         weight = getattr(layer, "w13_weight", None)
         if weight is None:
-            raise RuntimeError(
-                "A2E MXFP8 direct path needs the routed-experts weight to size "
-                "the MX scale collective",
-            )
-        hidden = int(weight.shape[-1])
-        columns = -(-hidden // 64)
+            return None
+        columns = -(-int(weight.shape[-1]) // 64)
 
         if transported is None:
             # 127 is 2^0, matching the neutral padding the transport uses.
@@ -148,7 +137,7 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         layer = kwargs.get("layer")
         # ### PATCH START: prefer the A2E MXFP8 transport scale
         if layer is not None:
-            expanded = _expand_scale_to_dp_rows(layer)
+            expanded = getattr(layer, AFD_MXFP8_SCALE_EXPANDED_ATTR, None)
             if expanded is not None:
                 kwargs["pertoken_scale"] = expanded
         # ### PATCH END: prefer the A2E MXFP8 transport scale
@@ -189,7 +178,12 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
     # (``shared_hidden_states = shared_experts_input or hidden_states``), but no
     # caller supplies it on the AFD path.
     # Patch functionality: fall back to the AFD-pinned model-dtype copy, which
-    # the transport receiver already produces for the router.
+    # the transport receiver already produces for the router. It also expands the
+    # transported MX scale here, because this is the MoE layer entry that every
+    # rank reaches once per layer: the expansion pads and all-gathers, so it can
+    # only live where the participation set matches the activation's DP gather.
+    # Delegation over copying is deliberate -- the upstream body is the MoE layer
+    # pipeline and only the two marked blocks differ.
     # Signature: matches upstream; no added parameters.
     def forward(
         self: Any,
@@ -204,6 +198,15 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             if transported_input is not None:
                 shared_experts_input = transported_input
         # ### PATCH END: give the shared experts the model-dtype copy
+        # ### PATCH START: expand the transported MX scale for the DP row layout
+        routed_experts = getattr(self, "routed_experts", None)
+        if routed_experts is not None:
+            setattr(
+                routed_experts,
+                AFD_MXFP8_SCALE_EXPANDED_ATTR,
+                _expand_scale_for_layer(routed_experts),
+            )
+        # ### PATCH END: expand the transported MX scale for the DP row layout
         return original_forward(
             self,
             hidden_states,

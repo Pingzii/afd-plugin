@@ -26,7 +26,6 @@ from vllm.sequence import IntermediateTensors
 
 from afd_plugin.compat.patches.npu.moe_mxfp8_scale import (
     AFD_MXFP8_SCALE_ATTR,
-    AFD_MXFP8_SCALE_COLUMNS_ATTR,
     AFD_MXFP8_SHARED_INPUT_ATTR,
 )
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
@@ -479,14 +478,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             self.mlp.experts.routed_experts,
             AFD_MXFP8_SCALE_ATTR,
             dynamic_scales,
-        )
-        # The scale's column count lets a rank without a transported scale build
-        # a matching dummy for the DP expansion, which has to be entered by every
-        # rank or the collective deadlocks.
-        setattr(
-            self.mlp.experts.routed_experts,
-            AFD_MXFP8_SCALE_COLUMNS_ATTR,
-            -(-self.config.hidden_size // 64) * 2,
         )
         setattr(
             self.mlp.experts,
