@@ -710,6 +710,14 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         comm_type = select_moe_comm_method(batch_size, self.vllm_config)
         requires = comm_type is not MoECommType.ALLGATHER
         self._moe_model_dtype_by_batch[batch_size] = requires
+        logger.info(
+            "AFD NPU CAMP2P MoE path: batch=%d topk=%d comm_type=%s "
+            "requires_model_dtype=%s",
+            batch_size,
+            self.num_experts_per_tok,
+            comm_type,
+            requires,
+        )
         return requires
 
     def _log_mxfp8_receive(self, batch_size: int, direct: bool) -> None:
