@@ -274,19 +274,12 @@ class AFDA2FTransferPayload:
         router_logits: Optional Attention-side routing tensor.
         input_ids: Optional token-aligned identifiers required by the remote
             FFN implementation.
-        hidden_states_fp32: Optional model-dtype copy of ``hidden_states``.
-
-    ``hidden_states_fp32`` lets a transport deliver a quantized activation that
-    the experts consume as-is while the router still sees the model dtype: the
-    remote MoE takes its routing decision from this copy and the matmuls from
-    ``hidden_states``.
     """
 
     hidden_states: torch.Tensor
     context: AFDTransferContext
     router_logits: torch.Tensor | None = None
     input_ids: torch.Tensor | None = None
-    hidden_states_fp32: torch.Tensor | None = None
 
 
 @dataclass(slots=True)

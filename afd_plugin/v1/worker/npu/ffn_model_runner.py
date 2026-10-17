@@ -356,7 +356,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
                         dynamic_scales=states.x_scale,
-                        hidden_states_fp32=payload.hidden_states_fp32,
                     )
                     _send_ffn_output(
                         self.connector,
