@@ -422,6 +422,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # the selector on every layer nor logs the same pair repeatedly.
         self._moe_model_dtype_by_batch: dict[int, bool] = {}
         self._mxfp8_receive_logged: set[tuple[int, bool]] = set()
+        self._mxfp8_shape_logged: set[int] = set()
         if self.quant_mode == _A2E_QUANT_MODE_MXFP8:
             if self.aiv_num < 3:
                 raise RuntimeError(
