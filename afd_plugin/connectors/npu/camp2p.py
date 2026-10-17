@@ -59,7 +59,7 @@ from afd_plugin.distributed import (
     init_afd_process_group,
     topology_from_config,
 )
-from afd_plugin.envs import camp2p_quant_mode
+from afd_plugin.envs import camp2p_mxfp8_direct_enabled, camp2p_quant_mode
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
