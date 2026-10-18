@@ -186,6 +186,8 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
                 f" x={probe[0]}/{hidden_states.dtype}"
                 f" rl={probe[2]}/{router_logits.dtype}"
                 f" rl_contig={router_logits.is_contiguous()}"
+                f" rl_finite={bool(torch.isfinite(router_logits).all())}"
+                f" rl_absmax={float(router_logits.abs().max())}"
                 f" ids_numel={probe[5]}"
                 f" ids_range={ids_range}",
                 flush=True,
