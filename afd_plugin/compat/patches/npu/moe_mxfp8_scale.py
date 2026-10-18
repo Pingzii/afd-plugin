@@ -126,17 +126,35 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         # ### PATCH START: stage the transported MX scale for the prepare stage
         routed_experts = getattr(self, "routed_experts", None)
         moe_config = getattr(self, "moe_config", None)
+        # The pin may land on the runner or on the routed-experts layer,
+        # depending on which object the model holds; check both.
+        staged = getattr(self, AFD_MXFP8_SCALE_ATTR, None)
+        if staged is None and routed_experts is not None:
+            staged = getattr(routed_experts, AFD_MXFP8_SCALE_ATTR, None)
+        # ``get_moe_comm_method`` caches one method object per (comm type, config)
+        # key, and that object -- not this runner -- owns the prepare/finalize
+        # instance whose ``_prepare_with_dp_group`` runs. Staging on the runner's
+        # config alone leaves the reader looking at a different config object.
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        moe_comm_method = getattr(_EXTRA_CTX, "moe_comm_method", None)
+        staged_targets = []
+        if moe_comm_method is not None:
+            prepare_finalize = getattr(moe_comm_method, "prepare_finalize", None)
+            if prepare_finalize is not None:
+                staged_targets.append(prepare_finalize)
+            cached_config = getattr(moe_comm_method, "moe_config", None)
+            if cached_config is not None:
+                staged_targets.append(cached_config)
         if moe_config is not None:
-            # The pin may land on the runner or on the routed-experts layer,
-            # depending on which object the model holds; check both.
-            staged = getattr(self, AFD_MXFP8_SCALE_ATTR, None)
-            if staged is None and routed_experts is not None:
-                staged = getattr(routed_experts, AFD_MXFP8_SCALE_ATTR, None)
-            setattr(moe_config, AFD_MXFP8_SCALE_ATTR, staged)
+            staged_targets.append(moe_config)
+        for target in staged_targets:
+            setattr(target, AFD_MXFP8_SCALE_ATTR, staged)
+        if moe_comm_method is not None:
             print(
                 "[AFD MXFP8 stage]"
-                f" self_id={id(self)}"
-                f" routed_id={id(routed_experts) if routed_experts is not None else None}"
+                f" method={moe_comm_method is not None}"
+                f" targets={len(staged_targets)}"
                 f" staged={staged is not None}",
                 flush=True,
             )
@@ -199,7 +217,9 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             from vllm.distributed import get_dp_group
 
             dp_group = get_dp_group()
-        transported = getattr(self.moe_config, AFD_MXFP8_SCALE_ATTR, None)
+        transported = getattr(self, AFD_MXFP8_SCALE_ATTR, None)
+        if transported is None:
+            transported = getattr(self.moe_config, AFD_MXFP8_SCALE_ATTR, None)
         padded_scale = None
         if (
             camp2p_mxfp8_direct_enabled()
