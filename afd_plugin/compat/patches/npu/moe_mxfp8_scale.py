@@ -127,12 +127,18 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         routed_experts = getattr(self, "routed_experts", None)
         moe_config = getattr(self, "moe_config", None)
         if moe_config is not None:
-            setattr(
-                moe_config,
-                AFD_MXFP8_SCALE_ATTR,
+            staged = (
                 getattr(routed_experts, AFD_MXFP8_SCALE_ATTR, None)
                 if routed_experts is not None
-                else None,
+                else None
+            )
+            setattr(moe_config, AFD_MXFP8_SCALE_ATTR, staged)
+            print(
+                "[AFD MXFP8 stage]"
+                f" routed={routed_experts is not None}"
+                f" layer_id={id(routed_experts) if routed_experts is not None else None}"
+                f" staged={staged is not None}",
+                flush=True,
             )
         # ### PATCH END: stage the transported MX scale for the prepare stage
         return original_forward(

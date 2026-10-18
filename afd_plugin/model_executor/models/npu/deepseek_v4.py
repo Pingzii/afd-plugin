@@ -479,6 +479,14 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             AFD_MXFP8_SCALE_ATTR,
             dynamic_scales,
         )
+        print(
+            "[AFD MXFP8 pin]"
+            f" dynamic_scales={dynamic_scales is not None}"
+            f" shape={tuple(dynamic_scales.shape) if dynamic_scales is not None else None}"
+            f" layer_id={id(self.mlp.experts.routed_experts)}"
+            f" layer_attr={getattr(self.mlp.experts.routed_experts, AFD_MXFP8_SCALE_ATTR, None) is not None}",
+            flush=True,
+        )
         setattr(
             self.mlp.experts,
             AFD_MXFP8_SHARED_INPUT_ATTR,
