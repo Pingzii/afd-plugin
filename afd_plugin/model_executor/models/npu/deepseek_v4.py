@@ -491,14 +491,14 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # and let them skip both the model-dtype copy and their own re-quantization.
         # The routed path needs ``[rows, hidden/64, 2]``; the shared MLP takes the
         # flat ``[rows, hidden/32]`` byte layout, which is the same bytes.
-        if dynamic_scales is not None:
+        if dynamic_scales is not None and runner.ascend_shared_experts is not None:
             shared_scale = dynamic_scales.view(torch.uint8).flatten(-2)
             setattr(
                 runner.ascend_shared_experts,
                 AFD_MXFP8_SHARED_PAIR_ATTR,
                 (hidden_states, shared_scale.view(torch.float8_e8m0fnu)),
             )
-        else:
+        elif runner.ascend_shared_experts is not None:
             setattr(runner.ascend_shared_experts, AFD_MXFP8_SHARED_PAIR_ATTR, None)
         return self.mlp(
             hidden_states,
