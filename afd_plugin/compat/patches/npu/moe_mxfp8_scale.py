@@ -141,10 +141,20 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
         staged_targets = []
-        moe_comm_type = getattr(_EXTRA_CTX, "moe_comm_type", None)
-        moe_comm_method = None
-        if moe_comm_type is not None and moe_config is not None:
-            moe_comm_method = get_moe_comm_method(moe_comm_type, moe_config)
+        moe_comm_method = getattr(_EXTRA_CTX, "moe_comm_method", None)
+        if moe_comm_method is None:
+            # ``forward_impl`` is what sets that field, so the very first layer of
+            # the very first step has to resolve the cached method itself. The
+            # released signature differs from the checkout (config argument
+            # optional), so accept both without guessing.
+            from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
+
+            moe_comm_type = getattr(_EXTRA_CTX, "moe_comm_type", None)
+            if moe_comm_type is not None:
+                try:
+                    moe_comm_method = get_moe_comm_method(moe_comm_type)
+                except TypeError:
+                    moe_comm_method = None
         if moe_comm_method is not None:
             prepare_finalize = getattr(moe_comm_method, "prepare_finalize", None)
             if prepare_finalize is not None:
@@ -158,7 +168,6 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             setattr(target, AFD_MXFP8_SCALE_ATTR, staged)
         print(
             "[AFD MXFP8 stage]"
-            f" comm_type={moe_comm_type}"
             f" method={moe_comm_method is not None}"
             f" targets={len(staged_targets)}"
             f" staged={staged is not None}",
