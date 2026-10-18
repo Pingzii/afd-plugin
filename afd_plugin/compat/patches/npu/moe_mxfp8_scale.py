@@ -36,6 +36,7 @@ from typing import Any
 
 AFD_MXFP8_SCALE_ATTR = "afd_mxfp8_scale"
 AFD_MXFP8_SHARED_INPUT_ATTR = "afd_mxfp8_shared_input"
+AFD_MXFP8_SHARED_PAIR_ATTR = "afd_mxfp8_shared_pair"
 _MXFP8_SCALE_PATCH_ATTR = "_afd_plugin_moe_mxfp8_scale_patch_state"
 _MXFP8_NEUTRAL_SCALE_ATTR = "_afd_plugin_moe_mxfp8_neutral_scale"
 _MXFP8_PAD_BUFFER_ATTR = "_afd_plugin_moe_mxfp8_pad_buffer"
@@ -328,11 +329,43 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
 
     all_gather_prepare._prepare_with_dp_group = _prepare_with_dp_group
     setattr(all_gather_prepare, _MXFP8_SCALE_PATCH_ATTR, original_prepare_with_dp_group)
+
+    try:
+        from vllm_ascend.ops.fused_moe import shared_experts as shared_module
+    except ImportError:
+        return True
+
+    shared_cls = getattr(shared_module, "AscendSharedExperts", None)
+    if shared_cls is None or hasattr(shared_cls, _MXFP8_SCALE_PATCH_ATTR):
+        return True
+
+    original_prepare_gate_up = shared_cls._prepare_gate_up_input
+
+    # Patch reason: the shared experts quantize whatever input they receive, so on
+    # the AFD path they need a model-dtype copy of the activation to work from --
+    # a full [tokens, hidden] read plus a full write per layer that the routed
+    # path does not need. The transport already carries the quantized activation
+    # and its MX scale, and ``gate_up_proj`` accepts that pair as-is.
+    # Patch functionality: hand the transported pair to the gate-up projection when
+    # the layer carries one, skipping both the model-dtype copy's re-quantization
+    # and the copy itself. Every other case keeps the upstream behavior.
+    # Signature: matches upstream; no added parameters.
+    def _prepare_gate_up_input(self: Any, hidden_states: Any) -> Any:
+        # ### PATCH START: reuse the transported MXFP8 activation pair
+        transported = getattr(self, AFD_MXFP8_SHARED_PAIR_ATTR, None)
+        if transported is not None:
+            return transported
+        # ### PATCH END: reuse the transported MXFP8 activation pair
+        return original_prepare_gate_up(self, hidden_states)
+
+    shared_cls._prepare_gate_up_input = _prepare_gate_up_input
+    setattr(shared_cls, _MXFP8_SCALE_PATCH_ATTR, original_prepare_gate_up)
     return True
 
 
 __all__ = [
     "AFD_MXFP8_SCALE_ATTR",
     "AFD_MXFP8_SHARED_INPUT_ATTR",
+    "AFD_MXFP8_SHARED_PAIR_ATTR",
     "apply_afd_moe_mxfp8_scale_patch",
 ]

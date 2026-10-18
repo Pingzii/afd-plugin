@@ -27,6 +27,7 @@ from vllm.sequence import IntermediateTensors
 from afd_plugin.compat.patches.npu.moe_mxfp8_scale import (
     AFD_MXFP8_SCALE_ATTR,
     AFD_MXFP8_SHARED_INPUT_ATTR,
+    AFD_MXFP8_SHARED_PAIR_ATTR,
 )
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
@@ -485,6 +486,20 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             AFD_MXFP8_SHARED_INPUT_ATTR,
             hidden_states_fp32,
         )
+        # The shared experts' gate-up projection accepts the same
+        # ``(quantized_activation, scale)`` pair the transport delivered, so pin it
+        # and let them skip both the model-dtype copy and their own re-quantization.
+        # The routed path needs ``[rows, hidden/64, 2]``; the shared MLP takes the
+        # flat ``[rows, hidden/32]`` byte layout, which is the same bytes.
+        if dynamic_scales is not None:
+            shared_scale = dynamic_scales.view(torch.uint8).flatten(-2)
+            setattr(
+                runner.ascend_shared_experts,
+                AFD_MXFP8_SHARED_PAIR_ATTR,
+                (hidden_states, shared_scale.view(torch.float8_e8m0fnu)),
+            )
+        else:
+            setattr(runner.ascend_shared_experts, AFD_MXFP8_SHARED_PAIR_ATTR, None)
         return self.mlp(
             hidden_states,
             input_ids=get_forward_context().input_ids,
