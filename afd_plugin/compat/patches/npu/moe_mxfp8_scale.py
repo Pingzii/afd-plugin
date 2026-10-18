@@ -193,13 +193,21 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
                 ids_range = (int(input_ids.min()), int(input_ids.max()))
                 if getattr(self, "_afd_router_probe_ids", None) != ids_range:
                     self._afd_router_probe_ids = ids_range
+            # Count, not just flag: a NaN reaching the gating op's sort becomes an
+            # index, and a batch full of random tokens can produce a few of them on
+            # its own. Only a difference between the two paths points at the
+            # transport, so report how many appear in each tensor.
+            x_nan = int(torch.isnan(hidden_states).sum())
+            rl_nan = int(torch.isnan(router_logits).sum())
+            rl_absmax = float(router_logits.abs().max()) if rl_nan == 0 else None
             print(
                 "[AFD router probe]"
                 f" x={probe[0]}/{hidden_states.dtype}"
+                f" x_nan={x_nan}"
                 f" rl={probe[2]}/{router_logits.dtype}"
+                f" rl_nan={rl_nan}"
+                f" rl_absmax={rl_absmax}"
                 f" rl_contig={router_logits.is_contiguous()}"
-                f" rl_finite={bool(torch.isfinite(router_logits).all())}"
-                f" rl_absmax={float(router_logits.abs().max())}"
                 f" ids_numel={probe[5]}"
                 f" ids_range={ids_range}",
                 flush=True,
