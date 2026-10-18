@@ -339,7 +339,22 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
     if shared_cls is None or hasattr(shared_cls, _MXFP8_SCALE_PATCH_ATTR):
         return True
 
-    original_prepare_gate_up = shared_cls._prepare_gate_up_input
+    original_prepare_gate_up = getattr(shared_cls, "_prepare_gate_up_input", None)
+    if original_prepare_gate_up is None:
+        # The released vllm-ascend may organise this differently from the checkout.
+        # Skipping keeps the worker usable; the candidate names are reported so the
+        # target can be corrected from one run instead of a startup failure.
+        candidates = sorted(
+            name
+            for name in dir(shared_cls)
+            if "prepare" in name or "gate" in name or "quant" in name
+        )
+        print(
+            "[AFD MXFP8 shared] no _prepare_gate_up_input; candidates="
+            + ",".join(candidates),
+            flush=True,
+        )
+        return True
 
     # Patch reason: the shared experts quantize whatever input they receive, so on
     # the AFD path they need a model-dtype copy of the activation to work from --
@@ -353,7 +368,9 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
     def _prepare_gate_up_input(self: Any, hidden_states: Any) -> Any:
         # ### PATCH START: reuse the transported MXFP8 activation pair
         transported = getattr(self, AFD_MXFP8_SHARED_PAIR_ATTR, None)
-        if transported is not None:
+        if transported is not None and int(transported[0].shape[0]) == int(
+            hidden_states.shape[0]
+        ):
             return transported
         # ### PATCH END: reuse the transported MXFP8 activation pair
         return original_prepare_gate_up(self, hidden_states)
