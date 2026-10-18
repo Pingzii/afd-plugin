@@ -175,6 +175,8 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             int(input_ids.numel()) if input_ids is not None else None,
         )
         if getattr(self, "_afd_router_probe", None) != probe:
+            import torch
+
             self._afd_router_probe = probe
             ids_range = None
             if input_ids is not None and int(input_ids.numel()) > 0:
