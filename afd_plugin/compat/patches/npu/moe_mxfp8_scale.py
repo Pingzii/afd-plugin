@@ -127,16 +127,16 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         routed_experts = getattr(self, "routed_experts", None)
         moe_config = getattr(self, "moe_config", None)
         if moe_config is not None:
-            staged = (
-                getattr(routed_experts, AFD_MXFP8_SCALE_ATTR, None)
-                if routed_experts is not None
-                else None
-            )
+            # The pin may land on the runner or on the routed-experts layer,
+            # depending on which object the model holds; check both.
+            staged = getattr(self, AFD_MXFP8_SCALE_ATTR, None)
+            if staged is None and routed_experts is not None:
+                staged = getattr(routed_experts, AFD_MXFP8_SCALE_ATTR, None)
             setattr(moe_config, AFD_MXFP8_SCALE_ATTR, staged)
             print(
                 "[AFD MXFP8 stage]"
-                f" routed={routed_experts is not None}"
-                f" layer_id={id(routed_experts) if routed_experts is not None else None}"
+                f" self_id={id(self)}"
+                f" routed_id={id(routed_experts) if routed_experts is not None else None}"
                 f" staged={staged is not None}",
                 flush=True,
             )

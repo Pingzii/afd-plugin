@@ -474,12 +474,13 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # runner itself, which is what hands ``shared_experts_input`` down: the
         # shared experts quantize their input unconditionally and would reject the
         # transported activation.
-        setattr(
-            self.mlp.experts.routed_experts,
-            AFD_MXFP8_SCALE_ATTR,
-            dynamic_scales,
-        )
-        layer = self.mlp.experts.routed_experts
+        # The runner and its routed-experts layer are both plausible readers: the
+        # MoE forward runs on the runner, while the quantization scheme receives
+        # the layer. Pin both so either one finds it.
+        runner = self.mlp.experts
+        layer = runner.routed_experts
+        for target in (runner, layer):
+            setattr(target, AFD_MXFP8_SCALE_ATTR, dynamic_scales)
         pinned = getattr(layer, AFD_MXFP8_SCALE_ATTR, None)
         scale_shape = (
             tuple(dynamic_scales.shape) if dynamic_scales is not None else None
@@ -488,6 +489,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             "[AFD MXFP8 pin]"
             f" dynamic_scales={dynamic_scales is not None}"
             f" shape={scale_shape}"
+            f" runner_id={id(runner)}"
             f" layer_id={id(layer)}"
             f" layer_attr={pinned is not None}",
             flush=True,
