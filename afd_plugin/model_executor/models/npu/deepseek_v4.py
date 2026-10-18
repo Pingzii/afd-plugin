@@ -478,22 +478,8 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # MoE forward runs on the runner, while the quantization scheme receives
         # the layer. Pin both so either one finds it.
         runner = self.mlp.experts
-        layer = runner.routed_experts
-        for target in (runner, layer):
+        for target in (runner, runner.routed_experts):
             setattr(target, AFD_MXFP8_SCALE_ATTR, dynamic_scales)
-        pinned = getattr(layer, AFD_MXFP8_SCALE_ATTR, None)
-        scale_shape = (
-            tuple(dynamic_scales.shape) if dynamic_scales is not None else None
-        )
-        print(
-            "[AFD MXFP8 pin]"
-            f" dynamic_scales={dynamic_scales is not None}"
-            f" shape={scale_shape}"
-            f" runner_id={id(runner)}"
-            f" layer_id={id(layer)}"
-            f" layer_attr={pinned is not None}",
-            flush=True,
-        )
         setattr(
             self.mlp.experts,
             AFD_MXFP8_SHARED_INPUT_ATTR,
