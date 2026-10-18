@@ -38,6 +38,7 @@ AFD_MXFP8_SCALE_ATTR = "afd_mxfp8_scale"
 AFD_MXFP8_SHARED_INPUT_ATTR = "afd_mxfp8_shared_input"
 _MXFP8_SCALE_PATCH_ATTR = "_afd_plugin_moe_mxfp8_scale_patch_state"
 _MXFP8_NEUTRAL_SCALE_ATTR = "_afd_plugin_moe_mxfp8_neutral_scale"
+_MXFP8_PAD_BUFFER_ATTR = "_afd_plugin_moe_mxfp8_pad_buffer"
 
 #: E8M0 byte for 2^0. Used as the neutral fill so the activation rows the
 #: framework pads with zeros stay zero after scaling.
@@ -63,30 +64,40 @@ def _pad_transported_scale(
     and the later all-gather stay on the byte view: HCCL has no E8M0 collective.
 
     A rank with no transported scale contributes ``_E8M0_ONE`` so the collective
-    keeps the same shape everywhere; the caller discards that result. That dummy is
-    reused rather than rebuilt: one allocation per (rows, pairs) instead of one per
-    layer per step, which at 43 layers was churning hundreds of megabytes and
-    fragmenting the cache that the following routing op depends on.
+    keeps the same shape everywhere; the caller discards that result. Both that
+    block and the pad destination are reused rather than rebuilt: one allocation per
+    (rows, pairs) instead of one per layer per step, which at 43 layers was churning
+    hundreds of megabytes and fragmenting the cache the following routing op needs.
     """
 
     import torch
 
     pairs = -(-int(hidden_dim) // (2 * _MX_GROUP_SIZE))
     if transported is None:
-        return _neutral_scale(
-            owner,
-            target_rows,
-            pairs,
-        )
+        return _neutral_scale(owner, target_rows, pairs)
     raw = transported.view(torch.uint8)
     rows = int(raw.shape[0])
-    if target_rows > rows:
-        raw = torch.nn.functional.pad(
-            raw,
-            (0, 0, 0, 0, 0, target_rows - rows),
-            value=_E8M0_ONE,
+    if target_rows == rows:
+        # Nothing to pad: hand the view straight to the collective.
+        return raw
+    # Pad into a reused block instead of a fresh ``F.pad`` result, so a step with
+    # uneven DP load does not allocate one block per layer. Only the real rows are
+    # copied; the tail keeps the neutral value.
+    buffer = getattr(owner, _MXFP8_PAD_BUFFER_ATTR, None)
+    if (
+        buffer is None
+        or buffer.shape != (target_rows, pairs, 2)
+        or buffer.device != raw.device
+    ):
+        buffer = torch.full(
+            (target_rows, pairs, 2),
+            _E8M0_ONE,
+            dtype=torch.uint8,
+            device=raw.device,
         )
-    return raw
+        setattr(owner, _MXFP8_PAD_BUFFER_ATTR, buffer)
+    buffer[:rows].copy_(raw)
+    return buffer
 
 
 def _neutral_scale(owner: Any, rows: int, pairs: int) -> Any:
