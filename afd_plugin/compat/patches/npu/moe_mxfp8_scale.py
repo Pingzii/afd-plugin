@@ -37,6 +37,7 @@ from typing import Any
 AFD_MXFP8_SCALE_ATTR = "afd_mxfp8_scale"
 AFD_MXFP8_SHARED_INPUT_ATTR = "afd_mxfp8_shared_input"
 _MXFP8_SCALE_PATCH_ATTR = "_afd_plugin_moe_mxfp8_scale_patch_state"
+_MXFP8_NEUTRAL_SCALE_ATTR = "_afd_plugin_moe_mxfp8_neutral_scale"
 
 #: E8M0 byte for 2^0. Used as the neutral fill so the activation rows the
 #: framework pads with zeros stay zero after scaling.
@@ -52,7 +53,9 @@ def _max_tokens_across_dp() -> int:
     return int(_EXTRA_CTX.max_tokens_across_dp)
 
 
-def _pad_transported_scale(transported: Any, hidden_dim: int, target_rows: int) -> Any:
+def _pad_transported_scale(
+    owner: Any, transported: Any, hidden_dim: int, target_rows: int
+) -> Any:
     """Pad a transported MX scale to ``target_rows`` on its E8M0 byte view.
 
     The scale arrives as ``[rows, hidden/32]`` E8M0 bytes. The routing op wants
@@ -60,18 +63,20 @@ def _pad_transported_scale(transported: Any, hidden_dim: int, target_rows: int) 
     and the later all-gather stay on the byte view: HCCL has no E8M0 collective.
 
     A rank with no transported scale contributes ``_E8M0_ONE`` so the collective
-    keeps the same shape everywhere; the caller discards that result.
+    keeps the same shape everywhere; the caller discards that result. That dummy is
+    reused rather than rebuilt: one allocation per (rows, pairs) instead of one per
+    layer per step, which at 43 layers was churning hundreds of megabytes and
+    fragmenting the cache that the following routing op depends on.
     """
 
     import torch
 
     pairs = -(-int(hidden_dim) // (2 * _MX_GROUP_SIZE))
     if transported is None:
-        return torch.full(
-            (target_rows, pairs, 2),
-            _E8M0_ONE,
-            dtype=torch.uint8,
-            device=torch.npu.current_device(),
+        return _neutral_scale(
+            owner,
+            target_rows,
+            pairs,
         )
     raw = transported.view(torch.uint8)
     rows = int(raw.shape[0])
@@ -82,6 +87,29 @@ def _pad_transported_scale(transported: Any, hidden_dim: int, target_rows: int) 
             value=_E8M0_ONE,
         )
     return raw
+
+
+def _neutral_scale(owner: Any, rows: int, pairs: int) -> Any:
+    """Return a cached all-ones E8M0 block sized ``(rows, pairs, 2)``.
+
+    The block is only read by the collective, so sharing one instance across
+    layers is safe. It is held on the long-lived prepare/finalize object, which
+    keeps the lifetime bounded by the process rather than by a forward pass.
+    """
+
+    import torch
+
+    cache = getattr(owner, _MXFP8_NEUTRAL_SCALE_ATTR, None)
+    if cache is not None and cache.shape == (rows, pairs, 2):
+        return cache
+    block = torch.full(
+        (rows, pairs, 2),
+        _E8M0_ONE,
+        dtype=torch.uint8,
+        device=torch.npu.current_device(),
+    )
+    setattr(owner, _MXFP8_NEUTRAL_SCALE_ATTR, block)
+    return block
 
 
 def apply_afd_moe_mxfp8_scale_patch() -> bool:
@@ -234,6 +262,7 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             and dp_group.world_size > 1
         ):
             padded_scale = _pad_transported_scale(
+                self,
                 transported,
                 int(self.moe_config.hidden_dim),
                 _max_tokens_across_dp(),
