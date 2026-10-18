@@ -181,11 +181,18 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         import dataclasses
 
         import torch
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
         from afd_plugin.envs import camp2p_mxfp8_direct_enabled
 
         # ### PATCH START: gather the transported MX scale with the activation
         dp_group = getattr(self.moe_config, "dp_group", None)
+        if dp_group is None:
+            # ``AscendMoERunner.__init__`` fills this in, but a config built
+            # elsewhere leaves it unset; fall back to the process-wide group.
+            from vllm.distributed import get_dp_group
+
+            dp_group = get_dp_group()
         transported = getattr(self.moe_config, AFD_MXFP8_SCALE_ATTR, None)
         padded_scale = None
         if (
@@ -211,6 +218,16 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             gathered = dp_group.all_gather(padded_scale, 0).view(torch.float8_e8m0fnu)
             if transported is not None:
                 output = dataclasses.replace(output, pertoken_scale=gathered)
+        print(
+            "[AFD MXFP8 prepare]"
+            f" dp_group={getattr(dp_group, 'world_size', None)}"
+            f" transported={transported is not None}"
+            f" padded={padded_scale is not None}"
+            f" pertoken_scale={output.pertoken_scale is not None}"
+            f" hidden_dim={getattr(self.moe_config, 'hidden_dim', None)}"
+            f" target_rows={getattr(_EXTRA_CTX, 'max_tokens_across_dp', None)}",
+            flush=True,
+        )
         # ### PATCH END: gather the transported MX scale with the activation
         return output
 
