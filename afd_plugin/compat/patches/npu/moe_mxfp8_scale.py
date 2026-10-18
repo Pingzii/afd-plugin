@@ -133,12 +133,18 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             staged = getattr(routed_experts, AFD_MXFP8_SCALE_ATTR, None)
         # ``get_moe_comm_method`` caches one method object per (comm type, config)
         # key, and that object -- not this runner -- owns the prepare/finalize
-        # instance whose ``_prepare_with_dp_group`` runs. Staging on the runner's
-        # config alone leaves the reader looking at a different config object.
+        # instance whose ``_prepare_with_dp_group`` runs. Ask for it the same way
+        # ``forward_impl`` will, rather than reading ``moe_comm_method`` from the
+        # forward context: that field is only set once ``forward_impl`` starts, so
+        # it is still unset for this layer.
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+        from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
-        moe_comm_method = getattr(_EXTRA_CTX, "moe_comm_method", None)
         staged_targets = []
+        moe_comm_type = getattr(_EXTRA_CTX, "moe_comm_type", None)
+        moe_comm_method = None
+        if moe_comm_type is not None and moe_config is not None:
+            moe_comm_method = get_moe_comm_method(moe_comm_type, moe_config)
         if moe_comm_method is not None:
             prepare_finalize = getattr(moe_comm_method, "prepare_finalize", None)
             if prepare_finalize is not None:
@@ -150,14 +156,14 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             staged_targets.append(moe_config)
         for target in staged_targets:
             setattr(target, AFD_MXFP8_SCALE_ATTR, staged)
-        if moe_comm_method is not None:
-            print(
-                "[AFD MXFP8 stage]"
-                f" method={moe_comm_method is not None}"
-                f" targets={len(staged_targets)}"
-                f" staged={staged is not None}",
-                flush=True,
-            )
+        print(
+            "[AFD MXFP8 stage]"
+            f" comm_type={moe_comm_type}"
+            f" method={moe_comm_method is not None}"
+            f" targets={len(staged_targets)}"
+            f" staged={staged is not None}",
+            flush=True,
+        )
         # ### PATCH END: stage the transported MX scale for the prepare stage
         return original_forward(
             self,
