@@ -162,6 +162,35 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
             if transported_input is not None:
                 shared_experts_input = transported_input
         # ### PATCH END: give the shared experts the model-dtype copy
+        # ### PATCH START: probe the router inputs (temporary diagnostic)
+        # ``MoeGatingTopKHash`` takes ``x=router_logits`` plus ``input_ids`` for its
+        # table lookup, so a row-count or dtype mismatch between them reads past a
+        # buffer. Report each distinct combination once rather than per layer.
+        probe = (
+            tuple(hidden_states.shape),
+            hidden_states.dtype,
+            tuple(router_logits.shape),
+            router_logits.dtype,
+            router_logits.is_contiguous(),
+            int(input_ids.numel()) if input_ids is not None else None,
+        )
+        if getattr(self, "_afd_router_probe", None) != probe:
+            self._afd_router_probe = probe
+            ids_range = None
+            if input_ids is not None and int(input_ids.numel()) > 0:
+                ids_range = (int(input_ids.min()), int(input_ids.max()))
+                if getattr(self, "_afd_router_probe_ids", None) != ids_range:
+                    self._afd_router_probe_ids = ids_range
+            print(
+                "[AFD router probe]"
+                f" x={probe[0]}/{hidden_states.dtype}"
+                f" rl={probe[2]}/{router_logits.dtype}"
+                f" rl_contig={router_logits.is_contiguous()}"
+                f" ids_numel={probe[5]}"
+                f" ids_range={ids_range}",
+                flush=True,
+            )
+        # ### PATCH END: probe the router inputs
         # ### PATCH START: stage the transported MX scale for the prepare stage
         routed_experts = getattr(self, "routed_experts", None)
         moe_config = getattr(self, "moe_config", None)
@@ -177,7 +206,6 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         # forward context: that field is only set once ``forward_impl`` starts, so
         # it is still unset for this layer.
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-        from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
         staged_targets = []
         moe_comm_method = getattr(_EXTRA_CTX, "moe_comm_method", None)
