@@ -25,6 +25,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 
 from afd_plugin.compat.patches.npu.moe_mxfp8_scale import (
+    AFD_MXFP8_ROUTER_LOGITS_ATTR,
     AFD_MXFP8_SCALE_ATTR,
     AFD_MXFP8_SHARED_INPUT_ATTR,
     AFD_MXFP8_SHARED_PAIR_ATTR,
@@ -36,6 +37,7 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.envs import camp2p_narrow_router_enabled
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
 from afd_plugin.model_executor.models.npu.async_cam_dbo import (
@@ -500,6 +502,17 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             )
         elif runner.ascend_shared_experts is not None:
             setattr(runner.ascend_shared_experts, AFD_MXFP8_SHARED_PAIR_ATTR, None)
+        # Diagnostic: hand the router a ``[tokens, n_routed_experts]`` slice so the
+        # gating op takes the 256-expert tiling key rather than the generalized one.
+        if camp2p_narrow_router_enabled() and hidden_states_fp32 is not None:
+            width = int(self.mlp.n_routed_experts)
+            setattr(
+                runner,
+                AFD_MXFP8_ROUTER_LOGITS_ATTR,
+                hidden_states_fp32[..., :width].contiguous(),
+            )
+        else:
+            setattr(runner, AFD_MXFP8_ROUTER_LOGITS_ATTR, None)
         return self.mlp(
             hidden_states,
             input_ids=get_forward_context().input_ids,

@@ -37,6 +37,7 @@ from typing import Any
 AFD_MXFP8_SCALE_ATTR = "afd_mxfp8_scale"
 AFD_MXFP8_SHARED_INPUT_ATTR = "afd_mxfp8_shared_input"
 AFD_MXFP8_SHARED_PAIR_ATTR = "afd_mxfp8_shared_pair"
+AFD_MXFP8_ROUTER_LOGITS_ATTR = "afd_mxfp8_router_logits"
 _MXFP8_SCALE_PATCH_ATTR = "_afd_plugin_moe_mxfp8_scale_patch_state"
 _MXFP8_NEUTRAL_SCALE_ATTR = "_afd_plugin_moe_mxfp8_neutral_scale"
 _MXFP8_PAD_BUFFER_ATTR = "_afd_plugin_moe_mxfp8_pad_buffer"
@@ -157,6 +158,14 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         input_ids: Any = None,
         shared_experts_input: Any = None,
     ) -> Any:
+        # ### PATCH START: feed the router a logits-shaped slice (diagnostic)
+        # The gating op derives its expert axis from ``x.shape[1]``, so a narrow input
+        # selects a different tiling key. Used to test whether the large-batch fault
+        # belongs to the generalized path only.
+        narrow = getattr(self, AFD_MXFP8_ROUTER_LOGITS_ATTR, None)
+        if narrow is not None and int(narrow.shape[0]) == int(router_logits.shape[0]):
+            router_logits = narrow
+        # ### PATCH END: feed the router a logits-shaped slice
         # ### PATCH START: give the shared experts the model-dtype copy
         if shared_experts_input is None:
             transported_input = getattr(self, AFD_MXFP8_SHARED_INPUT_ATTR, None)

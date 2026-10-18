@@ -25,6 +25,13 @@ ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 # different set of ranks ("execute kernel param invalid" from HcclLaunchAicpuKernel).
 AFD_NPU_CAMP2P_MXFP8_DIRECT = "AFD_NPU_CAMP2P_MXFP8_DIRECT"
 
+# Diagnostic switch: feed the router a ``[tokens, n_routed_experts]`` slice instead of
+# the model-dtype activation. The gating op derives its expert axis from ``x.shape[1]``,
+# so a narrow tensor sends it down the high-performance tiling key used for 256-expert
+# gates instead of the generalized path. Off by default; the slice is not real routing
+# logits, so accuracy is expected to move.
+AFD_NPU_CAMP2P_NARROW_ROUTER = "AFD_NPU_CAMP2P_NARROW_ROUTER"
+
 
 def force_balanced_topk_ids_enabled() -> bool:
     return os.environ.get(AFD_FORCE_BALANCED_TOPK_IDS, "").lower() in ENV_TRUE_VALUES
@@ -32,6 +39,12 @@ def force_balanced_topk_ids_enabled() -> bool:
 
 def async_cam_layered_gmm_enabled() -> bool:
     return os.environ.get(AFD_ASYNC_CAM_LAYERED_GMM, "").lower() in ENV_TRUE_VALUES
+
+
+def camp2p_narrow_router_enabled() -> bool:
+    """Return whether the router should receive a narrow logits-shaped input."""
+
+    return os.environ.get(AFD_NPU_CAMP2P_NARROW_ROUTER, "").lower() in ENV_TRUE_VALUES
 
 
 def camp2p_mxfp8_direct_enabled() -> bool:
@@ -63,11 +76,13 @@ __all__ = [
     "AFD_FORCE_BALANCED_TOPK_IDS",
     "AFD_ASYNC_CAM_LAYERED_GMM",
     "AFD_NPU_CAMP2P_MXFP8_DIRECT",
+    "AFD_NPU_CAMP2P_NARROW_ROUTER",
     "AFD_NPU_CAMP2P_QUANT_MODE",
     "A2E_QUANT_MODE_BF16",
     "A2E_QUANT_MODE_MXFP8",
     "async_cam_layered_gmm_enabled",
     "camp2p_mxfp8_direct_enabled",
+    "camp2p_narrow_router_enabled",
     "camp2p_quant_mode",
     "force_balanced_topk_ids_enabled",
 ]
