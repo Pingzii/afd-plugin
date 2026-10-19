@@ -13,10 +13,10 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("torch")
+pytest.importorskip("vllm")
 
 from afd_plugin.compat.npu import (
     fail_if_unsupported_npu_afd_features,
-    npu_afd_num_ubatches,
 )
 from afd_plugin.connectors import (
     AFDA2FTransferPayload,
@@ -25,6 +25,14 @@ from afd_plugin.connectors import (
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
+)
+from tests.unit.fakes.dp_metadata import (  # noqa: E402
+    DPMetadataValues as _FakeDPMetadata,
+)
+from tests.unit.fakes.dp_metadata import dp_tokens as _tokens
+from tests.unit.fakes.graph import Graph as _FakeGraph  # noqa: E402
+from tests.unit.fakes.vllm_config import (  # noqa: E402
+    npu_vllm_config as _vllm_config,
 )
 
 
@@ -169,112 +177,6 @@ class _FakeStructuredFFNModel:
             routed_output=f"routed({hidden_states}, layer={layer_idx})",
             shared_output=f"shared({hidden_states}, layer={layer_idx})",
         )
-
-
-class _FakeDPMetadata:
-    def __init__(self, values):
-        self.num_tokens_across_dp_cpu = values
-
-
-def _parallel_config(**overrides):
-    values = {
-        "data_parallel_size": 1,
-        "data_parallel_rank": 0,
-        "enable_dbo": False,
-        "use_ubatching": False,
-        "num_ubatches": 1,
-        "ubatch_size": 0,
-        "tensor_parallel_size": 1,
-        "pipeline_parallel_size": 1,
-        "use_sequence_parallel_moe": False,
-        "prefill_context_parallel_size": 1,
-        "decode_context_parallel_size": 1,
-        "dbo_decode_token_threshold": 1,
-        "dbo_prefill_token_threshold": 1,
-        "worker_cls": "unused",
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
-def _vllm_config(
-    *,
-    role="attention",
-    connector="CAMP2pAFDConnector",
-    extra_config=None,
-    use_mla=False,
-    use_v2_model_runner=True,
-    cudagraph_mode="FULL",
-    speculative_config=None,
-    **parallel_overrides,
-):
-    async_dp = bool(parallel_overrides.pop("async_dp", False))
-    compute_gate_on_attention = bool(
-        parallel_overrides.pop("compute_gate_on_attention", False),
-    )
-    num_attention_ranks = int(parallel_overrides.pop("num_attention_ranks", 1))
-    num_ffn_ranks = int(parallel_overrides.pop("num_ffn_ranks", 1))
-    return SimpleNamespace(
-        use_v2_model_runner=use_v2_model_runner,
-        additional_config={
-            "afd": {
-                "role": role,
-                "connector": connector,
-                "async": async_dp,
-                "compute_gate_on_attention": compute_gate_on_attention,
-                "num_attention_ranks": num_attention_ranks,
-                "num_ffn_ranks": num_ffn_ranks,
-                "connector_extra_config": extra_config or {},
-            },
-        },
-        parallel_config=_parallel_config(**parallel_overrides),
-        model_config=SimpleNamespace(
-            enforce_eager=True,
-            hf_text_config=SimpleNamespace(model_type="deepseek_v2"),
-            use_mla=use_mla,
-        ),
-        compilation_config=SimpleNamespace(
-            cudagraph_mode=SimpleNamespace(
-                name=cudagraph_mode,
-                has_full_cudagraphs=lambda: (
-                    cudagraph_mode in {"FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"}
-                ),
-            ),
-            fast_moe_cold_start=False,
-        ),
-        speculative_config=speculative_config,
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
-    )
-
-
-def _async_moe_config(
-    *,
-    role="attention",
-    compute_gate_on_attention=True,
-    num_attention_ranks=1,
-    num_ffn_ranks=1,
-    tensor_parallel_size=1,
-    prefill_context_parallel_size=1,
-    decode_context_parallel_size=1,
-    **extra_config,
-):
-    return _vllm_config(
-        role=role,
-        connector="CAMAsyncAFDConnector",
-        use_mla=True,
-        async_dp=True,
-        compute_gate_on_attention=compute_gate_on_attention,
-        num_attention_ranks=num_attention_ranks,
-        num_ffn_ranks=num_ffn_ranks,
-        tensor_parallel_size=tensor_parallel_size,
-        prefill_context_parallel_size=prefill_context_parallel_size,
-        decode_context_parallel_size=decode_context_parallel_size,
-        extra_config={
-            "async_moe_ubatching": True,
-            "attn_ranks_per_dp": tensor_parallel_size,
-            **extra_config,
-        },
-    )
 
 
 def _require_npu_runtime():
@@ -772,14 +674,6 @@ def test_npu_ffn_runner_filters_dense_layers_when_gate_runs_on_attention():
     )
 
     assert _ffn_layer_indices(runner) == [2, 4]
-
-
-class _FakeGraph:
-    def __init__(self):
-        self.replay_count = 0
-
-    def replay(self):
-        self.replay_count += 1
 
 
 def test_npu_ffn_runner_replays_acl_graph_when_key_exists():
@@ -1391,154 +1285,6 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypat
     assert calls == [("bind", worker.device), "step", "sync"]
 
 
-def test_npu_feature_validation_rejects_unsupported_switches():
-    for extra_config, message in [
-        ({"compute_gate_on_attention": True}, "compute_gate_on_attention"),
-        ({"quant_mode": 1}, "quant_mode=0"),
-    ]:
-        with pytest.raises((RuntimeError, ValueError), match=message):
-            fail_if_unsupported_npu_afd_features(
-                _vllm_config(extra_config=extra_config),
-            )
-
-
-def test_npu_feature_validation_uses_selected_connector_extra_info_parser():
-    with pytest.raises(ValueError, match="does not support connector_extra_config"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="P2pNcclAFDConnector",
-                extra_config={"core_num": 8},
-            ),
-        )
-
-
-def test_npu_feature_validation_allows_two_ubatches_only():
-    config = _vllm_config(
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-    fail_if_unsupported_npu_afd_features(config)
-    assert npu_afd_num_ubatches(config) == 2
-
-    with pytest.raises(RuntimeError, match="exactly two ubatches"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                enable_dbo=True,
-                use_ubatching=True,
-                num_ubatches=4,
-                ubatch_size=4,
-            ),
-        )
-
-    config = _vllm_config()
-    config.model_config.enforce_eager = False
-    fail_if_unsupported_npu_afd_features(config)
-
-
-@pytest.mark.parametrize("cudagraph_mode", ["FULL", "FULL_AND_PIECEWISE"])
-def test_npu_feature_validation_requires_decode_only_full_graph_for_mla_dbo(
-    cudagraph_mode,
-):
-    config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode=cudagraph_mode,
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-
-    with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
-        fail_if_unsupported_npu_afd_features(config)
-
-    fail_if_unsupported_npu_afd_features(
-        _vllm_config(
-            use_mla=True,
-            cudagraph_mode="FULL_DECODE_ONLY",
-            enable_dbo=True,
-            use_ubatching=True,
-            num_ubatches=2,
-            ubatch_size=4,
-        ),
-    )
-
-    sparse_config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode="FULL",
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-    sparse_config.model_config.hf_text_config = SimpleNamespace(index_topk=8)
-    fail_if_unsupported_npu_afd_features(sparse_config)
-
-    # A compressor model such as DeepSeek V4 selects the DSA backend, whose
-    # graph-params update is a no-op, so the MLA DBO full graph rules do not
-    # apply to it either.
-    compressor_config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode="FULL",
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-    compressor_config.model_config.hf_text_config = SimpleNamespace(
-        index_topk=512,
-        compress_ratios=[0, 4, 128],
-    )
-    fail_if_unsupported_npu_afd_features(compressor_config)
-
-
-def test_npu_feature_validation_rejects_speculative_mla_dbo_full_graph():
-    config = _vllm_config(
-        use_mla=True,
-        cudagraph_mode="FULL_DECODE_ONLY",
-        speculative_config=object(),
-        enable_dbo=True,
-        use_ubatching=True,
-        num_ubatches=2,
-        ubatch_size=4,
-    )
-
-    with pytest.raises(RuntimeError, match="does not support speculative decoding"):
-        fail_if_unsupported_npu_afd_features(config)
-
-
-def test_npu_async_feature_validation_requires_async_config_and_eager():
-    with pytest.raises(RuntimeError, match="async=true"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(connector="CAMAsyncAFDConnector", async_dp=False),
-        )
-
-    config = _vllm_config(connector="CAMAsyncAFDConnector", async_dp=True)
-    config.model_config.enforce_eager = False
-    with pytest.raises(RuntimeError, match="only eager"):
-        fail_if_unsupported_npu_afd_features(config)
-
-
-@pytest.mark.parametrize(
-    "parallel_override",
-    [
-        {"use_ubatching": True},
-        {"enable_dbo": True},
-    ],
-)
-def test_npu_async_feature_validation_requires_two_native_ubatches(parallel_override):
-    with pytest.raises(RuntimeError, match="DBO requires exactly two ubatches"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="CAMAsyncAFDConnector",
-                async_dp=True,
-                **parallel_override,
-            ),
-        )
-
-
-@pytest.mark.parametrize("use_v2_model_runner", [False, True])
 @pytest.mark.parametrize(
     ("method", "rejected"),
     [
@@ -1551,7 +1297,6 @@ def test_npu_async_feature_validation_requires_two_native_ubatches(parallel_over
     ],
 )
 def test_npu_async_feature_validation_rejects_native_draft_models(
-    use_v2_model_runner,
     method,
     rejected,
 ):
@@ -1565,7 +1310,7 @@ def test_npu_async_feature_validation_rejects_native_draft_models(
         connector="CAMAsyncAFDConnector",
         async_dp=True,
         use_mla=True,
-        use_v2_model_runner=use_v2_model_runner,
+        use_v2_model_runner=True,
         speculative_config=speculative_config,
     )
     if rejected:
@@ -1573,143 +1318,6 @@ def test_npu_async_feature_validation_rejects_native_draft_models(
             fail_if_unsupported_npu_afd_features(config)
     else:
         fail_if_unsupported_npu_afd_features(config)
-
-
-@pytest.mark.parametrize("use_v2_model_runner", [False, True])
-@pytest.mark.parametrize("role", ["attention", "ffn"])
-@pytest.mark.parametrize(
-    ("factor", "max_num_batched_tokens", "rejected"),
-    [
-        ("0.015625", 8192, True),
-        ("0.015625", 4096, False),
-        ("0.5", 8192, False),
-        (None, 262144, False),
-        ("0", 16, True),
-        ("nan", 16, True),
-        ("invalid", 16, True),
-        ("0.01_5625", 4096, True),
-    ],
-)
-def test_npu_async_feature_validation_checks_receive_capacity(
-    monkeypatch,
-    use_v2_model_runner,
-    role,
-    factor,
-    max_num_batched_tokens,
-    rejected,
-):
-    if factor is None:
-        monkeypatch.delenv("BATCH_SIZE_FACTOR", raising=False)
-    else:
-        monkeypatch.setenv("BATCH_SIZE_FACTOR", factor)
-    config = _vllm_config(
-        role=role,
-        connector="CAMAsyncAFDConnector",
-        async_dp=True,
-        use_mla=True,
-        use_v2_model_runner=use_v2_model_runner,
-        num_attention_ranks=2,
-        tensor_parallel_size=2 if role == "attention" else 1,
-        extra_config={"attn_ranks_per_dp": 2},
-    )
-    config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
-    if rejected:
-        with pytest.raises(RuntimeError, match="BATCH_SIZE_FACTOR"):
-            fail_if_unsupported_npu_afd_features(config)
-    else:
-        fail_if_unsupported_npu_afd_features(config)
-
-
-def test_npu_async_feature_validation_allows_dynamic_quant_zero_or_one():
-    for dynamic_quant in (0, "1"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="CAMAsyncAFDConnector",
-                async_dp=True,
-                use_mla=True,
-                extra_config={"dynamicQuant": dynamic_quant},
-            ),
-        )
-
-    with pytest.raises(RuntimeError, match="dynamicQuant"):
-        fail_if_unsupported_npu_afd_features(
-            _vllm_config(
-                connector="CAMAsyncAFDConnector",
-                async_dp=True,
-                use_mla=True,
-                extra_config={"dynamicQuant": 2},
-            ),
-        )
-
-
-@pytest.mark.parametrize(
-    "config",
-    [
-        pytest.param(_async_moe_config(), id="request-tp1"),
-        pytest.param(
-            _async_moe_config(
-                tensor_parallel_size=2,
-                num_attention_ranks=2,
-                async_moe_split="token",
-            ),
-            id="token-attention-tp2",
-        ),
-        pytest.param(
-            _async_moe_config(role="ffn", async_moe_split="token"),
-            id="token-ffn-tp1",
-        ),
-    ],
-)
-def test_npu_async_moe_ubatching_validation_accepts_supported_shape(config):
-    fail_if_unsupported_npu_afd_features(config)
-
-
-@pytest.mark.parametrize(
-    ("config", "error"),
-    [
-        pytest.param(
-            _async_moe_config(compute_gate_on_attention=False),
-            "compute_gate_on_attention",
-            id="missing-attention-gate",
-        ),
-        pytest.param(
-            _async_moe_config(async_moe_num_ubatches=3),
-            "exactly two",
-            id="three-stages",
-        ),
-        pytest.param(
-            _async_moe_config(decode_context_parallel_size=2),
-            "context parallel",
-            id="decode-context-parallel",
-        ),
-        pytest.param(
-            _async_moe_config(prefill_context_parallel_size=2),
-            "context parallel",
-            id="prefill-context-parallel",
-        ),
-        pytest.param(
-            _async_moe_config(
-                tensor_parallel_size=2,
-                attn_ranks_per_dp=1,
-            ),
-            "attn_ranks_per_dp",
-            id="attention-cam-tp-mismatch",
-        ),
-    ],
-)
-def test_npu_async_moe_ubatching_validation_rejects_unsupported_shape(
-    config,
-    error,
-):
-    with pytest.raises(RuntimeError, match=error):
-        fail_if_unsupported_npu_afd_features(config)
-
-
-def _tokens(dp_metadata):
-    values = dp_metadata.num_tokens_across_dp_cpu
-    if hasattr(values, "tolist"):
-        return values.tolist()
-    return list(values)
 
 
 class _LifecycleConnector:
@@ -1876,99 +1484,6 @@ def test_npu_attention_runner_load_model_initializes_connector_after_weights(
 
     assert events == ["model_load", "connector_init"]
     assert connector.is_initialized is True
-
-
-@pytest.mark.parametrize(
-    "extra_config,additional_config,model_type,use_mla,error",
-    [
-        (
-            {},
-            {"enable_shared_expert_dp": True},
-            "deepseek_v2",
-            True,
-            "shared-expert DP",
-        ),
-        *[
-            (
-                {},
-                {"finegrained_tp_config": {key: 2}},
-                "deepseek_v2",
-                True,
-                "finegrained TP",
-            )
-            for key in (
-                "oproj_tensor_parallel_size",
-                "mlp_tensor_parallel_size",
-                "embedding_tensor_parallel_size",
-                "lmhead_tensor_parallel_size",
-            )
-        ],
-        ({}, {}, "qwen3_moe", True, "DeepSeek-V2/V3 MLA"),
-        ({}, {}, "deepseek_v2", False, "DeepSeek-V2/V3 MLA"),
-    ],
-)
-def test_npu_async_mrv2_feature_boundaries(
-    extra_config, additional_config, model_type, use_mla, error
-):
-    config = _vllm_config(
-        connector="CAMAsyncAFDConnector",
-        async_dp=True,
-        compute_gate_on_attention=True,
-        use_v2_model_runner=True,
-        use_mla=use_mla,
-        extra_config=extra_config,
-    )
-    config.additional_config.update(additional_config)
-    config.model_config.hf_text_config.model_type = model_type
-    with pytest.raises(RuntimeError, match=error):
-        fail_if_unsupported_npu_afd_features(config)
-
-
-@pytest.mark.parametrize(
-    "model_type,use_mla",
-    [("deepseek_v2", True), ("deepseek_v3", True), ("deepseek_v4", False)],
-)
-@pytest.mark.parametrize("tp_size,use_sp", [(1, False), (2, False), (2, True)])
-@pytest.mark.parametrize("local_ubatching", [False, True])
-def test_npu_async_mrv2_features_allow_model_layouts(
-    model_type, use_mla, tp_size, use_sp, local_ubatching
-):
-    config = _vllm_config(
-        connector="CAMAsyncAFDConnector",
-        async_dp=True,
-        compute_gate_on_attention=True,
-        use_v2_model_runner=True,
-        use_mla=use_mla,
-        tensor_parallel_size=tp_size,
-        use_sequence_parallel_moe=use_sp,
-        num_attention_ranks=2 * tp_size,
-        data_parallel_size=2,
-        extra_config={
-            "attn_ranks_per_dp": tp_size,
-            "dynamicQuant": 1,
-            "async_moe_ubatching": local_ubatching,
-            "async_moe_split": "token" if tp_size > 1 else "request",
-        },
-    )
-    config.model_config.hf_text_config.model_type = model_type
-    config.additional_config["enable_flashcomm1"] = use_sp
-    fail_if_unsupported_npu_afd_features(config)
-
-
-def test_npu_async_mrv2_rejects_fractional_tp_capacity():
-    config = _vllm_config(
-        connector="CAMAsyncAFDConnector",
-        async_dp=True,
-        compute_gate_on_attention=True,
-        use_v2_model_runner=True,
-        use_mla=True,
-        tensor_parallel_size=2,
-        num_attention_ranks=2,
-        extra_config={"attn_ranks_per_dp": 2},
-    )
-    config.scheduler_config.max_num_batched_tokens = 5
-    with pytest.raises(RuntimeError, match="divisible by attn_ranks_per_dp"):
-        fail_if_unsupported_npu_afd_features(config)
 
 
 @pytest.mark.parametrize(

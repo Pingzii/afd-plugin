@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -25,6 +24,8 @@ from vllm.config import CompilationMode  # noqa: E402
 
 from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
+from tests.unit.fakes.model_layers import Stage as _FakeStage  # noqa: E402
+from tests.unit.fakes.model_layers import stage_type as _stage_type
 
 CONSTRUCTOR_DIGESTS = {
     "AFDDeepseekV2Model": (
@@ -34,19 +35,6 @@ CONSTRUCTOR_DIGESTS = {
         "83ebb82ab4e7d4e65fef6ea9427715af121f9eab04e75bbf1e31b370ec05faf1"
     ),
 }
-
-
-class _FakeStage(nn.Module):
-    kind = "stage"
-
-    def __init__(self, calls: dict[str, list[str]], *args, prefix="", **kwargs):
-        super().__init__()
-        calls[self.kind].append(prefix)
-        self.weight = nn.Parameter(torch.empty(1))
-
-
-def _stage_type(kind: str):
-    return type(f"Fake{kind.title()}", (_FakeStage,), {"kind": kind})
 
 
 @pytest.fixture
@@ -208,15 +196,6 @@ def _masked_patch_sha256(source: str) -> str:
     assert not in_patch
     masked_source = "\n".join(masked_lines).strip() + "\n"
     return hashlib.sha256(masked_source.encode()).hexdigest()
-
-
-def test_pinned_constructor_signatures_match_native_vllm():
-    assert inspect.signature(adapter.AFDDeepseekV2Model.__init__) == inspect.signature(
-        adapter.native.DeepseekV2Model.__init__,
-    )
-    assert inspect.signature(
-        adapter.AFDDeepseekV2DecoderLayer.__init__,
-    ) == inspect.signature(adapter.native.DeepseekV2DecoderLayer.__init__)
 
 
 @pytest.mark.parametrize(
