@@ -29,6 +29,7 @@ validation_paths:
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py"
   - "tests/unit/test_dsv4_e2e.py"
+  - "tests/unit/test_dsv4_sync_e2e.py"
   - "tests/e2e/environment.py"
   - "tests/e2e/models/deepseek_v4_flash/config.py"
   - "tests/e2e/models/deepseek_v4_flash/completions.py"
