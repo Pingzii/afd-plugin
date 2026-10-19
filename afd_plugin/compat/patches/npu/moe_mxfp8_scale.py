@@ -162,15 +162,18 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         # The gating op derives its expert axis from ``x.shape[1]``, so a narrow input
         # selects a different tiling key. Used to test whether the large-batch fault
         # belongs to the generalized path only.
+        pinned = False
         narrow = getattr(self, AFD_MXFP8_ROUTER_LOGITS_ATTR, None)
         if narrow is not None and int(narrow.shape[0]) == int(router_logits.shape[0]):
             router_logits = narrow
+            pinned = True
         # ### PATCH END: feed the router a logits-shaped slice
         # ### PATCH START: give the shared experts the model-dtype copy
         if shared_experts_input is None:
             transported_input = getattr(self, AFD_MXFP8_SHARED_INPUT_ATTR, None)
             if transported_input is not None:
                 shared_experts_input = transported_input
+                pinned = True
         # ### PATCH END: give the shared experts the model-dtype copy
         # ### PATCH START: stage the transported MX scale for the prepare stage
         routed_experts = getattr(self, "routed_experts", None)
@@ -180,6 +183,19 @@ def apply_afd_moe_mxfp8_scale_patch() -> bool:
         staged = getattr(self, AFD_MXFP8_SCALE_ATTR, None)
         if staged is None and routed_experts is not None:
             staged = getattr(routed_experts, AFD_MXFP8_SCALE_ATTR, None)
+        if staged is not None:
+            pinned = True
+        # BF16 transport pins none of the above, so nothing downstream will read
+        # these attributes. Delegate without the bookkeeping below instead of
+        # paying it on every layer of the default path.
+        if not pinned:
+            return original_forward(
+                self,
+                hidden_states,
+                router_logits,
+                input_ids,
+                shared_experts_input,
+            )
         # ``get_moe_comm_method`` caches one method object per (comm type, config)
         # key, and that object -- not this runner -- owns the prepare/finalize
         # instance whose ``_prepare_with_dp_group`` runs. Ask for it the same way
