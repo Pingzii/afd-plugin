@@ -155,7 +155,7 @@ role rank.
 | --- | --- | --- | --- |
 | `core_num` | `int` | `8` | Positive default AIV core count for both roles. |
 | `attn_core_num` / `ffn_core_num` | `int` | unset | Positive role-specific override for `core_num`. |
-| `quant_mode` | `int` | `0` | CAM quantization mode. Synchronous CAMP2P serving currently accepts only `0`; the A5 A2E operator has an opt-in `4` transport contract for pre-quantized E4M3 or E5M2 activations plus E8M0 MX scales, but the connector keeps rejecting `4` until its FFN consumer accepts both tensors. |
+| `quant_mode` | `int` | `0` | CAM quantization mode. `0` transports BF16 and lets the FFN quantize. `4` transports pre-quantized E4M3/E5M2 activations plus E8M0 MX scales and lets the FFN consume them: the attention side quantizes once, the A2E payload halves, and the FFN skips its own quantization. `4` additionally requires at least 3 AIV cores and a vLLM-Ascend build that provides the MoE MXFP8 scale resolver (`_prepare_with_dp_group` gathering `pertoken_scale`); the connector raises at construction when either is missing. Both roles must use the same value. Measured on A5 4A4F: +34.7% total-token throughput versus `0` when concurrency saturates all DP ranks, at about −0.15 GSM8K points. |
 | `compute_gate_on_attention` | `bool` | `false` | Connector-local operator option; must remain `false`, as must the common AFD field. |
 | `hccl_buffer_size` | `int` | unset | Positive CAMP2P HCCL buffer size in MB. The override applies to every connector-owned `afd*` communication domain and the FFN-side `afd_moe` domain; the Gloo control group is unaffected. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Use the same value on all members of each HCCL domain. |
 
@@ -201,9 +201,22 @@ writes, requiring
 Capacity violations fail closed; no universal maximum batch or hidden
 size is implied by this contract.
 
-The synchronous serving connector continues rejecting `quant_mode=4`: receiving
-both tensors is not equivalent to having a compatible FFN consumer. This is not
-an MXFP8 serving configuration or an end-to-end FFN correctness claim.
+The synchronous serving connector accepts `quant_mode=4` on this branch: the
+transport contract above is complemented by an FFN consumer that reads the
+received FP8 activations and E8M0 scales directly. Enabling it requires a
+vLLM-Ascend build that gathers `pertoken_scale` alongside the activation in
+`PrepareAndFinalizeWithAllGather._prepare_with_dp_group`; without it the scale
+reaches the FFN with fewer rows than the activation and the routing operator
+rejects the call. The connector raises at construction when the resolver or the
+AIV core count is missing, so a misconfigured deployment fails fast rather than
+producing wrong results.
+
+Measured on A5 single-host 4A4F with 128 concurrent 8192-token requests:
+318,519 total token/s versus 236,378 for `quant_mode=0` (+34.7%), TTFT median
+2995 ms versus 3748 ms, GSM8K 93.71% versus 93.86%. The gain depends on the
+concurrency actually saturating the FFN ranks: with 8 concurrent requests the
+same configuration measured −0.3%, because each layer's round-trip wait is then
+dominated by its fixed latency rather than by the activation payload.
 
 On A5 hardware, the explicit standalone byte-transport sample is:
 
