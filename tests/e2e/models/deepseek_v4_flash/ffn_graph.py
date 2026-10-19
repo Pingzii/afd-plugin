@@ -6,8 +6,8 @@ Functional coverage only: test observers fence eager transactions. Do not use
 this fixture for performance comparisons. Inference and process cleanup are
 recorded separately.
 
-This deliberately has its own fixed profile; the existing 16-die E2E and its
-MRV1/ubatching settings are unchanged. It reuses the common command/cleanup code.
+This has its own fixed DBO-disabled profile, separate from the existing
+16-die eager Attention DBO case. It reuses common command/cleanup code.
 """
 
 from __future__ import annotations
@@ -132,8 +132,6 @@ def environment_for(args, settings, role: str) -> dict[str, str]:
     env = runner.build_env(
         visible, settings, role=role, e2e_run_id=args.output_dir.name
     )
-    # The shared runner's legacy NPU scenarios still select MRV1. This profile
-    # explicitly requests MRV2 without migrating those independent cases.
     env.update(
         {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
@@ -396,6 +394,7 @@ def main() -> None:
                 cwd=runner.REPO_ROOT,
                 stdout=log,
                 stderr=subprocess.STDOUT,
+                text=True,
                 start_new_session=True,
             )
         save(

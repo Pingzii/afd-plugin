@@ -2,8 +2,13 @@
 
 AFD #449 captures one complete routed-expert transaction: original dispatch
 receive (DR), existing layered W4A8 FFN, and original combine send (CS).
-Attention remains MRV2 eager. This path does not complete the wider MRV2
-migration in #451.
+Attention remains MRV2 eager. Issue #451 retires the separate MRV1 paths while
+preserving this runtime and its original transport/lifecycle boundary.
+
+`AsyncNPUFFNModelRunner` owns Async CAM model loading, eager/FULL transactions
+and receive-safe resource release independently of the synchronous CAMP2P
+`AFDNPUFFNModelRunner`. The FFN worker selects the owner from the connector;
+neither runner inherits MRV1 or owns Attention request/KV state.
 
 ## Selection and startup
 
@@ -77,8 +82,8 @@ remain blocked after requests finish; stopping the host event does not interrupt
 already submitted work. Such services require process-level cleanup. This change
 does not guarantee graceful idle shutdown or all A/F processes exiting with code
 zero. Test reports distinguish successful inference from cleanup, and forced
-termination must not be described as normal shutdown. Existing MRV1, eager and
-synchronous stopping policies are preserved.
+termination must not be described as normal shutdown. Eager and synchronous
+stopping policies retain their connector/process-level cleanup boundaries.
 
 ## Computation semantics
 
@@ -94,8 +99,6 @@ Use the pinned stack and native artifacts built from the same baseline sources.
 The real-model fixture targets DeepSeek-V4 Flash per-channel W4A8 on A3/910C,
 4A/4F, A TP4, F TP1, receive capacity 128 and DBO disabled. Synthetic per-group
 coverage does not qualify loading real per-group checkpoints.
-The Attention DBO + FFN FULL combination has host configuration coverage only;
-the existing device results do not validate this combination.
 
 - Host contracts: `tests/unit/connectors/test_async_cam_startup.py`,
   `tests/unit/v1/worker/test_async_ffn_graph.py`, and

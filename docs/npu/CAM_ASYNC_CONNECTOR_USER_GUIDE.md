@@ -23,7 +23,7 @@ Use this connector for eager asynchronous Ascend inference with these requiremen
 - Attention performs MoE gating before dispatch to FFN ranks;
 - Attention execution is eager and AFD async-DP is enabled; **`async_dp=true` is required**;
 - regular prefill and autoregressive decode steps use the same CAM path;
-- optional ubatching uses exactly two native DBO microbatches in MRV1 and MRV2,
+- optional ubatching uses exactly two native MRV2 DBO microbatches,
   including Attention DP1.
 
 CAM async supports eager execution. Native DBO requires Attention-side gating,
@@ -34,15 +34,13 @@ Attention DP replicas make that decision independently; FFN is connector-driven.
 FFN also supports the experimental complete-transaction FULL mode described in
 [Async FFN runtime](ASYNC_FFN_RUNTIME.md#selection-and-startup).
 FULL requires MRV2 on both roles and accepts Attention-side DBO under the
-existing constraints. Attention graph execution remains unsupported. The
-DBO + FFN FULL combination has not yet been validated on device.
+existing constraints. Attention graph execution remains unsupported.
 
 ## ModelRunnerV2 deployment
 
-Attention supports both ModelRunnerV1 and ModelRunnerV2. To select V2, set
-`VLLM_USE_V2_MODEL_RUNNER=1` and `VLLM_PLUGINS=ascend,afd` on both roles.
-Only Attention uses the native V2 model runner; FFN keeps its connector-driven
-runner. Use the pinned vLLM/vLLM-Ascend pair in the installation instructions.
+Set `VLLM_USE_V2_MODEL_RUNNER=1` and `VLLM_PLUGINS=ascend,afd` on both roles.
+Attention uses native Ascend ModelRunnerV2; FFN uses the independent
+`AsyncNPUFFNModelRunner`. Neither role selects or falls back to MRV1. Use the pinned vLLM/vLLM-Ascend pair in the installation instructions.
 
 The V2 Async CAM contract is:
 
@@ -330,8 +328,8 @@ AFD_ASYNC_CAM_LAYERED_GMM=1 bash /path/to/W4A8-FFN-launch-script.sh
 The intended configuration is Ascend 910C / `ascend910_93`, async CAM FFN,
 Attention-side gate, `dynamicQuant=1`, eager execution (or the separately
 qualified FFN FULL mode), and static expert
-placement. `VLLM_USE_V2_MODEL_RUNNER=1` may be set on both roles; FFN still uses
-its connector-driven runner. This path applies only to Ascend DeepSeek V4;
+placement. `VLLM_USE_V2_MODEL_RUNNER=1` is required on both roles; FFN uses
+its independent connector-driven runner. This path applies only to Ascend DeepSeek V4;
 enabling the switch for another model fails at startup. All remote MoE layers must share geometry,
 SiLU activation, quantization layout, and scaling semantics. The extractor
 can represent per-channel and per-group parameters, but the pinned Ascend

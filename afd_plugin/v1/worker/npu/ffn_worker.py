@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import get_world_group
 from vllm.platforms import current_platform
 from vllm.v1.worker.worker_base import CompilationTimes
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -22,11 +24,12 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.connectors import AFDConnectorFactory
+from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.npu.async_ffn_model_runner import (
-    AsyncNPUFFNModelRunner,
-    create_npu_ffn_model_runner,
-)
+from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
+from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
     NPU_FFN_WORKER_FQCN,
     assert_compatible_afd_stack,
@@ -41,6 +44,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FFN_SHUTDOWN_TIMEOUT_SECONDS = 5
+
+
+def create_npu_ffn_model_runner(
+    vllm_config: VllmConfig, device: torch.device
+) -> AFDNPUFFNModelRunner | AsyncNPUFFNModelRunner:
+    """Select the execution owner from the connector, with no MRV1 fallback."""
+    validate_npu_model_runner_v2_config(
+        vllm_config, expected_role="ffn", device_type=device.type
+    )
+    afd_config = parse_afd_config(vllm_config, expected_role="ffn")
+    if afd_config.connector == AFD_ASYNC_CONNECTOR:
+        connector = AFDConnectorFactory.create_connector(
+            int(get_world_group().rank), int(device.index), vllm_config, afd_config
+        )
+        return AsyncNPUFFNModelRunner(
+            vllm_config, device, cast(CAMAsyncAFDConnector, connector)
+        )
+    return AFDNPUFFNModelRunner(vllm_config, device)
 
 
 class AFDNPUFFNWorker(NPUWorker):
@@ -65,12 +86,11 @@ class AFDNPUFFNWorker(NPUWorker):
         )
         fail_if_unsupported_npu_afd_features(self.vllm_config)
         fix_all2all_backend_for_afd(self.vllm_config)
-        if self.use_v2_model_runner:
-            validate_npu_model_runner_v2_config(
-                self.vllm_config,
-                expected_role="ffn",
-                device_type="npu",
-            )
+        validate_npu_model_runner_v2_config(
+            self.vllm_config,
+            expected_role="ffn",
+            device_type="npu",
+        )
 
         self.device = self._init_device()
         init_workspace_manager(
@@ -137,6 +157,7 @@ class AFDNPUFFNWorker(NPUWorker):
                 logger.exception("AFD NPU FFN worker loop failed")
             else:
                 if self._uses_async_full_graph():
+                    assert isinstance(self.model_runner, AsyncNPUFFNModelRunner)
                     self.model_runner._graph_receiver_exited = True
 
         self._ffn_thread = threading.Thread(
@@ -179,12 +200,9 @@ class AFDNPUFFNWorker(NPUWorker):
                 if self.model_runner.effective_mode == "eager":
                     torch.npu.synchronize()
                 continue
-            if self.model_runner.connector.control_plane is None:
-                self.model_runner.execute_connector_driven_step()
-                torch.npu.synchronize()
-                continue
-
-            payload = self.model_runner.connector.control_plane.recv_dp_metadata_list()
+            control_plane = self.model_runner.connector.control_plane
+            assert control_plane is not None
+            payload = control_plane.recv_dp_metadata_list()
             dp_metadata_list = payload.dp_metadata_list
             is_attn_graph_capturing = payload.is_graph_capturing
             is_warmup = payload.is_warmup

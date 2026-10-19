@@ -16,7 +16,10 @@ from afd_plugin.async_cam_startup import (
     POLL_SECONDS,
     FFNGraphPlan,
 )
-from afd_plugin.compat.npu.forward_context import ascend_forward_context
+from afd_plugin.compat.npu import (
+    ascend_forward_context,
+    fail_if_unsupported_npu_afd_features,
+)
 from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
@@ -38,14 +41,17 @@ from afd_plugin.model_executor.npu.async_cam_w4a8 import (
     W4A8LayerWeights,
 )
 from afd_plugin.v1.worker.ffn_metadata import _set_moe_layer_index
-from afd_plugin.validation import cam_receive_capacity, requested_ffn_mode
+from afd_plugin.validation import (
+    cam_receive_capacity,
+    requested_ffn_mode,
+    validate_npu_model_runner_v2_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.tasks import SupportedTask
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
-    from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 
 logger = init_logger(__name__)
 
@@ -72,9 +78,13 @@ class AsyncNPUFFNModelRunner:
         device: torch.device,
         connector: CAMAsyncAFDConnector,
     ) -> None:
+        validate_npu_model_runner_v2_config(
+            vllm_config, expected_role="ffn", device_type=device.type
+        )
         self.vllm_config, self.device, self.connector = vllm_config, device, connector
         self.model_config = vllm_config.model_config
         self.afd_config = parse_afd_config(vllm_config, expected_role="ffn")
+        fail_if_unsupported_npu_afd_features(vllm_config, afd_config=self.afd_config)
         self.model: FFNModel | None = None
         self.model_memory_usage = 0
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -446,26 +456,3 @@ class AsyncNPUFFNModelRunner:
         free_before_shutdown(self.vllm_config)
         self.model = None
         self._is_shutdown = True
-
-
-def create_npu_ffn_model_runner(
-    vllm_config: VllmConfig, device: torch.device
-) -> AsyncNPUFFNModelRunner | AFDNPUFFNModelRunner:
-    from vllm.distributed.parallel_state import get_world_group
-
-    from afd_plugin.connectors.factory import AFDConnectorFactory
-
-    afd_config = parse_afd_config(vllm_config, expected_role="ffn")
-    if (
-        vllm_config.use_v2_model_runner
-        and afd_config.connector == "CAMAsyncAFDConnector"
-    ):
-        connector = AFDConnectorFactory.create_connector(
-            int(get_world_group().rank), int(device.index), vllm_config, afd_config
-        )
-        return AsyncNPUFFNModelRunner(
-            vllm_config, device, cast(CAMAsyncAFDConnector, connector)
-        )
-    from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
-
-    return AFDNPUFFNModelRunner(vllm_config, device)

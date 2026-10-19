@@ -32,7 +32,7 @@ FFN_MODEL_RUNNER_FQCN: Final[str] = "afd_plugin.v1.worker.GPUFFNModelRunner"
 NPU_ATTENTION_WORKER_FQCN: Final[str] = "afd_plugin.v1.worker.npu.AFDNPUAttentionWorker"
 NPU_FFN_WORKER_FQCN: Final[str] = "afd_plugin.v1.worker.npu.AFDNPUFFNWorker"
 NPU_ATTENTION_MODEL_RUNNER_FQCN: Final[str] = (
-    "afd_plugin.v1.worker.npu.AFDNPUAttentionModelRunner"
+    "afd_plugin.v1.worker.npu.AFDNPUAttentionModelRunnerV2"
 )
 NPU_FFN_MODEL_RUNNER_FQCN: Final[str] = "afd_plugin.v1.worker.npu.AFDNPUFFNModelRunner"
 VLLM_GPU_WORKER_FQCN: Final[str] = "vllm.v1.worker.gpu_worker.Worker"
@@ -151,6 +151,8 @@ def validate_npu_model_runner_v2_config(
 ) -> None:
     """Validate the supported Ascend NPU ModelRunnerV2 deployment."""
 
+    if not vllm_config.use_v2_model_runner:
+        raise RuntimeError("AFD NPU requires ModelRunnerV2")
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
     if device_type != "npu":
         raise RuntimeError("AFD NPU ModelRunnerV2 requires NPU")
@@ -198,17 +200,13 @@ def validate_npu_model_runner_v2_config(
         not parallel.enable_expert_parallel
         or parallel.enable_elastic_ep
         or parallel.enable_eplb
-        or (
-            afd_config.connector != AFD_ASYNC_CONNECTOR
-            and (
-                parallel.use_sequence_parallel_moe
-                or vllm_config.compilation_config.pass_config.enable_sp
-            )
-        )
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
     if parallel.enable_dbo or parallel.use_ubatching:
-        if not vllm_config.model_config.enforce_eager:
+        if (
+            afd_config.connector == AFD_ASYNC_CONNECTOR
+            and not vllm_config.model_config.enforce_eager
+        ):
             raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires eager execution")
         if (
             expected_role == "attention"
