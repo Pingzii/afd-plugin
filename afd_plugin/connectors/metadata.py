@@ -274,12 +274,19 @@ class AFDA2FTransferPayload:
         router_logits: Optional Attention-side routing tensor.
         input_ids: Optional token-aligned identifiers required by the remote
             FFN implementation.
+        topk_ids: Optional expert indices selected by an Attention-side gate,
+            shaped ``(tokens, topk)`` as ``int32``.
+        topk_weights: Optional routing weights paired with ``topk_ids``, shaped
+            ``(tokens, topk)`` as ``float32``. The two are present together or
+            not at all.
     """
 
     hidden_states: torch.Tensor
     context: AFDTransferContext
     router_logits: torch.Tensor | None = None
     input_ids: torch.Tensor | None = None
+    topk_ids: torch.Tensor | None = None
+    topk_weights: torch.Tensor | None = None
 
 
 @dataclass(slots=True)

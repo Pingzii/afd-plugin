@@ -535,3 +535,120 @@ def test_camp2p_init_fails_cleanly_without_ascend_runtime(monkeypatch):
 
     with pytest.raises(RuntimeError, match="AFD Ascend custom ops|torch-npu"):
         connector.init_afd_connector()
+
+
+def test_camp2p_routing_channel_round_trips_attention_side_topk():
+    """The ids channel must carry a gate result unchanged in both directions.
+
+    An Attention-side gate fills the operator's ids and scales slots with its
+    own ``(tokens, topk)`` routing. The operator casts to the channel dtypes and
+    widens the row count to its capacity, so the receiver has to trim back to
+    the tokens the FFN rank computes on without touching the values.
+    """
+
+    torch = pytest.importorskip("torch")
+
+    topk_ids = torch.tensor([[0, 3], [1, 2]], dtype=torch.int64)
+    topk_weights = torch.tensor([[0.25, 0.75], [0.5, 0.5]], dtype=torch.float64)
+
+    wire_ids, wire_weights = camp2p_module.prepare_routing_transfer(
+        topk_ids,
+        topk_weights,
+        expected_tokens=2,
+    )
+
+    assert wire_ids.dtype == torch.int32
+    assert wire_weights.dtype == torch.float32
+
+    # The operator sizes its outputs to the capacity it was given, so the extra
+    # rows are padding the FFN rank must not route.
+    capacity_ids = torch.cat([wire_ids, torch.full((1, 2), 99, dtype=torch.int32)])
+    capacity_weights = torch.cat(
+        [wire_weights, torch.full((1, 2), 0.125, dtype=torch.float32)],
+    )
+
+    received_ids, received_weights = camp2p_module.received_routing(
+        capacity_ids,
+        capacity_weights,
+        expected_tokens=2,
+    )
+
+    assert received_ids.tolist() == [[0, 3], [1, 2]]
+    assert received_weights.tolist() == [[0.25, 0.75], [0.5, 0.5]]
+
+
+def test_camp2p_routing_channel_rejects_misaligned_token_counts():
+    """Both directions must refuse routing that does not match the transfer."""
+
+    torch = pytest.importorskip("torch")
+
+    topk_ids = torch.zeros((3, 2), dtype=torch.int32)
+    topk_weights = torch.zeros((3, 2), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="covers 3 tokens"):
+        camp2p_module.prepare_routing_transfer(
+            topk_ids,
+            topk_weights,
+            expected_tokens=2,
+        )
+    with pytest.raises(ValueError, match="routing rows"):
+        camp2p_module.received_routing(
+            topk_ids[:1],
+            topk_weights[:1],
+            expected_tokens=2,
+        )
+
+
+def test_camp2p_recv_attn_output_reads_the_routing_slot(monkeypatch):
+    """Asking for routing must select the operator's slot mode and split it.
+
+    ``recv_input_ids`` and ``recv_routing`` read the same wire slot with
+    different meanings, so the mode has to reach the operator and the payload
+    has to expose the routing pair rather than token ids.
+    """
+
+    torch = pytest.importorskip("torch")
+
+    calls: list[tuple] = []
+
+    def fake_a2e(*args):
+        calls.append(args)
+        tokens, topk = args[3], args[5]
+        ids = torch.arange(tokens * topk, dtype=torch.int32).reshape(tokens, topk)
+        weights = torch.full((tokens, topk), 0.5, dtype=torch.float32)
+        return ("hidden", ids, weights, "atten-batch", "active-mask")
+
+    monkeypatch.setattr(torch.ops.afd_ascend, "a2e", fake_a2e, raising=False)
+    connector = _init_ffn_connector(0, _vllm_config())
+    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+
+    payload = connector.recv_attn_output(
+        ubatch_idx=0,
+        layer_idx=0,
+        recv_routing=True,
+    )
+
+    assert calls[0][-1] == 1
+    assert payload.input_ids is None
+    assert payload.topk_ids.shape == (7, 2)
+    assert payload.topk_ids[0].tolist() == [0, 1]
+    assert payload.topk_weights.shape == (7, 2)
+    assert payload.topk_weights[0].tolist() == [0.5, 0.5]
+
+
+def test_camp2p_wire_slot_rejects_two_payloads():
+    """One wire slot cannot carry token ids and routing in the same transfer."""
+
+    pytest.importorskip("torch")
+
+    connector = _init_ffn_connector(0, _vllm_config())
+    connector.dp_metadata_list = {0: _FakeDPMetadata([2, 3, 5, 7])}
+
+    with pytest.raises(ValueError, match="wire slot"):
+        connector.recv_attn_output(
+            ubatch_idx=0,
+            layer_idx=0,
+            recv_input_ids=True,
+            recv_routing=True,
+        )
+
