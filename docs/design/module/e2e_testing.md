@@ -13,6 +13,7 @@ primary_code_paths:
 related_code_paths:
   - "tests/e2e/README.md"
   - ".agents/skills/run-e2e/SKILL.md"
+  - ".agents/skills/deploy-dsv4-flash-async/**"
 depends_on:
   - "plugin_boundary.md"
   - "attention_runtime.md"
@@ -23,6 +24,7 @@ depends_on:
   - "compatibility_and_patches.md"
 validation_paths:
   - "tests/e2e/test_runner.py"
+  - "tests/e2e/test_deploy_dsv4_flash_async_skill.py"
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
@@ -270,14 +272,14 @@ of 24; the lower threshold applies only at sample counts up to 24.
 Model entrypoints reuse the subprocess and download helpers in
 `tests/conftest.py`.
 
-## Unit test maintenance
-
-`tests/unit/.loc-baseline` limits physical lines in every unit Python file,
-including shared fakes, comments and blank lines. The `unit-test-budget`
-pre-commit hook checks the budget. Lower it after a cleanup; an increase
-requires an approved reason in the PR body. Report tests moved out of unit
-separately from deleted code.
+## Host integration checks
 
 Run host-only process/signal integration coverage explicitly with
 `pytest tests/e2e/test_runner.py`; it launches local processes and sockets
 without model weights or accelerators.
+
+The DSV4 deployment skill also has host-only shell integration coverage. Run
+`python -m unittest discover -s tests/e2e -p 'test_deploy_dsv4_flash_async_skill.py'`
+to check its CLI/environment contract, benchmark result handling, and frozen
+workload with local subprocesses. It uses a CLI double and synthetic benchmark
+results; it provides no device, model accuracy, or performance evidence.
