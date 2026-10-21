@@ -27,6 +27,9 @@ _PATCHES_APPLIED = False
 def apply_afd_ascend_config_patch_if_needed() -> None:
     """Apply patches required while vLLM builds an AFD NPU config."""
 
+    from afd_plugin.compat.npu.debug_moe_comm_probe import (
+        install as install_moe_comm_probe,
+    )
     from afd_plugin.compat.patches.npu.ascend_config import (
         apply_afd_ascend_config_patch,
     )
@@ -39,6 +42,8 @@ def apply_afd_ascend_config_patch_if_needed() -> None:
         raise RuntimeError(
             "AFD NPU DBO config patch requires vLLM-Ascend NPUPlatform",
         )
+    # Observation only; a no-op unless AFD_DEBUG_MOE_COMM=1.
+    install_moe_comm_probe()
 
 
 def apply_afd_async_dp_engine_patch_if_needed(vllm_config: VllmConfig) -> bool:
