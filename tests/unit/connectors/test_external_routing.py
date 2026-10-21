@@ -192,9 +192,16 @@ def test_scale_with_wrong_row_count_is_rejected(inputs_type):
         )
 
 
-def test_expert_indices_must_not_be_floating(inputs_type):
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bool, torch.complex64, torch.float16, torch.uint8],
+    ids=["bool", "complex64", "float16", "uint8"],
+)
+def test_expert_indices_reject_non_index_dtypes(inputs_type, dtype):
+    """Index dtypes are listed explicitly; bool and complex are not indices."""
+
     with pytest.raises(ValueError, match="expert indices"):
         inputs_type(
-            topk_ids=torch.zeros((2, TOP_K), dtype=torch.float32),
+            topk_ids=torch.zeros((2, TOP_K), dtype=dtype),
             topk_weights=torch.zeros((2, TOP_K), dtype=torch.float32),
         )

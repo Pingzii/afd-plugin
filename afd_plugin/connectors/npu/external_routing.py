@@ -35,6 +35,14 @@ import torch
 # filling a tensor with the *float* 127 would round to 2**7 and store byte 134.
 SCALE_PAD_BYTE: Final[int] = 127
 
+# Expert indices reach the MoE kernels as 32-bit, and gather/combine treat them as
+# integers. Listing the accepted dtypes explicitly also rejects bool and complex,
+# which ``is_floating_point()`` alone would let through.
+SUPPORTED_INDEX_DTYPES: Final[tuple[torch.dtype, ...]] = (
+    torch.int32,
+    torch.int64,
+)
+
 
 @dataclass(frozen=True)
 class AFDExternalRoutingInputs:
@@ -65,9 +73,11 @@ class AFDExternalRoutingInputs:
                 "topk_ids and topk_weights must have the same shape, got "
                 f"{tuple(self.topk_ids.shape)} and {tuple(self.topk_weights.shape)}",
             )
-        if self.topk_ids.is_floating_point():
+        if self.topk_ids.dtype not in SUPPORTED_INDEX_DTYPES:
             raise ValueError(
-                f"topk_ids must hold expert indices, got dtype {self.topk_ids.dtype}",
+                "topk_ids must hold expert indices in one of "
+                f"{[str(dtype) for dtype in SUPPORTED_INDEX_DTYPES]}, got "
+                f"{self.topk_ids.dtype}",
             )
         if not self.topk_weights.is_floating_point():
             raise ValueError(
