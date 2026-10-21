@@ -347,6 +347,11 @@ class AFDNPUFFNModelRunner:
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
+                        # Attention-side routing arrives on the payload when the
+                        # model declared it; passing both through keeps the branch
+                        # decision in the decoder layer rather than here.
+                        topk_ids=payload.topk_ids,
+                        topk_weights=payload.topk_weights,
                     )
                     _send_ffn_output(
                         self.connector,

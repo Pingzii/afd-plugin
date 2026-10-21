@@ -512,11 +512,28 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         dynamic_scales_shared: torch.Tensor | None = None,
         topk_scales: torch.Tensor | None = None,
         group_list_type: int = 1,
+        topk_ids: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | AFDF2ATransferPayload:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
             raise RuntimeError(
                 "DSV4 compute_ffn_output requires the FFN role to own the MoE"
+            )
+        # Three F-side shapes share this entry point. Which one applies is decided
+        # by what arrived, not by the config alone, because the sync and async
+        # gate-on-Attention paths carry different payloads.
+        if topk_ids is not None or topk_weights is not None:
+            # Sync connector: the routing arrived on the wire slot.
+            if topk_ids is None or topk_weights is None:
+                raise RuntimeError(
+                    "DSV4 external routing needs both topk_ids and topk_weights; "
+                    f"got ids={topk_ids is not None}, weights={topk_weights is not None}",
+                )
+            return self._compute_external_routing_ffn(
+                hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
             )
         if self.compute_gate_on_attention:
             if group_list is None:
@@ -542,6 +559,34 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             )
         # Target Hash MoE takes explicit token IDs from the CAM transfer.
         return self.mlp(hidden_states, input_ids=get_forward_context().input_ids)
+
+    def _compute_external_routing_ffn(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the FFN on routing the Attention side computed.
+
+        The routing covers this rank's local rows, so it must be padded and gathered
+        by the same rule the activation took. That happens inside the comm method's
+        prepare, which the patches teach to read ``afd_external_routing``.
+
+        Not implemented yet. The pieces that exist are the alignment contract, the
+        two prepare patches and the Attention-side producer; what is missing is this
+        consumer: installing the patches once at start-up, writing the stash before
+        prepare, and running prepare -> apply -> finalize with a ``finally`` that
+        clears the stash and the layer's per-call state.
+        """
+
+        del hidden_states, topk_ids, topk_weights
+        raise NotImplementedError(
+            "DSV4 external-routing FFN consumption is not implemented yet: the "
+            "prepare patches and the alignment contract exist, but the "
+            "prepare -> apply -> finalize wiring, the per-call stash and its "
+            "cleanup do not.",
+        )
 
 
 @native.support_torch_compile
