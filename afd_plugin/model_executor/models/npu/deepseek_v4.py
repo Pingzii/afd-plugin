@@ -689,7 +689,13 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 padded_hidden_states_shape=prepare_output.padded_hidden_states_shape,
             )
         finally:
+            # The inner finally already clears these before finalize runs, matching
+            # the native path's ordering. Clearing again here covers the paths that
+            # never reach it: if prepare raises, no other block cleans up, and the
+            # next call would start with another call's per-token state.
             prepare_finalize.afd_external_routing = None
+            routed_experts.ascend_pertoken_scale = None
+            routed_experts.ascend_mc2_mask = None
 
 
 @native.support_torch_compile
