@@ -117,6 +117,7 @@ _CAMP2P_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
         "attn_core_num",
         "ffn_core_num",
         "compute_gate_on_attention",
+        "force_allgather",
         "hccl_buffer_size",
         "quant_mode",
     },
@@ -131,7 +132,15 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
         core_num: Default number of AIV cores used by each AFD role.
         attn_core_num: Optional Attention-role override for ``core_num``.
         ffn_core_num: Optional FFN-role override for ``core_num``.
-        compute_gate_on_attention: Whether Attention computes MoE gate outputs.
+        compute_gate_on_attention: Connector-level mirror of the AFD setting.
+            The supported switch is ``additional_config["afd"][
+            "compute_gate_on_attention"]``; this copy exists only so a value
+            placed at the wrong level is rejected with a message that names the
+            right one.
+        force_allgather: Pin this process's Ascend MoE communication path to
+            ALLGATHER. A debug/measurement switch, off by default: it holds the
+            path fixed across the prefill/decode split so one implementation is
+            exercised, and it is not part of the performance baseline.
         hccl_buffer_size: Optional buffer size in MB for CAMP2P HCCL domains.
         quant_mode: A2E transport quantization mode. ``0`` keeps the original
             BF16 activation contract; ``4`` moves a pre-quantized E4M3
@@ -142,6 +151,7 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
     attn_core_num: int | None = None
     ffn_core_num: int | None = None
     compute_gate_on_attention: bool = False
+    force_allgather: bool = False
     hccl_buffer_size: int | None = None
     quant_mode: int = 0
 
@@ -179,6 +189,10 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
                 raw.get("compute_gate_on_attention", False),
                 field_name="compute_gate_on_attention",
             ),
+            force_allgather=coerce_extra_bool(
+                raw.get("force_allgather", False),
+                field_name="force_allgather",
+            ),
             hccl_buffer_size=coerce_optional_extra_positive_int(
                 raw.get("hccl_buffer_size"),
                 field_name="hccl_buffer_size",
@@ -198,8 +212,14 @@ class CAMP2PExtraInfo(ConnectorExtraInfo):
 
     def validate_supported(self) -> None:
         if self.compute_gate_on_attention:
+            # The gate switch belongs to the AFD config layer; until recently
+            # this connector field was the only place to write it, so a config
+            # copied from an old run reaches here. Say where it belongs instead
+            # of reporting a missing feature.
             raise RuntimeError(
-                "AFD NPU runtime does not support compute_gate_on_attention=true yet",
+                "compute_gate_on_attention must be set in "
+                'additional_config["afd"], not in connector_extra_config; the '
+                "connector-level copy is not supported",
             )
         if self.quant_mode not in _A2E_QUANT_MODES:
             raise RuntimeError(
