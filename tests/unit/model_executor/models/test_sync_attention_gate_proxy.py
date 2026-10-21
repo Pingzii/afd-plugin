@@ -47,7 +47,15 @@ class _RecordingConnector:
 
 
 def _fake_gate_topk(monkeypatch, events: list[tuple], topk_ids, topk_weights):
-    """Replace the gate helper with one that records and returns fixed routing."""
+    """Replace the gate helper with one that records and returns fixed routing.
+
+    The forward does ``from package import deepseek_v4_attention_gate``, and that
+    form checks the package attribute before falling back to an import. Setting
+    only ``sys.modules`` is therefore not enough once the real submodule has been
+    imported once; the package attribute is replaced as well.
+    """
+
+    import afd_plugin.model_executor.models.npu as npu_package
 
     helper = ModuleType("afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate")
 
@@ -63,6 +71,7 @@ def _fake_gate_topk(monkeypatch, events: list[tuple], topk_ids, topk_weights):
         "afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate",
         helper,
     )
+    monkeypatch.setattr(npu_package, "deepseek_v4_attention_gate", helper)
 
 
 def _shell(*, events, connector, shared_experts):
