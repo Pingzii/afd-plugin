@@ -128,6 +128,7 @@ def lifecycle_probe(role, dbo, *, serialized=None, fail=False):
     constructed = []
     modules = {}
     npu_module = types.ModuleType("afd_plugin.compat.npu")
+    npu_module.__path__ = []
     npu_module.__dict__["apply_afd_ascend_config_patch_if_needed"] = lambda: (
         namespace_calls.append(1)
     )
@@ -141,6 +142,19 @@ def lifecycle_probe(role, dbo, *, serialized=None, fail=False):
         lambda config: None
     )
     modules[npu_module.__name__] = npu_module
+
+    # The config hook also installs the process-scoped runtime overrides. Their
+    # own contracts live in their modules; here they only need to be importable.
+    probe_module = types.ModuleType("afd_plugin.compat.npu.debug_moe_comm_probe")
+    probe_module.__dict__["install_moe_comm_probe"] = lambda: False
+    modules[probe_module.__name__] = probe_module
+    force_allgather_module = types.ModuleType(
+        "afd_plugin.compat.patches.npu.force_allgather"
+    )
+    force_allgather_module.__dict__["apply_afd_force_allgather_patch_if_needed"] = (
+        lambda config: None
+    )
+    modules[force_allgather_module.__name__] = force_allgather_module
 
     class NPUPlatform:
         device_type = "npu"

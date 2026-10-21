@@ -237,8 +237,11 @@ def apply_afd_ascend_config_patch() -> None:
 # Patch reason: DP EngineCore initializes AscendConfig before vLLM loads
 # general plugins in the spawned process, so AFD's config namespace fails
 # strict validation before register_afd can install the namespace factory.
-# Patch functionality: install the AFD namespace factory in the child, then
-# run Ascend's complete EngineCore entry point unchanged.
+# Patch functionality: install the AFD namespace factory and the AFD path
+# overrides in the child, then run Ascend's complete EngineCore entry point
+# unchanged. ``vllm serve`` spawns this process, so patches installed while the
+# config was built are not inherited here, and installing them before the core
+# is constructed keeps the first forward on the intended path.
 # Signature: matches the upstream process target; no added parameters.
 # Removal plan: remove once Ascend initializes plugin config after general
 # plugins have loaded in every DP child.
@@ -253,6 +256,15 @@ def run_afd_ascend_engine_core(
     # ### PATCH START: AFD namespace before Ascend child config validation
     apply_afd_ascend_config_patch()
     # ### PATCH END: AFD namespace before Ascend child config validation
+    # ### PATCH START: AFD engine-core overrides before the core exists
+    from afd_plugin.compat.npu.debug_moe_comm_probe import install_moe_comm_probe
+    from afd_plugin.compat.patches.npu.force_allgather import (
+        apply_afd_force_allgather_patch_if_needed,
+    )
+
+    install_moe_comm_probe()
+    apply_afd_force_allgather_patch_if_needed(kwargs.get("vllm_config"))
+    # ### PATCH END: AFD engine-core overrides before the core exists
     return patch_engine_core._run_engine_core_patch_func(
         *args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs
     )
