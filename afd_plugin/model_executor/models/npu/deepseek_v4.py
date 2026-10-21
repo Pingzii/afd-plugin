@@ -630,9 +630,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
         from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl
 
-        from afd_plugin.compat.patches.npu.external_routing_prepare import (
-            apply_afd_external_routing_prepare_patch,
-        )
         from afd_plugin.connectors.npu.external_routing import (
             AFDExternalRoutingInputs,
         )
@@ -646,9 +643,9 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 "differently and is not verified yet.",
             )
 
-        # Installing is idempotent and only replaces the method, so doing it here
-        # keeps a partially configured process from running the unpatched version.
-        apply_afd_external_routing_prepare_patch()
+        # The ALLGATHER prepare patch is installed once during runtime start-up, not
+        # here: re-installing it per layer forward only repeats work, since the patch
+        # already behaves exactly like upstream when no routing was published.
 
         # The prepare patch reads the routing from this attribute and writes the
         # padded/gathered version back, so the two must be the same object.
