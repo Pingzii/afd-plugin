@@ -199,6 +199,8 @@ def test_camp2p_opaque_send_uses_current_stage_padding(monkeypatch, with_input_i
             int(with_input_ids),
             ids,
             scales,
+            # The operator takes the A2E quant mode last; 0 is the BF16 transport.
+            0,
         )
         wire = sent[-1][0]
         assert wire.shape == (physical, 16)
