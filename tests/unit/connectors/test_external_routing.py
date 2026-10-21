@@ -205,3 +205,25 @@ def test_expert_indices_reject_non_index_dtypes(inputs_type, dtype):
             topk_ids=torch.zeros((2, TOP_K), dtype=dtype),
             topk_weights=torch.zeros((2, TOP_K), dtype=torch.float32),
         )
+
+
+def test_split_rows_takes_one_rank_slice_and_drops_the_rest(inputs_type):
+    inputs = _inputs(inputs_type, rows=4)
+    taken = inputs.split_rows(lambda tensor: tensor[[1, 2]])
+    assert taken.token_count == 2
+    assert torch.equal(taken.topk_ids, inputs.topk_ids[[1, 2]])
+    assert torch.equal(taken.topk_weights, inputs.topk_weights[[1, 2]])
+    assert torch.equal(
+        taken.scale.view(torch.uint8),
+        inputs.scale.view(torch.uint8)[[1, 2]],
+    )
+
+
+def test_split_rows_without_scale_keeps_scale_absent(inputs_type):
+    inputs = inputs_type(
+        topk_ids=torch.zeros((4, TOP_K), dtype=torch.int32),
+        topk_weights=torch.zeros((4, TOP_K), dtype=torch.float32),
+    )
+    taken = inputs.split_rows(lambda tensor: tensor[[0]])
+    assert taken.scale is None
+    assert taken.token_count == 1

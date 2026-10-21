@@ -142,6 +142,21 @@ class AFDExternalRoutingInputs:
             scale=None if self.scale is None else _gather_scale(self.scale, all_gather),
         )
 
+    def split_rows(self, split) -> AFDExternalRoutingInputs:
+        """Keep one rank's slice, exactly as the activation is sliced.
+
+        MC2 shards the token dimension across TP ranks instead of gathering it, so
+        the routing has to take the same slice. ``split`` must be the split the
+        caller applies to the activation.
+        """
+
+        return replace(
+            self,
+            topk_ids=split(self.topk_ids),
+            topk_weights=split(self.topk_weights),
+            scale=None if self.scale is None else _split_scale(self.scale, split),
+        )
+
 
 def _require_2d(tensor: torch.Tensor, name: str) -> None:
     """Reject anything that is not a token-by-something matrix."""
@@ -184,6 +199,12 @@ def _gather_scale(scale: torch.Tensor, all_gather) -> torch.Tensor:
     """
 
     return all_gather(scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
+
+
+def _split_scale(scale: torch.Tensor, split) -> torch.Tensor:
+    """Slice an E8M0 scale through its byte view, for the same reason as gather."""
+
+    return split(scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
 
 
 __all__ = ["AFDExternalRoutingInputs", "SCALE_PAD_BYTE"]
