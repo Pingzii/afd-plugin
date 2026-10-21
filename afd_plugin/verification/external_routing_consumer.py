@@ -16,14 +16,29 @@ Two paths are compared for the same layer, activation and routing:
 The reference deliberately does not call the candidate, and does not go through the
 patch, so a defect in the patch shows up as a difference instead of cancelling out.
 
-Scale semantics: the Attention-side selector folds ``routed_scaling_factor`` into
-``topk_weights``, and the native FFN MoE is built with ``routed_scaling_factor=1.0``
-for exactly that reason. Both paths therefore carry the factor once, in the weights,
-and comparing the finalised routed output compares the same stage. The cases run at
-the configured factor and at an explicit non-1 factor so a missing or duplicated
-application cannot hide behind a factor of 1.
+Scale semantics -- corrected, and still open:
 
-Not performance work: nothing here should be quoted as a throughput result.
+The routing this consumer receives already carries whatever scaling the Attention
+selector applied, because the selector folds ``routed_scaling_factor`` into
+``topk_weights``. The consumer must therefore not scale again, and it does not.
+
+An earlier version of this docstring justified that by pointing at
+``routed_scaling_factor=1.0`` in ``_extract_async_cam_w4a8_layers``. That line
+belongs to the async layered-GMM weight export, not to the sync FFN MoE
+construction, so it is not evidence for this path. The sync construction only
+changes ``n_shared_experts``. Whether the sync consumer ends up scaling once follows
+from bypassing the native MoE outer layer and needs a numeric check, not a citation.
+
+Known blockers before this can be acceptance evidence:
+
+- the reference is not independent: it reuses the same alignment helper and the same
+  patched prepare, so a shared alignment defect cancels out. It needs its own
+  padding/gathering and the unpatched prepare with a placeholder ``router_logits``;
+- the per-rank case rows are clamped locally, which silently changes the case and can
+  leave other ranks waiting in a collective. The case matrix has to be agreed across
+  ranks and run in the same order everywhere, and a skipped case must fail the run.
+
+Until both are addressed, a pass here means the two paths agreed and nothing more.
 """
 
 from __future__ import annotations
@@ -51,9 +66,14 @@ LAYER_CASES: tuple[tuple[str, tuple[int, ...]], ...] = (
 class ScalingCase:
     """A routed-scaling factor to verify.
 
-    ``configured`` uses whatever the model was built with; ``explicit`` overrides the
-    Attention-side factor with a non-1 value, so an accidental duplicate application
-    changes the numbers.
+    The factor is multiplied into the routing weights here, mirroring what the
+    Attention selector does, so the consumer is checked against an already-scaled
+    routing. Every case carries a concrete value; the caller passes the model's own
+    factor as the "configured" case, because this module cannot read it and an earlier
+    sentinel-based version silently ran unscaled.
+
+    A pass proves the consumer does not rescale. It does not prove the selector folds
+    the factor correctly -- that is the Attention side's own check.
     """
 
     name: str
@@ -61,7 +81,7 @@ class ScalingCase:
 
 
 SCALING_CASES: tuple[ScalingCase, ...] = (
-    ScalingCase("configured", 0.0),  # 0.0 means "use the model's factor"
+    ScalingCase("configured", 1.0),  # replaced by the caller's model factor
     ScalingCase("explicit_1p5", 1.5),
 )
 
@@ -263,23 +283,30 @@ class _Plan:
     pad_size: int
 
 
-def _routing_for(experts, activation, factor):
-    """Build routing with the configured or an overridden scaling factor."""
+def _routing_for(experts, activation, factor, *, device, seed):
+    """Build routing already carrying ``factor``, on the worker's device.
+
+    The Attention selector folds the factor into the weights, so this multiplies here
+    as well. An earlier version treated ``0.0`` as "use the model's factor" but only
+    multiplied when the value was truthy, so the configured case silently ran
+    unscaled. ``factor`` is now always applied, and the caller resolves the
+    configured value before calling.
+    """
 
     import torch
 
+    generator = torch.Generator(device="cpu").manual_seed(seed)
     rows = int(activation.shape[0])
     top_k = int(experts.moe_config.experts_per_token)
     ids = torch.randint(
         0,
         int(experts.moe_config.num_experts),
         (rows, top_k),
+        generator=generator,
         dtype=torch.int32,
-    )
-    weights = torch.full((rows, top_k), 0.5 / top_k, dtype=torch.float32)
-    if factor:
-        weights = weights * factor
-    return ids, weights
+    ).to(device)
+    weights = torch.full((rows, top_k), 0.5 / top_k, dtype=torch.float32).to(device)
+    return ids, weights * factor
 
 
 __all__ = [
