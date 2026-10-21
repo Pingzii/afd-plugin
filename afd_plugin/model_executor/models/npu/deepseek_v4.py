@@ -24,7 +24,11 @@ from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import (
+    AFD_ASYNC_CONNECTOR,
+    CAMP2P_CONNECTOR,
+    parse_afd_config,
+)
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
@@ -734,9 +738,20 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
     # installs them in the forward context before the FFN compute.
     afd_requires_input_ids = True
 
+    # The wire slot carries either token ids or Attention-side routing, never both.
+    # When the router lives on Attention with the sync connector, the FFN side needs
+    # the routing instead of the ids, and the runner must ask for it by name.
+    afd_requires_attention_routing = False
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         self.afd_config = parse_afd_config(vllm_config, validate=False)
         self.afd_role = self.afd_config.role
+        # Per-instance, because the same model class serves both connectors and the
+        # async CAM shell carries its routing inside its own dispatch payload.
+        self.afd_requires_attention_routing = bool(
+            self.afd_config.compute_gate_on_attention
+            and self.afd_config.connector == CAMP2P_CONNECTOR
+        )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
     def get_async_cam_w4a8_layers(self) -> "tuple[list[W4A8LayerWeights], str]":
