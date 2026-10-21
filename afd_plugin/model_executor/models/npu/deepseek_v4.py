@@ -411,6 +411,13 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         self.config = config
         self.afd_role = afd_config.role
         self.compute_gate_on_attention = bool(afd_config.compute_gate_on_attention)
+        # Which wire protocol this layer expects, decided from the configuration.
+        # The payload only validates that expectation; it must not pick the path,
+        # because a missing or mixed payload would otherwise silently reroute.
+        self.uses_external_routing = bool(
+            afd_config.compute_gate_on_attention
+            and afd_config.connector == CAMP2P_CONNECTOR
+        )
         self.is_moe_layer = True
         # ### PATCH END: AFD decoder metadata
         cache_config = vllm_config.cache_config
@@ -520,22 +527,36 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             raise RuntimeError(
                 "DSV4 compute_ffn_output requires the FFN role to own the MoE"
             )
-        # Three F-side shapes share this entry point. Which one applies is decided
-        # by what arrived, not by the config alone, because the sync and async
-        # gate-on-Attention paths carry different payloads.
-        if topk_ids is not None or topk_weights is not None:
-            # Sync connector: the routing arrived on the wire slot.
+        # The configuration decides which protocol this layer speaks; the payload
+        # only has to satisfy it. Letting the payload choose would turn a missing or
+        # mixed payload into a silent reroute to a different computation.
+        cam_payload_present = group_list is not None
+        routing_payload_present = topk_ids is not None or topk_weights is not None
+
+        if self.uses_external_routing:
+            if cam_payload_present:
+                raise RuntimeError(
+                    "DSV4 sync external routing received CAM dispatch data as well; "
+                    "a layer speaks one protocol",
+                )
             if topk_ids is None or topk_weights is None:
                 raise RuntimeError(
-                    "DSV4 external routing needs both topk_ids and topk_weights; "
-                    f"got ids={topk_ids is not None}, weights={topk_weights is not None}",
+                    "DSV4 sync external routing requires both topk_ids and "
+                    f"topk_weights; got ids={topk_ids is not None}, "
+                    f"weights={topk_weights is not None}",
                 )
             return self._compute_external_routing_ffn(
                 hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
             )
+
         if self.compute_gate_on_attention:
+            if routing_payload_present:
+                raise RuntimeError(
+                    "DSV4 async CAM routing received a wire-slot routing payload as "
+                    "well; a layer speaks one protocol",
+                )
             if group_list is None:
                 raise RuntimeError(
                     "DSV4 Attention-side routing requires CAM group_list on FFN",
@@ -556,6 +577,12 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 # DSV4's Attention-side CANN gate folds routed scaling into
                 # topk_weights, which CAM applies during combine-recv.
                 routed_scale_applied_in_topk=True,
+            )
+
+        if routing_payload_present or cam_payload_present:
+            raise RuntimeError(
+                "DSV4 gate-on-FFN received Attention-side routing; the FFN side owns "
+                "the gate for this configuration and must compute it itself",
             )
         # Target Hash MoE takes explicit token IDs from the CAM transfer.
         return self.mlp(hidden_states, input_ids=get_forward_context().input_ids)

@@ -344,14 +344,18 @@ class AFDNPUFFNModelRunner:
                     assert states, "Context.states must not be None"
                     _set_moe_layer_index(forward_context, layer_idx)
 
+                    # Only a model that declared Attention-side routing gets the
+                    # extra keywords. Passing them unconditionally changes the call
+                    # contract for every other model wrapper, including ones that
+                    # accept only (hidden_states, layer_idx).
+                    ffn_kwargs: dict[str, Any] = {}
+                    if recv_routing:
+                        ffn_kwargs["topk_ids"] = payload.topk_ids
+                        ffn_kwargs["topk_weights"] = payload.topk_weights
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
-                        # Attention-side routing arrives on the payload when the
-                        # model declared it; passing both through keeps the branch
-                        # decision in the decoder layer rather than here.
-                        topk_ids=payload.topk_ids,
-                        topk_weights=payload.topk_weights,
+                        **ffn_kwargs,
                     )
                     _send_ffn_output(
                         self.connector,
