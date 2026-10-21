@@ -143,3 +143,32 @@ def test_dry_run_names_every_case_and_the_reference_requirement(verification):
     # The independence requirement must survive into the printed plan.
     assert "unpatched prepare" in rendered
     assert "ALLGATHER -> MC2 -> ALLGATHER" in rendered
+
+
+def test_dry_run_exits_zero(verification, capsys):
+    assert verification.main(["--dry-run"]) == 0
+    assert "uniform_bf16" in capsys.readouterr().out
+
+
+def test_a_run_without_a_device_exits_two(verification, capsys):
+    """A missing NPU must not look like a pass."""
+
+    try:
+        import torch_npu  # noqa: F401
+    except Exception:
+        assert verification.main([]) == 2
+        assert "needs an NPU host" in capsys.readouterr().err
+    else:  # pragma: no cover - the CPU host used for these checks has no torch_npu
+        pytest.skip("torch_npu is available on this host")
+
+
+def test_model_path_precedence(verification, monkeypatch):
+    """Explicit wins over env, env wins over the recorded checkpoint."""
+
+    monkeypatch.delenv("DSV4_MODEL_PATH", raising=False)
+    assert verification.resolve_model_path() == verification.DEFAULT_MODEL_PATH
+    assert verification.DEFAULT_MODEL_PATH.startswith("/mnt/share/weight/")
+
+    monkeypatch.setenv("DSV4_MODEL_PATH", "/tmp/from-env")
+    assert verification.resolve_model_path() == "/tmp/from-env"
+    assert verification.resolve_model_path("/tmp/explicit") == "/tmp/explicit"

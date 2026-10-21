@@ -2,27 +2,41 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Compare the native routing path with the external-routing prepare patches.
 
-The prepare patches are only useful if feeding Attention-side routing through
-them yields the same routed output the native path produces for the same routing.
-That comparison needs a device: it runs the real ``comm.prepare()``, the target
-quant method's ``apply()`` and ``comm.finalize()``.
+The prepare patches only matter if Attention-side routing through them yields the
+same routed output the native path produces for the same routing. That comparison
+runs on a device, in two levels:
+
+- **Communication level** — a real multi-rank HCCL group, ``prepare``, a
+  hand-built routed contribution, ``finalize``. Proves row identity, padding,
+  ``mc2_mask``, scale transport and the reduce/trim, without needing expert
+  weights. A stubbed group does not count: it only re-tests CPU framework logic.
+- **Expert level** — the production-loaded W4A8MXFP experts, ``prepare`` then
+  ``apply`` then ``finalize``. Proves the full routed values agree. Both sides must
+  use the same weights and the same routing, the reference ``prepare`` must be the
+  unpatched one, and the comparison must exclude the shared-expert output and
+  apply routed scaling exactly once.
+
+Neither level can run from this entry point: both need a normally-initialised FFN
+worker, because that worker owns the HCCL groups and the production weight loading
+(``AFDNPUFFNModelRunner.load_model`` → native ``loader.load_model``). Constructing a
+runner without initialisation, or fabricating packed FP4 weights, would not
+exercise the production path.
 
 This module holds the part that does not need a device: the case matrix, the
 result formatting, and the comparison itself once two routed tensors exist.
-``--dry-run`` prints the matrix without touching a device, so a green-zone run can
-be prepared and reviewed from the blue zone.
-
-Reference independence: the device half must compute the reference with the
-unpatched ``prepare`` (saved before the installer runs) and only then install the
-patch. Sharing one code path for both sides would let a bug cancel itself out.
+``--dry-run`` prints the matrix without touching a device.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Final
+
+# Checkpoint the FFN serve script records; DSV4_MODEL_PATH or --model overrides it.
+DEFAULT_MODEL_PATH: Final[str] = "/mnt/share/weight/DeepSeek-V4-Flash"
 
 # Absolute tolerance for BF16 activations through a W4A8MXFP expert stack. The
 # comparison reports the measured error as well, so a near miss is visible rather
@@ -223,6 +237,14 @@ def render_dry_run(cases: tuple[RoutingCase, ...] = DEFAULT_CASES) -> str:
     return "\n".join(lines)
 
 
+def resolve_model_path(explicit: str | None = None) -> str:
+    """Resolve the checkpoint directory: explicit, then env, then the recorded one."""
+
+    if explicit:
+        return explicit
+    return os.environ.get("DSV4_MODEL_PATH", DEFAULT_MODEL_PATH)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -230,7 +252,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print the case matrix and exit without touching a device",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "checkpoint directory for the expert-path level; defaults to "
+            "DSV4_MODEL_PATH or the path the FFN serve script records"
+        ),
+    )
     args = parser.parse_args(argv)
+    model_path = resolve_model_path(args.model)
 
     if args.dry_run:
         print(render_dry_run())
@@ -249,8 +280,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    print("device comparison is driven by tests/npu/test_external_routing_paths.py")
-    return 0
+    # The device levels run inside a normally-initialised FFN worker: they need its
+    # real HCCL groups and its production-loaded W4A8MXFP experts, which cannot be
+    # recreated here. Report that instead of exiting 0, so a wrapper never mistakes
+    # "nothing ran" for "the comparison passed".
+    print(
+        "device comparison is not available from this entry point: it must run "
+        "inside an initialised FFN worker, which owns the HCCL groups and the "
+        f"loaded experts (checkpoint: {model_path}). "
+        "Use --dry-run to inspect the matrix, or run the FFN worker verification.",
+        file=sys.stderr,
+    )
+    return 3
 
 
 if __name__ == "__main__":
@@ -265,5 +306,6 @@ __all__ = [
     "DEFAULT_RTOL",
     "RoutingCase",
     "compare_routed",
+    "resolve_model_path",
     "render_dry_run",
 ]
