@@ -136,6 +136,10 @@ extend-ignore-words-re = [
     "(?i)^tbe$",
 ]
 extend-ignore-identifiers-re = [
+    # Git short (7-char) and full (40-char) commit hashes quoted in docs
+    # (e.g. `c8afe37`): digit-split segments trip the dictionary (afe->safe).
+    "^[0-9a-f]{7}$",
+    "^[0-9a-f]{40}$",
     ".*_thw",
     ".*thw",
     "ein",

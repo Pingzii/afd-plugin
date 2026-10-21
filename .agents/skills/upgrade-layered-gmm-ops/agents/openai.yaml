@@ -1,0 +1,4 @@
+interface:
+  display_name: "Upgrade A3 Layered GMM Operators"
+  short_description: "Replay A3 layered GMM changes onto a new ops-transformer revision"
+  default_prompt: "Use $upgrade-layered-gmm-ops to migrate the A3 layered GMM operators to a new ops-transformer revision."
