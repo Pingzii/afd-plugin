@@ -252,3 +252,71 @@ def test_missing_router_logits_and_dp_size_one_is_a_noop(monkeypatch):
     assert output.router_logits is None
     assert dp_group.calls == []
     assert subject.afd_external_routing.topk_ids.shape[0] == 2
+
+
+def test_bf16_transfer_without_scale_keeps_rows_paired(monkeypatch):
+    """The next stage runs BF16 with no scale; rows must still line up.
+
+    Every activation row carries its own marker, so a padding or gather bug shows
+    up as a mismatched marker instead of passing on shapes alone.
+    """
+
+    _, context = _install_fake_upstream(monkeypatch)
+    patch = _load_patch_module(monkeypatch)
+    context.max_tokens_across_dp = 3
+    dp_group = _FakeDpGroup(dp_size=2)
+
+    inputs_type = _routing_inputs_type()
+    ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    weights = torch.full((2, TOP_K), 0.5, dtype=torch.float32)
+    subject = _prepared_self(
+        dp_group,
+        inputs_type(topk_ids=ids, topk_weights=weights),
+    )
+
+    # Two local rows: row 0 filled with 10, row 1 with 20.
+    hidden_states = torch.stack(
+        [torch.full((HIDDEN,), 10.0), torch.full((HIDDEN,), 20.0)],
+    ).to(torch.bfloat16)
+    output = patch.prepare_with_dp_group(
+        subject,
+        hidden_states=hidden_states,
+        router_logits=None,
+    )
+
+    gathered = subject.afd_external_routing
+    assert output.hidden_states.dtype == torch.bfloat16
+    assert output.hidden_states.shape[0] == 6
+    assert gathered.token_count == 6
+    # A BF16 transfer carries no scale, and none was invented.
+    assert gathered.scale is None
+    assert output.pertoken_scale is None
+    # Row r of the routing still names the row-r marker, and the padding row
+    # lines up with a zeroed activation row.
+    for row, marker, expected_ids in (
+        (0, 10.0, [0, 1]),
+        (1, 20.0, [2, 3]),
+        (2, 0.0, [0, 0]),
+    ):
+        assert output.hidden_states[row].float().max().item() == marker
+        assert gathered.topk_ids[row].tolist() == expected_ids
+
+
+def test_routing_with_a_different_token_count_is_rejected(monkeypatch):
+    """Different row counts pad to different totals, misaligning the result."""
+
+    _, context = _install_fake_upstream(monkeypatch)
+    patch = _load_patch_module(monkeypatch)
+    context.max_tokens_across_dp = 3
+    dp_group = _FakeDpGroup(dp_size=2)
+    subject = _prepared_self(dp_group, _routing(rows=1))
+
+    with pytest.raises(ValueError, match="different token count"):
+        patch.prepare_with_dp_group(
+            subject,
+            hidden_states=torch.zeros(2, HIDDEN),
+            router_logits=None,
+        )
+
+    # The check runs before any collective, so nothing was gathered.
+    assert dp_group.calls == []

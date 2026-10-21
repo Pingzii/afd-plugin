@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
 import torch.nn as nn
 
 from vllm.distributed.parallel_state import get_pcp_group
@@ -49,8 +50,8 @@ PrepareAndFinalizeWithAllGather.afd_external_routing = None
 # Signature: matches upstream; no added parameters.
 def prepare_with_dp_group(
     self,
-    hidden_states,
-    router_logits,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
     replace_allreduce: bool = False,
     quant_type=QuantType.NONE,
 ) -> MoEPrepareOutput:
@@ -65,6 +66,15 @@ def prepare_with_dp_group(
     """
     # ### PATCH START: routing may be precomputed on the Attention side
     external = self.afd_external_routing
+    # The routing only describes this rank's rows, so it has to start from the
+    # same row count as the activation. Mismatched counts pad to different
+    # totals and the gathered ids silently describe the wrong tokens.
+    if external is not None and external.token_count != hidden_states.shape[0]:
+        raise ValueError(
+            "external routing covers a different token count than the activation: "
+            f"{external.token_count} routing rows for "
+            f"{hidden_states.shape[0]} activation rows",
+        )
     # ### PATCH END: routing may be precomputed on the Attention side
     if self.moe_config.dp_size > 1:
         max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
@@ -143,7 +153,13 @@ def prepare_with_dp_group(
 
 
 def apply_afd_external_routing_prepare_patch() -> bool:
-    """Install the ALLGATHER prepare patch. Safe to call more than once."""
+    """Install the ALLGATHER prepare patch.
+
+    Call once during runtime initialisation, not per forward. Repeating it is
+    harmless because it assigns the same function, but the FFN-side consumer owns
+    the per-call state (writing and reading the stash, and clearing it in a
+    ``finally``) rather than re-installing the patch.
+    """
 
     PrepareAndFinalizeWithAllGather._prepare_with_dp_group = prepare_with_dp_group
     return True
