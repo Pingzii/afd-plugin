@@ -187,9 +187,19 @@ def _fail_if_unsupported_sync_attention_gate(
     gate plus MXFP8 transport additionally needs the MC2 dispatcher to accept a
     pre-quantized activation and its E8M0 scale, which is not verified on a device
     yet; allowing it would produce wrong numerics rather than an error.
+
+    DBO and ubatching are rejected rather than merely unused: the sync shell does not
+    call the DBO yield, so enabling DBO here would interleave microbatches against a
+    transport that never yields. Not calling the yield is not the same as forbidding
+    the feature.
     """
 
-    del vllm_config
+    parallel = vllm_config.parallel_config
+    if bool(parallel.enable_dbo) or bool(parallel.use_ubatching):
+        raise RuntimeError(
+            "Attention-side gate with the synchronous connector does not support "
+            "DBO or ubatching yet",
+        )
     if afd_config.connector != CAMP2P_CONNECTOR:
         raise RuntimeError(
             "Attention-side gate is only supported with "
