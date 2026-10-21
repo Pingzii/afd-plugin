@@ -63,8 +63,15 @@ def fail_if_unsupported_npu_afd_features(
         return
 
     if afd_config.compute_gate_on_attention:
-        raise RuntimeError(
-            "AFD NPU runtime does not support compute_gate_on_attention=true yet",
+        # The sync Attention-side gate prototype is deliberately narrow: one
+        # connector, the target model, and BF16 transport. The gate plus MXFP8
+        # transport needs the MC2 FP8 contract first, which is not verified yet, so
+        # it stays rejected rather than silently producing wrong numerics.
+        _fail_if_unsupported_sync_attention_gate(
+            vllm_config,
+            afd_config,
+            extra_info,
+            is_dsv4=is_dsv4,
         )
     if afd_config.connector == CAMP2P_CONNECTOR:
         from afd_plugin.connectors.npu.camp2p import (
@@ -164,6 +171,47 @@ def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
         raise RuntimeError(
             "DSV4 NPU AFD supports only CAMAsyncAFDConnector and "
             f"CAMP2pAFDConnector; got {afd_config.connector!r}",
+        )
+
+
+def _fail_if_unsupported_sync_attention_gate(
+    vllm_config: VllmConfig,
+    afd_config: AFDConfig,
+    extra_info: object,
+    *,
+    is_dsv4: bool,
+) -> None:
+    """Restrict the sync Attention-side gate prototype to what it supports today.
+
+    The gate move has only been wired for BF16 transport on the sync connector. The
+    gate plus MXFP8 transport additionally needs the MC2 dispatcher to accept a
+    pre-quantized activation and its E8M0 scale, which is not verified on a device
+    yet; allowing it would produce wrong numerics rather than an error.
+    """
+
+    del vllm_config
+    if afd_config.connector != CAMP2P_CONNECTOR:
+        raise RuntimeError(
+            "Attention-side gate is only supported with "
+            f"{CAMP2P_CONNECTOR}, got {afd_config.connector!r}",
+        )
+    if not is_dsv4:
+        raise RuntimeError(
+            "Attention-side gate is only supported for the DeepSeek V4 target",
+        )
+    from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
+    from afd_plugin.envs import A2E_QUANT_MODE_MXFP8
+
+    if not isinstance(extra_info, CAMP2PExtraInfo):
+        raise TypeError(
+            "CAMP2pAFDConnector requires CAMP2PExtraInfo, got "
+            f"{type(extra_info).__name__}",
+        )
+    if extra_info.quant_mode == A2E_QUANT_MODE_MXFP8:
+        raise RuntimeError(
+            "Attention-side gate with A2E MXFP8 transport is not verified yet: "
+            "the FFN side must pass a pre-quantized activation and its E8M0 scale "
+            "through the MC2 dispatcher first. Use quant_mode=0.",
         )
 
 
