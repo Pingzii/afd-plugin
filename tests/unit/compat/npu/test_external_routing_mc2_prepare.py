@@ -200,7 +200,9 @@ def test_tp_sharding_takes_the_same_slice_for_routing(monkeypatch):
     _, context = _install_fake_upstream(monkeypatch)
     patch = _load_patch_module(monkeypatch)
     context.padded_num_tokens = 4
-    context.mc2_mask = torch.ones(4, dtype=torch.bool)
+    # Explicit valid bits, so a wrong slice is visible: rank 1 must keep the
+    # true bit from column 2 and the false bit from column 3.
+    context.mc2_mask = torch.tensor([True, True, True, False])
     subject = _subject(tp_size=2, tp_rank=1, external=_routing(rows=4))
 
     output = patch.prepare(
@@ -214,6 +216,28 @@ def test_tp_sharding_takes_the_same_slice_for_routing(monkeypatch):
     assert output.hidden_states[0, 0].item() == 4.0
     assert subject.afd_external_routing.token_count == 2
     assert subject.afd_external_routing.topk_ids[0].tolist() == [4, 5]
+    # The mask keeps its own bits, not just its length.
+    assert output.mc2_mask.tolist() == [True, False]
+
+
+def test_sp_branch_keeps_the_mask_bits_it_owns(monkeypatch):
+    """In the SP branch the mask is sliced by shard, then padded with False."""
+
+    _, context = _install_fake_upstream(monkeypatch)
+    patch = _load_patch_module(monkeypatch)
+    context.padded_num_tokens = 4
+    context.mc2_mask = torch.tensor([True, False, True, True])
+    subject = _subject(tp_size=2, tp_rank=0, external=_routing(rows=1))
+
+    output = patch.prepare(
+        subject,
+        hidden_states=torch.zeros(1, HIDDEN),
+        router_logits=None,
+        replace_allreduce=True,
+    )
+
+    # One local row from shard 0 is [True]; the padding row is False.
+    assert output.mc2_mask.tolist() == [True, False]
 
 
 def test_replace_allreduce_pads_the_local_shard(monkeypatch):
