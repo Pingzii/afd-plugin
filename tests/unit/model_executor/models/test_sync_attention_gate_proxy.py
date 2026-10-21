@@ -24,7 +24,8 @@ torch = pytest.importorskip("torch")
 # partial vLLM install where `import vllm` succeeds but this one does not.
 pytest.importorskip("vllm.forward_context")
 
-from afd_plugin.model_executor.models import deepseek_v4 as adapter  # noqa: E402
+# The NPU adapter; the CUDA module of the same name has no sync gate shell.
+from afd_plugin.model_executor.models.npu import deepseek_v4 as adapter  # noqa: E402
 
 TOP_K = 2
 HIDDEN = 4
@@ -69,14 +70,17 @@ def _shell(*, events, connector, shared_experts):
 
     The forward only needs the layer index and the shared-expert module, so the
     linear layers the constructor would build are irrelevant here.
+
+    ``shared_experts`` is a presence flag: True installs a recorder-backed module,
+    False leaves the slot empty.
     """
 
+    del connector  # the connector arrives through the forward metadata
     shell = object.__new__(adapter.AFDDeepseekV4SyncAttentionGateRemoteMoE)
     torch.nn.Module.__init__(shell)
     shell.layer_idx = LAYER_IDX
-    if shared_experts is None:
-        shell.shared_experts = None
-    else:
+    shell.shared_experts = None
+    if shared_experts:
 
         class _Shared(torch.nn.Module):
             def forward(self, hidden_states):
