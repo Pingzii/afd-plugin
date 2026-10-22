@@ -117,20 +117,40 @@ class VerificationRecord:
         return "\n".join(lines)
 
 
-def _align_by_hand(activation, topk_ids, topk_weights, plan, gather):
-    """Pad and gather the routing without the patch, using the documented rule."""
+def _align_routing_independently(topk_ids, topk_weights, pad_size, gather):
+    """Pad and gather the routing with plain PyTorch.
 
-    from afd_plugin.connectors.npu.external_routing import (
-        AFDExternalRoutingInputs,
-    )
+    Deliberately does not use ``AFDExternalRoutingInputs.padded``/``gathered``: those
+    are what the candidate path runs through, so reusing them would let a defect in
+    that helper cancel out on both sides of the comparison.
 
-    routing = AFDExternalRoutingInputs(
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-    ).padded(plan.pad_size)
-    if gather is not None:
-        routing = routing.gathered(gather)
-    return activation, routing
+    Scope: DP-level ALLGATHER, BF16 activations, one routing row per token. PCP and
+    SP sharding use different rules and are not covered.
+    """
+
+    import torch
+
+    pad_rows = pad_size
+    if pad_rows < 0:
+        raise ValueError(f"pad_size {pad_rows} is negative")
+    if pad_rows > 0:
+        id_pad = torch.zeros(
+            (pad_rows, topk_ids.shape[1]),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        weight_pad = torch.zeros(
+            (pad_rows, topk_weights.shape[1]),
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        padded_ids = torch.cat([topk_ids, id_pad], dim=0)
+        padded_weights = torch.cat([topk_weights, weight_pad], dim=0)
+    else:
+        padded_ids, padded_weights = topk_ids, topk_weights
+    if gather is None:
+        return padded_ids, padded_weights
+    return gather(padded_ids), gather(padded_weights)
 
 
 def _run_reference(
@@ -144,20 +164,45 @@ def _run_reference(
     experts,
     comm,
 ):
-    """Run prepare/apply/finalize with hand-aligned routing and no patch."""
+    """Run the unpatched prepare with independently aligned routing.
 
+    Reads the captured upstream function from its module attribute rather than
+    importing it by name: a module-level ``from ... import`` binding is resolved once,
+    and could hold ``None`` if it was bound before the installer ran.
+
+    Calls that function directly instead of ``comm.prepare``, because ``comm.prepare``
+    may still route through the patch depending on how the class was wired.
+    """
+
+    import torch
     from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl
 
-    aligned_activation, routing = _align_by_hand(
-        activation,
+    from afd_plugin.compat.patches.npu import external_routing_prepare
+
+    upstream_prepare = external_routing_prepare.ORIGINAL_PREPARE_WITH_DP_GROUP
+    if upstream_prepare is None:
+        raise RuntimeError(
+            "the upstream prepare was not captured; the verification reference "
+            "cannot run and would otherwise compare the patch against itself",
+        )
+
+    aligned_ids, aligned_weights = _align_routing_independently(
         topk_ids,
         topk_weights,
-        plan,
+        plan.pad_size,
         gather,
     )
-    output = comm.prepare(
-        hidden_states=aligned_activation,
-        router_logits=None,
+    # The upstream prepare requires logits and derives the row count from them. The
+    # activation is aligned by that same call, once, so this must not pre-gather it.
+    placeholder_logits = torch.zeros(
+        (int(activation.shape[0]), int(experts.moe_config.num_experts)),
+        dtype=torch.float32,
+        device=activation.device,
+    )
+    output = upstream_prepare(
+        comm.prepare_finalize,
+        hidden_states=activation,
+        router_logits=placeholder_logits,
         replace_allreduce=experts.moe_config.is_sequence_parallel,
         quant_type=experts.quant_type,
     )
@@ -167,8 +212,8 @@ def _run_reference(
         fused = experts.quant_method.apply(
             layer=experts,
             x=output.hidden_states,
-            topk_weights=routing.topk_weights,
-            topk_ids=routing.topk_ids,
+            topk_weights=aligned_weights,
+            topk_ids=aligned_ids,
             shared_experts=None,
             shared_experts_input=None,
         )
@@ -189,14 +234,20 @@ def verify_layer(
     local_rows: int,
     hidden_size: int,
     dp_rank: int,
+    device,
+    seed: int = 0,
     tolerance=None,
 ) -> None:
     """Compare both paths for one decoder layer and record every case.
 
-    The caller supplies the worker-loaded layer and the three facts only it can know:
-    this rank's local row count, the hidden width, and this rank's DP index. Reading
-    them from the forward context would not work -- it exposes neither the rank nor
-    the width -- and guessing would silently compare the wrong shapes.
+    The caller supplies the worker-loaded layer and the facts only it can know: this
+    rank's local row count, the hidden width, this rank's DP index, and the device the
+    experts live on. Reading them from the forward context would not work -- it exposes
+    neither the rank nor the width -- and guessing would silently compare the wrong
+    shapes or run on the wrong device.
+
+    ``seed`` is fixed so a rerun reproduces the same activations and routing; it is not
+    a determinism claim about the collective itself.
 
     Weights, communication groups and the quant method all come from the production
     path. Anything unavailable is recorded as skipped rather than treated as a pass.
@@ -240,15 +291,20 @@ def verify_layer(
         case_rows = min(case_rows, local_rows, max_rows)
         plan = _Plan(pad_size=max_rows - case_rows)
         for scaling in SCALING_CASES:
+            # Both paths must run on the experts' device; a CPU activation compared
+            # against an NPU result would fail for the wrong reason.
             activation = torch.randn(
                 case_rows,
                 hidden_size,
                 dtype=torch.bfloat16,
+                device=device,
             )
             topk_ids, topk_weights = _routing_for(
                 experts,
                 activation,
                 scaling.factor,
+                device=device,
+                seed=seed,
             )
             reference = _run_reference(
                 layer,
