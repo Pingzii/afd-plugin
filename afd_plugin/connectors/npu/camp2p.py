@@ -961,11 +961,11 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             # experts quantize their own input, so both need a model-dtype tensor
             # regardless, and the MoE then quantizes it for its GMM as usual.
             #
-            # The scale is kept alongside the restored activation so a consumer that
-            # can take the quantized form later does not have to recover it. Today
-            # nothing reads it: this step still dequantizes, and dropping the scale
-            # here is what made an MXFP8 transport indistinguishable from a working
-            # pass-through.
+            # The scale is kept alongside the restored activation, but the two are
+            # not a pair: this step already dequantized, so the scale describes the
+            # activation that arrived, not what is in ``received_activation``. It is
+            # reported so a later change can keep both, and it must not be handed to
+            # an expert path that skips quantization when a scale is present.
             received_activation_scale = outputs[5]
             received_activation = mx_dequantize_a2e_activation(
                 received_activation, outputs[5]
