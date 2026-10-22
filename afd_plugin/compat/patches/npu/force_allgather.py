@@ -25,12 +25,6 @@ import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from vllm_ascend.device.hardware_profile import (
-    HardwareProfile,
-    MoECommPolicy,
-    get_current_hardware_profile as get_upstream_hardware_profile,
-)
-
 from afd_plugin.config import (
     CAMP2P_CONNECTOR,
     connector_extra_config_from_source,
@@ -40,6 +34,7 @@ from afd_plugin.config_utils import coerce_extra_bool
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm_ascend.device.hardware_profile import HardwareProfile
 
 _FORCE_ALLGATHER_FIELD = "force_allgather"
 
@@ -57,6 +52,15 @@ _FORCE_ALLGATHER_FIELD = "force_allgather"
 # on every selected path.
 def get_current_hardware_profile() -> HardwareProfile:
     """Return the active hardware profile with the policy pinned to ALLGATHER."""
+
+    # Imported here rather than at module scope: this module is imported while a
+    # config is built and validated, and that stage has no need for vLLM-Ascend's
+    # hardware modules. The switch is off by default, so the usual path never pays
+    # for the import at all.
+    from vllm_ascend.device.hardware_profile import (
+        MoECommPolicy,
+        get_current_hardware_profile as get_upstream_hardware_profile,
+    )
 
     profile = get_upstream_hardware_profile()
     # ### PATCH START: AFD pins the MoE communication policy

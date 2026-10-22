@@ -33,23 +33,12 @@ def apply_afd_ascend_config_patch_if_needed() -> None:
     from afd_plugin.compat.patches.npu.ascend_platform import (
         apply_afd_ascend_dbo_config_patch,
     )
-    from afd_plugin.compat.patches.npu.external_routing_mc2_prepare import (
-        apply_afd_external_routing_mc2_prepare_patch,
-    )
-    from afd_plugin.compat.patches.npu.external_routing_prepare import (
-        apply_afd_external_routing_prepare_patch,
-    )
 
     apply_afd_ascend_config_patch()
     if not apply_afd_ascend_dbo_config_patch():
         raise RuntimeError(
             "AFD NPU DBO config patch requires vLLM-Ascend NPUPlatform",
         )
-    # Installed once here rather than per layer forward: both replacements are no-ops
-    # when no routing was published, so every existing configuration behaves as
-    # before, and a forward never pays for re-installing them.
-    apply_afd_external_routing_prepare_patch()
-    apply_afd_external_routing_mc2_prepare_patch()
 
 
 def apply_afd_async_dp_engine_patch_if_needed(vllm_config: VllmConfig) -> bool:
@@ -101,6 +90,12 @@ def apply_afd_ascend_patches_if_needed() -> None:
     if _PATCHES_APPLIED:
         return
 
+    from afd_plugin.compat.patches.npu.external_routing_mc2_prepare import (
+        apply_afd_external_routing_mc2_prepare_patch,
+    )
+    from afd_plugin.compat.patches.npu.external_routing_prepare import (
+        apply_afd_external_routing_prepare_patch,
+    )
     from afd_plugin.compat.patches.npu.mla_graph import (
         apply_afd_mla_graph_patch,
     )
@@ -110,6 +105,13 @@ def apply_afd_ascend_patches_if_needed() -> None:
         raise RuntimeError(
             "AFD NPU MLA graph patch requires the vLLM-Ascend MLA resolver",
         )
+    # The routing patches replace the MoE prepare path, so they belong here rather
+    # than in the config stage: importing them pulls vLLM-Ascend's MoE internals,
+    # which a process that only builds and validates a config does not need. This
+    # runs from the worker constructor, before any model load, warm-up or forward,
+    # and the guard above keeps it to one install per process.
+    apply_afd_external_routing_prepare_patch()
+    apply_afd_external_routing_mc2_prepare_patch()
     _PATCHES_APPLIED = True
 
 
