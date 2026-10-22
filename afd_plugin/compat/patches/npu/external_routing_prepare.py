@@ -152,20 +152,44 @@ def prepare_with_dp_group(
     )
 
 
-def apply_afd_external_routing_prepare_patch() -> bool:
-    """Install the ALLGATHER prepare patch.
+# The upstream implementation, captured before the first replacement. A verification
+# reference has to run the unpatched prepare, and re-deriving it later is unsound: once
+# the class attribute points at the patch, "the original" is whatever the patch would
+# call, which defeats the purpose of an independent control.
+ORIGINAL_PREPARE_WITH_DP_GROUP = None
 
-    Call once during runtime initialisation, not per forward. Repeating it is
-    harmless because it assigns the same function, but the FFN-side consumer owns
-    the per-call state (writing and reading the stash, and clearing it in a
-    ``finally``) rather than re-installing the patch.
+
+def apply_afd_external_routing_prepare_patch() -> bool:
+    """Install the ALLGATHER prepare patch and keep the upstream implementation.
+
+    Call once during runtime initialisation, not per forward. The captured original is
+    written only once: a second install keeps the first capture, so a later re-import
+    cannot replace the control with the patch.
+
+    Raises:
+        RuntimeError: If the class attribute already holds this patch. That means the
+            original was overwritten before it could be captured, and the captured
+            reference would silently be the patch itself.
     """
 
+    global ORIGINAL_PREPARE_WITH_DP_GROUP
+    current = PrepareAndFinalizeWithAllGather._prepare_with_dp_group
+    if current is prepare_with_dp_group:
+        if ORIGINAL_PREPARE_WITH_DP_GROUP is None:
+            raise RuntimeError(
+                "AFD external routing prepare patch was installed before the upstream "
+                "implementation could be captured; the verification reference would "
+                "compare the patch against itself",
+            )
+        return False
+    if ORIGINAL_PREPARE_WITH_DP_GROUP is None:
+        ORIGINAL_PREPARE_WITH_DP_GROUP = current
     PrepareAndFinalizeWithAllGather._prepare_with_dp_group = prepare_with_dp_group
     return True
 
 
 __all__ = [
+    "ORIGINAL_PREPARE_WITH_DP_GROUP",
     "apply_afd_external_routing_prepare_patch",
     "prepare_with_dp_group",
 ]
