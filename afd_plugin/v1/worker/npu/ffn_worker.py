@@ -20,6 +20,7 @@ from vllm_ascend.worker.worker import NPUWorker
 
 from afd_plugin.compat.npu import (
     apply_afd_ascend_patches_if_needed,
+    apply_afd_worker_runtime_hooks,
     fail_if_unsupported_npu_afd_features,
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
@@ -84,6 +85,10 @@ class AFDNPUFFNWorker(NPUWorker):
             expected_role="ffn",
             expected_worker_qualname_override=NPU_FFN_WORKER_FQCN,
         )
+        # The worker is spawned and its config arrives unpickled, so the config-build
+        # hooks never ran in this process. Anything that has to be in place before the
+        # first forward is installed here.
+        apply_afd_worker_runtime_hooks(self.vllm_config)
         fail_if_unsupported_npu_afd_features(self.vllm_config)
         fix_all2all_backend_for_afd(self.vllm_config)
         validate_npu_model_runner_v2_config(

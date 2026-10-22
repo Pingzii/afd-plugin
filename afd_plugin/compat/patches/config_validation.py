@@ -167,19 +167,13 @@ def _apply_afd_npu_config_patches(config: EngineArgs | VllmConfig) -> bool:
         return False
 
     from afd_plugin.compat.npu import apply_afd_ascend_config_patch_if_needed
-    from afd_plugin.compat.npu.debug_moe_comm_probe import install_moe_comm_probe
 
     apply_afd_ascend_config_patch_if_needed()
-    # Observation only; a no-op unless AFD_DEBUG_MOE_COMM=1.
-    install_moe_comm_probe()
-    # Runs in the front-end during engine-argument parsing and again when the
-    # engine core revalidates the config in a child process, so the ALLGATHER
-    # pin lands in every process that can select a communication path.
-    from afd_plugin.compat.patches.npu.force_allgather import (
-        apply_afd_force_allgather_patch_if_needed,
-    )
-
-    apply_afd_force_allgather_patch_if_needed(config)
+    # The communication-path hooks are deliberately absent here. A worker is spawned
+    # and its config arrives unpickled, so this function never runs in the process
+    # that executes the forward -- installing them here only covered the front-end and
+    # the engine core, and the workers silently kept upstream's selection. They are
+    # installed from the worker's init_device and from the engine-core entry instead.
     return True
 
 

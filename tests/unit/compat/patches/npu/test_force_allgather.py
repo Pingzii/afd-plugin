@@ -227,7 +227,15 @@ def test_engine_core_entry_pins_the_path_before_the_core_runs(monkeypatch):
     assert observed == [_MoECommPolicy.ALLGATHER]
 
 
-def test_config_hook_pins_the_path_for_the_process_that_built_the_config(monkeypatch):
+def test_config_hook_leaves_the_pin_to_the_process_that_forwards(monkeypatch):
+    """Building a config must not be what pins the path.
+
+    The config hook runs in the front-end and on child revalidation, and a spawned
+    worker never re-runs it. Pinning there looked right and produced a real run where
+    the FFN workers kept upstream's MC2 selection while the front-end believed the path
+    was pinned, so the hook must stay out of it.
+    """
+
     fake = _fake_vllm_ascend(monkeypatch)
     _load_patch_module(monkeypatch)
     hook = _load_config_hook(monkeypatch)
@@ -235,4 +243,4 @@ def test_config_hook_pins_the_path_for_the_process_that_built_the_config(monkeyp
     assert hook(_vllm_config(extra_config={"force_allgather": True}))
 
     pinned = fake.forward_context.get_current_hardware_profile()
-    assert pinned.moe_comm_policy is _MoECommPolicy.ALLGATHER
+    assert pinned.moe_comm_policy is _MoECommPolicy.CAPACITY_AND_WORLD_SIZE

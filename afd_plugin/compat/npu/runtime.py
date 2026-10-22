@@ -115,11 +115,34 @@ def apply_afd_ascend_patches_if_needed() -> None:
     _PATCHES_APPLIED = True
 
 
+def apply_afd_worker_runtime_hooks(vllm_config: VllmConfig) -> None:
+    """Install the worker-side hooks that need the resolved config.
+
+    These cannot ride on the config-build path. A worker is spawned and its config
+    arrives unpickled, so ``VllmConfig.__post_init__`` -- and with it
+    ``_apply_afd_npu_config_patches`` -- never runs in the worker process. Anything
+    installed there exists in the front-end and the engine core, and is absent from
+    the process that actually runs the forward.
+
+    Called from each worker's ``init_device``, which is before any model load,
+    warm-up or forward, and after ``vllm_config`` is available.
+    """
+
+    from afd_plugin.compat.npu.debug_moe_comm_probe import install_moe_comm_probe
+    from afd_plugin.compat.patches.npu.force_allgather import (
+        apply_afd_force_allgather_patch_if_needed,
+    )
+
+    install_moe_comm_probe()
+    apply_afd_force_allgather_patch_if_needed(vllm_config)
+
+
 __all__ = [
     "apply_afd_async_dp_engine_patch_if_needed",
     "apply_afd_ascend_engine_core_config_patch_if_needed",
     "apply_afd_ascend_config_patch_if_needed",
     "apply_afd_ascend_patches_if_needed",
+    "apply_afd_worker_runtime_hooks",
     "ascend_forward_context",
     "fail_if_unsupported_npu_afd_features",
     "fix_all2all_backend_for_afd",
