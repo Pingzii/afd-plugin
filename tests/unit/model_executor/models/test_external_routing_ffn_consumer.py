@@ -120,6 +120,9 @@ def _experts(comm: _Comm):
 def _layer(comm, experts):
     layer = object.__new__(adapter.AFDDeepseekV4DecoderLayer)
     layer.mlp = SimpleNamespace(experts=SimpleNamespace(routed_experts=experts))
+    # Set by the real constructor, and read by the pass-through diagnostic. A fake
+    # without it fails before reaching the behaviour under test.
+    layer.layer_idx = 0
     return layer
 
 
