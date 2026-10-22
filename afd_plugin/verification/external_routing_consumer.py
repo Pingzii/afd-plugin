@@ -55,6 +55,10 @@ from afd_plugin.verification.external_routing_ffn import (
     compare_routed,
 )
 
+# Communication methods the consumer can run on. ALLGATHER and MC2 both let the prepare
+# patch align the routing; the all-to-all paths shard differently and are not covered.
+SUPPORTED_COMM_METHODS = frozenset({"AllGatherCommImpl", "MC2CommImpl"})
+
 # Row counts per rank for the shapes that matter. Zero exercises an empty rank,
 # which is legal because an EP rank can own none of the routed tokens.
 #
@@ -163,8 +167,11 @@ def precheck(
     and a single rank cannot decide to stop on its own.
     """
 
-    if comm_type_name != "AllGatherCommImpl":
-        return f"comm method is {comm_type_name}, not AllGatherCommImpl"
+    if comm_type_name not in SUPPORTED_COMM_METHODS:
+        return (
+            f"comm method is {comm_type_name}, not one of "
+            f"{sorted(SUPPORTED_COMM_METHODS)}"
+        )
     if dp_size < 2:
         return f"dp_size {dp_size} has no ranks to align across"
     if tp_size != 1:

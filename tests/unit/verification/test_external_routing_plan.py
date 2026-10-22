@@ -23,6 +23,9 @@ from afd_plugin.verification.external_routing_consumer import (
     precheck,
     summarize,
 )
+from afd_plugin.verification.external_routing_consumer import (
+    SUPPORTED_COMM_METHODS as _SUPPORTED_COMM_METHODS,
+)
 from afd_plugin.verification.external_routing_ffn import ComparisonResult
 
 DP_SIZE = 4
@@ -200,13 +203,33 @@ def test_differing_plans_without_a_refusal_are_reported_as_a_plan_mismatch():
 
 
 def test_an_unknown_comm_method_is_refused():
-    assert "AllGatherCommImpl" in precheck(
-        comm_type_name="MC2CommImpl",
+    reason = precheck(
+        comm_type_name="AlltoAllCommImpl",
         dp_size=DP_SIZE,
         tp_size=1,
         pcp_size=1,
         sequence_parallel=False,
         captured=True,
+    )
+
+    assert reason is not None
+    assert "AlltoAllCommImpl" in reason
+
+
+@pytest.mark.parametrize("comm_type_name", sorted(_SUPPORTED_COMM_METHODS))
+def test_each_wired_comm_method_passes_the_topology_check(comm_type_name):
+    """ALLGATHER and MC2 share the consumer flow, so both have to be accepted."""
+
+    assert (
+        precheck(
+            comm_type_name=comm_type_name,
+            dp_size=DP_SIZE,
+            tp_size=1,
+            pcp_size=1,
+            sequence_parallel=False,
+            captured=True,
+        )
+        is None
     )
 
 

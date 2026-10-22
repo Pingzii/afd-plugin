@@ -623,12 +623,20 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         weights directly in the token combine, so the factor is applied exactly once.
         Applying it again here would scale the routed output a second time.
 
-        Only the ALLGATHER path is wired. MC2 pads and shards differently and is not
-        verified, so it is rejected instead of silently taking the ALLGATHER route.
+        Both ALLGATHER and MC2 are wired. They share this flow because their prepare
+        patches both pad the routing, and MC2's additionally splits it for the TP
+        sharding before writing the aligned version back. What differs is only whether
+        finalize reduces across ranks.
+
+        Any other communication method is rejected rather than silently taking one of
+        these routes.
         """
 
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-        from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl
+        from vllm_ascend.ops.fused_moe.moe_comm_method import (
+            AllGatherCommImpl,
+            MC2CommImpl,
+        )
 
         from afd_plugin.compat.npu.debug_moe_comm_probe import (
             report_consumer_comm_method,
@@ -643,11 +651,11 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # the consumer actually reached. The selector probe reports the registry
         # answer, which is not always the same object.
         report_consumer_comm_method(comm_method)
-        if not isinstance(comm_method, AllGatherCommImpl):
+        if not isinstance(comm_method, (AllGatherCommImpl, MC2CommImpl)):
             raise RuntimeError(
-                "DSV4 external routing is only wired for the ALLGATHER MoE path; "
-                f"got {type(comm_method).__name__}. The MC2 path pads and shards "
-                "differently and is not verified yet.",
+                "DSV4 external routing is wired for the ALLGATHER and MC2 MoE paths; "
+                f"got {type(comm_method).__name__}. The all-to-all paths shard "
+                "differently and are not verified yet.",
             )
 
         # The ALLGATHER prepare patch is installed once during runtime start-up, not
