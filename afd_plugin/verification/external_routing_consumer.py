@@ -56,10 +56,162 @@ from afd_plugin.verification.external_routing_ffn import (
 
 # Row counts per rank for the shapes that matter. Zero exercises an empty rank,
 # which is legal because an EP rank can own none of the routed tokens.
+#
+# A table is tied to the DP size it was written for. A different size is refused rather
+# than folded onto the table with a modulus: that would silently reuse a row count from
+# a shape nobody chose and label the result with that shape's name.
 LAYER_CASES: tuple[tuple[str, tuple[int, ...]], ...] = (
     ("uniform", (2, 2, 2, 2)),
     ("uneven_with_empty_rank", (3, 1, 0, 2)),
 )
+
+
+@dataclass(frozen=True)
+class VerificationPlan:
+    """The execution plan every participating rank has to agree on.
+
+    Built from shared configuration, never from a rank's own view. Each rank reads its
+    own row count out of it, which is why differing row counts are fine and differing
+    plans are not.
+    """
+
+    case_order: tuple[str, ...]
+    rows_by_case: tuple[tuple[int, ...], ...]
+    seed: int
+    scaling: tuple[tuple[str, float], ...]
+    atol: float
+    rtol: float
+
+    def signature(self) -> tuple[Any, ...]:
+        """A comparable form of everything that has to match across ranks."""
+
+        return (
+            self.case_order,
+            self.rows_by_case,
+            self.seed,
+            self.scaling,
+            self.atol,
+            self.rtol,
+        )
+
+    def rows_for(self, case: str, dp_rank: int) -> int:
+        index = self.case_order.index(case)
+        return self.rows_by_case[index][dp_rank]
+
+
+def build_plan(dp_size: int, *, seed: int, atol: float, rtol: float) -> VerificationPlan:
+    """Return the plan for this topology.
+
+    Raises:
+        ValueError: If the case tables do not have one row count per DP rank. The
+            tables are written for a fixed topology; a different one needs its own
+            table, not a modulus.
+    """
+
+    if dp_size < 2:
+        raise ValueError(f"dp_size {dp_size} has no ranks to align across")
+    for name, rows in LAYER_CASES:
+        if len(rows) != dp_size:
+            raise ValueError(
+                f"case {name!r} has {len(rows)} row counts for dp_size {dp_size}; "
+                "add a case table for this topology instead of reusing another one",
+            )
+    return VerificationPlan(
+        case_order=tuple(name for name, _ in LAYER_CASES),
+        rows_by_case=tuple(rows for _, rows in LAYER_CASES),
+        seed=seed,
+        scaling=tuple((case.name, case.factor) for case in SCALING_CASES),
+        atol=atol,
+        rtol=rtol,
+    )
+
+
+def agree_plan(plan: VerificationPlan, exchange) -> str | None:
+    """Return why the ranks disagreed, or ``None`` when they all match.
+
+    ``exchange`` is the all-gather over the participating group: it takes this rank's
+    value and returns every rank's value. Injected so the agreement rule is testable
+    without a collective.
+
+    Runs before any data collective, so a disagreement is reported by every rank that
+    voted rather than by whichever one happened to notice first.
+    """
+
+    signature = plan.signature()
+    gathered = exchange(signature)
+    for rank, other in enumerate(gathered):
+        if other != signature:
+            return (
+                f"rank {rank} planned {other!r} while this rank planned {signature!r}; "
+                "the ranks must agree on the cases before any collective"
+            )
+    return None
+
+
+def precheck(
+    *,
+    comm_type_name: str,
+    dp_size: int,
+    tp_size: int,
+    pcp_size: int,
+    sequence_parallel: bool,
+    captured: bool,
+) -> str | None:
+    """Return why this topology cannot be verified, or ``None`` when it can.
+
+    Pure and topology-based, so every rank reaches the same answer from the same facts
+    and a single rank cannot decide to stop on its own.
+    """
+
+    if comm_type_name != "AllGatherCommImpl":
+        return f"comm method is {comm_type_name}, not AllGatherCommImpl"
+    if dp_size < 2:
+        return f"dp_size {dp_size} has no ranks to align across"
+    if tp_size != 1:
+        return f"tp_size {tp_size}: routing rows are not sharded by TP here"
+    if pcp_size > 1:
+        return f"pcp_size {pcp_size}: PCP aligns differently and is not covered"
+    if sequence_parallel:
+        return "sequence parallelism aligns differently and is not covered"
+    if not captured:
+        return (
+            "the upstream prepare was not captured, so the reference would compare "
+            "the patch against itself"
+        )
+    return None
+
+
+@dataclass
+class OutcomeSummary:
+    """The run's verdict, and the reasons that produced it."""
+
+    failed: bool
+    reasons: list[str] = field(default_factory=list)
+
+
+def summarize(
+    plan: VerificationPlan,
+    results: list[ComparisonResult],
+    skipped: list[str],
+) -> OutcomeSummary:
+    """Decide the run's verdict from what actually executed.
+
+    A skipped mandatory case fails the run. Reporting "nothing to report" as a pass is
+    how a verification entry point ends up green without having checked anything.
+    """
+
+    reasons: list[str] = []
+    if skipped:
+        reasons.extend(f"skipped: {reason}" for reason in skipped)
+    expected = len(plan.case_order) * len(plan.scaling)
+    if len(results) != expected:
+        reasons.append(
+            f"ran {len(results)} of {expected} cases; a missing case is a failure",
+        )
+    for result in results:
+        if not result.passed:
+            reasons.append(f"case {result.case!r} did not match")
+    return OutcomeSummary(failed=bool(reasons), reasons=reasons)
 
 
 @dataclass(frozen=True)
@@ -231,66 +383,85 @@ def verify_layer(
     layer,
     record: VerificationRecord,
     *,
-    local_rows: int,
     hidden_size: int,
     dp_rank: int,
     device,
+    tp_size: int = 1,
+    pcp_size: int = 1,
     seed: int = 0,
     tolerance=None,
 ) -> None:
     """Compare both paths for one decoder layer and record every case.
 
-    The caller supplies the worker-loaded layer and the facts only it can know: this
-    rank's local row count, the hidden width, this rank's DP index, and the device the
-    experts live on. Reading them from the forward context would not work -- it exposes
+    The caller supplies the worker-loaded layer and the facts only it can know: the
+    hidden width, this rank's DP index, the device the experts live on, and the TP and
+    PCP sizes. Reading them from the forward context would not work -- it exposes
     neither the rank nor the width -- and guessing would silently compare the wrong
     shapes or run on the wrong device.
+
+    The per-case row counts come from the shared plan, not from this rank. Every rank
+    reads the same plan, so a case that one rank cannot run is refused before the first
+    collective rather than clamped into a different shape.
 
     ``seed`` is fixed so a rerun reproduces the same activations and routing; it is not
     a determinism claim about the collective itself.
 
     Weights, communication groups and the quant method all come from the production
-    path. Anything unavailable is recorded as skipped rather than treated as a pass.
+    path. Anything unavailable is recorded as skipped, and a skipped mandatory case
+    fails the run rather than passing quietly.
     """
 
     import torch
     from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-    from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl
 
+    from afd_plugin.compat.patches.npu import external_routing_prepare
     from afd_plugin.model_executor.models.npu.deepseek_v4 import (
         _routed_experts_of,
     )
 
     atol, rtol = tolerance if tolerance is not None else (DEFAULT_ATOL, DEFAULT_RTOL)
     comm = _EXTRA_CTX.moe_comm_method
-    if not isinstance(comm, AllGatherCommImpl):
-        record.skipped.append(
-            f"comm method is {type(comm).__name__}, not AllGatherCommImpl",
-        )
-        return
     experts = _routed_experts_of(layer.mlp)
     moe_config = experts.moe_config
-    if moe_config.dp_size <= 1:
-        record.skipped.append("dp_size <= 1: nothing to align across ranks")
+    dp_size = int(moe_config.dp_size)
+
+    # Every rank runs the same topology test on the same facts and reaches the same
+    # answer, so one rank cannot decide to stop alone while the others wait inside a
+    # collective.
+    reason = precheck(
+        comm_type_name=type(comm).__name__,
+        dp_size=dp_size,
+        tp_size=tp_size,
+        pcp_size=pcp_size,
+        sequence_parallel=bool(moe_config.is_sequence_parallel),
+        captured=external_routing_prepare.ORIGINAL_PREPARE_WITH_DP_GROUP is not None,
+    )
+    if reason is not None:
+        record.skipped.append(reason)
         return
-    if not 0 <= dp_rank < moe_config.dp_size:
-        record.skipped.append(f"dp_rank {dp_rank} outside dp_size {moe_config.dp_size}")
+
+    try:
+        plan = build_plan(dp_size, seed=seed, atol=atol, rtol=rtol)
+    except ValueError as error:
+        record.skipped.append(str(error))
+        return
+
+    disagreement = agree_plan(
+        plan,
+        lambda signature: moe_config.dp_group.all_gather_object(signature),
+    )
+    if disagreement is not None:
+        record.skipped.append(disagreement)
         return
 
     max_rows = _EXTRA_CTX.max_tokens_across_dp
-    if local_rows > max_rows:
-        record.skipped.append(
-            f"local_rows {local_rows} exceeds max_tokens_across_dp {max_rows}",
-        )
-        return
     gather = lambda tensor: moe_config.dp_group.all_gather(tensor, 0)  # noqa: E731
-    for case_name, rows_by_rank in LAYER_CASES:
-        # Each rank uses its own row count from the case, so one run covers the
-        # uniform and uneven shapes without coordinating across ranks.
-        case_rows = rows_by_rank[dp_rank % len(rows_by_rank)]
-        case_rows = min(case_rows, local_rows, max_rows)
-        plan = _Plan(pad_size=max_rows - case_rows)
-        for scaling in SCALING_CASES:
+    for case_name in plan.case_order:
+        # The plan decides the row count, not this rank. No clamping: a case that does
+        # not fit is refused above rather than silently renamed to a smaller shape.
+        case_rows = plan.rows_for(case_name, dp_rank)
+        pad_plan = _Plan(pad_size=max_rows - case_rows)
+        for scaling_name, factor in plan.scaling:
             # Both paths must run on the experts' device; a CPU activation compared
             # against an NPU result would fail for the wrong reason.
             #
@@ -309,7 +480,7 @@ def verify_layer(
             topk_ids, topk_weights = _routing_for(
                 experts,
                 activation,
-                scaling.factor,
+                factor,
                 device=device,
                 seed=seed,
             )
@@ -318,7 +489,7 @@ def verify_layer(
                 activation,
                 topk_ids,
                 topk_weights,
-                plan=plan,
+                plan=pad_plan,
                 gather=gather,
                 experts=experts,
                 comm=comm,
@@ -332,11 +503,17 @@ def verify_layer(
                 compare_routed(
                     reference,
                     candidate,
-                    case=f"{case_name}/{scaling.name}",
+                    case=f"{case_name}/{scaling_name}",
                     atol=atol,
                     rtol=rtol,
                 ),
             )
+
+    # The verdict comes from what actually ran, on every rank. A skipped mandatory case
+    # is a failure, not an absence of news.
+    summary = summarize(plan, list(record.report.results), record.skipped)
+    if summary.failed:
+        record.skipped.extend(summary.reasons)
 
 
 @dataclass(frozen=True)
@@ -375,7 +552,13 @@ def _routing_for(experts, activation, factor, *, device, seed):
 __all__ = [
     "LAYER_CASES",
     "SCALING_CASES",
+    "OutcomeSummary",
     "ScalingCase",
+    "VerificationPlan",
     "VerificationRecord",
+    "agree_plan",
+    "build_plan",
+    "precheck",
+    "summarize",
     "verify_layer",
 ]
