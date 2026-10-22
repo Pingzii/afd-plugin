@@ -630,12 +630,19 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
         from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl
 
+        from afd_plugin.compat.npu.debug_moe_comm_probe import (
+            report_consumer_comm_method,
+        )
         from afd_plugin.connectors.npu.external_routing import (
             AFDExternalRoutingInputs,
         )
 
         routed_experts = _routed_experts_of(self.mlp)
         comm_method = _EXTRA_CTX.moe_comm_method
+        # Reported before the type check, so a rejection also records which object
+        # the consumer actually reached. The selector probe reports the registry
+        # answer, which is not always the same object.
+        report_consumer_comm_method(comm_method)
         if not isinstance(comm_method, AllGatherCommImpl):
             raise RuntimeError(
                 "DSV4 external routing is only wired for the ALLGATHER MoE path; "

@@ -34,6 +34,34 @@ PROBE_ENV_VAR = "AFD_DEBUG_MOE_COMM"
 # back; they are not configuration.
 _REPORTED: set[tuple[int, str]] = set()
 _INSTALLED = False
+_CONSUMED: set[str] = set()
+
+
+def report_consumer_comm_method(comm_method: object) -> None:
+    """Report the comm method the FFN consumer is about to use.
+
+    ``install_moe_comm_probe`` reports what the selector returned through the
+    process-wide registry. That is not necessarily the object a model ends up
+    running: when the model carries its own table, the forward context takes the
+    object from there instead. This reports the object reached from the consumer,
+    so a run can tell the two apart.
+
+    Returns nothing and changes nothing; a no-op unless the probe is enabled.
+    """
+
+    if os.environ.get(PROBE_ENV_VAR) != "1":
+        return
+
+    name = type(comm_method).__name__
+    if name in _CONSUMED:
+        return
+    _CONSUMED.add(name)
+    print(
+        "[AFD-P1] "
+        f"pid={os.getpid()} "
+        f"consumer_comm_method={name}",
+        flush=True,
+    )
 
 
 def install_moe_comm_probe() -> bool:
@@ -89,4 +117,8 @@ def install_moe_comm_probe() -> bool:
     return True
 
 
-__all__ = ["PROBE_ENV_VAR", "install_moe_comm_probe"]
+__all__ = [
+    "PROBE_ENV_VAR",
+    "install_moe_comm_probe",
+    "report_consumer_comm_method",
+]
