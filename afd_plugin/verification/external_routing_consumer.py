@@ -43,6 +43,7 @@ Until both are addressed, a pass here means the two paths agreed and nothing mor
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -127,14 +128,13 @@ def build_plan(dp_size: int, *, seed: int, atol: float, rtol: float) -> Verifica
 
 
 def agree_plan(plan: VerificationPlan, exchange) -> str | None:
-    """Return why the ranks disagreed, or ``None`` when they all match.
+    """Return why the ranks disagreed on the plan alone, or ``None`` when they match.
 
-    ``exchange`` is the all-gather over the participating group: it takes this rank's
-    value and returns every rank's value. Injected so the agreement rule is testable
-    without a collective.
+    Kept separate from :func:`decide_together` because the precheck and the plan are
+    answered by different votes; a refusal is not a planning disagreement and should not
+    be reported as one. ``decide_together`` is what a run uses.
 
-    Runs before any data collective, so a disagreement is reported by every rank that
-    voted rather than by whichever one happened to notice first.
+    ``exchange`` is the object all-gather over the participating group.
     """
 
     signature = plan.signature()
@@ -181,6 +181,72 @@ def precheck(
     return None
 
 
+@dataclass(frozen=True)
+class _Vote:
+    """One rank's participation answer, exchanged before anything collective runs."""
+
+    rank: int
+    reason: str | None
+    plan: tuple[Any, ...] | None
+
+
+def decide_together(*, dp_rank: int, precheck_reason: str | None, plan, exchange) -> str | None:
+    """Return the run's shared refusal reason, or ``None`` when every rank agrees to run.
+
+    Local refusals do not exit on their own. A rank whose precheck failed, or whose plan
+    could not be built, still takes part in this exchange, because the others are going
+    to wait for it in the next collective. The decision is taken from every vote, so all
+    ranks stop together.
+
+    ``exchange`` is the object all-gather over the participating group.
+    """
+
+    if precheck_reason is None and plan is None:
+        # No plan and no stated reason is an inconsistent vote, not an approval. Every
+        # rank that cannot build a plan has to say why, and one that says nothing must
+        # not be counted as agreeing.
+        precheck_reason = "no plan was built for this rank"
+
+    vote = _Vote(
+        rank=dp_rank,
+        reason=precheck_reason,
+        plan=None if plan is None else plan.signature(),
+    )
+    votes = exchange(vote)
+    refusals = [other for other in votes if other.reason is not None]
+    if refusals:
+        lowest = min(refusals, key=lambda item: item.rank)
+        return f"rank {lowest.rank} refused: {lowest.reason}"
+    signatures = {other.plan for other in votes}
+    if len(signatures) != 1:
+        return (
+            f"the ranks planned differently: {sorted(map(repr, signatures))}; "
+            "they must agree before any collective"
+        )
+    return None
+
+
+@contextmanager
+def case_forward_context(max_rows: int):
+    """Present ``max_rows`` to the native prepare for one case.
+
+    The native prepare reads the padding target from the forward context, not from an
+    argument, so a per-case value has to be installed there. Without this every case
+    would pad to whatever the entry context happened to hold, and a case larger than
+    that would ask for negative padding on one rank while the others had already
+    entered the collective.
+    """
+
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+    previous = _EXTRA_CTX.max_tokens_across_dp
+    _EXTRA_CTX.max_tokens_across_dp = max_rows
+    try:
+        yield max_rows
+    finally:
+        _EXTRA_CTX.max_tokens_across_dp = previous
+
+
 @dataclass
 class OutcomeSummary:
     """The run's verdict, and the reasons that produced it."""
@@ -191,26 +257,48 @@ class OutcomeSummary:
 
 def summarize(
     plan: VerificationPlan,
-    results: list[ComparisonResult],
+    entries: list[tuple[int, str, bool]],
     skipped: list[str],
+    participating_ranks: list[int],
 ) -> OutcomeSummary:
-    """Decide the run's verdict from what actually executed.
+    """Decide the run's verdict from what every rank reported.
+
+    ``entries`` are ``(rank, case, passed)`` gathered across the participating ranks. A
+    local-only view cannot see a remote rank's failure, and a count cannot tell a
+    duplicated case from a missing one, so the check is on the named set: every planned
+    ``(case, scaling)`` must be reported by every participating rank, exactly once.
 
     A skipped mandatory case fails the run. Reporting "nothing to report" as a pass is
     how a verification entry point ends up green without having checked anything.
     """
 
-    reasons: list[str] = []
-    if skipped:
-        reasons.extend(f"skipped: {reason}" for reason in skipped)
-    expected = len(plan.case_order) * len(plan.scaling)
-    if len(results) != expected:
-        reasons.append(
-            f"ran {len(results)} of {expected} cases; a missing case is a failure",
-        )
-    for result in results:
-        if not result.passed:
-            reasons.append(f"case {result.case!r} did not match")
+    reasons: list[str] = [f"skipped: {reason}" for reason in skipped]
+    expected = {
+        f"{case}/{scaling}" for case in plan.case_order for scaling, _ in plan.scaling
+    }
+    by_case: dict[str, list[tuple[int, bool]]] = {}
+    for rank, case, passed in entries:
+        by_case.setdefault(case, []).append((rank, passed))
+
+    for case in sorted(expected):
+        reported = by_case.get(case, [])
+        ranks = [rank for rank, _ in reported]
+        if sorted(ranks) != sorted(participating_ranks):
+            reasons.append(
+                f"case {case!r} reported by ranks {sorted(ranks)}, "
+                f"expected {sorted(participating_ranks)}",
+            )
+            continue
+        if len(ranks) != len(set(ranks)):
+            reasons.append(f"case {case!r} reported more than once by one rank")
+        if not all(passed for _, passed in reported):
+            failing = sorted(rank for rank, passed in reported if not passed)
+            reasons.append(f"case {case!r} did not match on ranks {failing}")
+
+    unplanned = sorted(set(by_case) - expected)
+    if unplanned:
+        reasons.append(f"cases outside the plan were reported: {unplanned}")
+
     return OutcomeSummary(failed=bool(reasons), reasons=reasons)
 
 
@@ -246,10 +334,20 @@ class VerificationRecord:
     configuration: dict[str, Any]
     report: CaseReport = field(default_factory=CaseReport)
     skipped: list[str] = field(default_factory=list)
+    summary: OutcomeSummary | None = None
 
     @property
     def passed(self) -> bool:
-        return bool(self.report.results) and self.report.passed
+        """Whether the run passed. False until a verdict from all ranks exists.
+
+        Reading this before ``summarize`` runs would report a pass from a local view
+        that has not seen the other ranks, and a local case matching says nothing about
+        a rank that failed or never ran.
+        """
+
+        if self.summary is None:
+            return False
+        return not self.summary.failed
 
     def render(self) -> str:
         lines = ["external routing consumer verification", ""]
@@ -425,9 +523,9 @@ def verify_layer(
     moe_config = experts.moe_config
     dp_size = int(moe_config.dp_size)
 
-    # Every rank runs the same topology test on the same facts and reaches the same
-    # answer, so one rank cannot decide to stop alone while the others wait inside a
-    # collective.
+    # Neither a failed precheck nor an unbuildable plan may exit on its own: the other
+    # ranks are about to wait for this one in the exchange. Both results travel into
+    # the same vote, and every rank reads the same decision out of it.
     reason = precheck(
         comm_type_name=type(comm).__name__,
         dp_size=dp_size,
@@ -436,30 +534,43 @@ def verify_layer(
         sequence_parallel=bool(moe_config.is_sequence_parallel),
         captured=external_routing_prepare.ORIGINAL_PREPARE_WITH_DP_GROUP is not None,
     )
-    if reason is not None:
-        record.skipped.append(reason)
-        return
-
+    plan = None
     try:
         plan = build_plan(dp_size, seed=seed, atol=atol, rtol=rtol)
     except ValueError as error:
-        record.skipped.append(str(error))
-        return
+        if reason is None:
+            reason = str(error)
 
-    disagreement = agree_plan(
-        plan,
-        lambda signature: moe_config.dp_group.all_gather_object(signature),
+    import torch.distributed as dist
+
+    def exchange(vote):
+        votes = [None] * dp_size
+        # The plan is a plain object, so it travels over the CPU group. vLLM's
+        # GroupCoordinator exposes all_gather for tensors only; the CPU group is the
+        # supported route for object exchange.
+        dist.all_gather_object(votes, vote, group=moe_config.dp_group.cpu_group)
+        return votes
+
+    refusal = decide_together(
+        dp_rank=dp_rank,
+        precheck_reason=reason,
+        plan=plan,
+        exchange=exchange,
     )
-    if disagreement is not None:
-        record.skipped.append(disagreement)
+    if refusal is not None:
+        record.skipped.append(refusal)
         return
+    assert plan is not None, "decide_together accepted a run without a plan"
 
-    max_rows = _EXTRA_CTX.max_tokens_across_dp
     gather = lambda tensor: moe_config.dp_group.all_gather(tensor, 0)  # noqa: E731
     for case_name in plan.case_order:
         # The plan decides the row count, not this rank. No clamping: a case that does
         # not fit is refused above rather than silently renamed to a smaller shape.
         case_rows = plan.rows_for(case_name, dp_rank)
+        # The padding target this case needs, derived from the plan so every rank pads
+        # to the same total. The native prepare reads it from the forward context, so it
+        # has to be installed there, not just computed here.
+        max_rows = max(plan.rows_by_case[plan.case_order.index(case_name)])
         pad_plan = _Plan(pad_size=max_rows - case_rows)
         for scaling_name, factor in plan.scaling:
             # Both paths must run on the experts' device; a CPU activation compared
@@ -484,21 +595,22 @@ def verify_layer(
                 device=device,
                 seed=seed,
             )
-            reference = _run_reference(
-                layer,
-                activation,
-                topk_ids,
-                topk_weights,
-                plan=pad_plan,
-                gather=gather,
-                experts=experts,
-                comm=comm,
-            )
-            candidate = layer._compute_external_routing_ffn(
-                activation,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-            )
+            with case_forward_context(max_rows):
+                reference = _run_reference(
+                    layer,
+                    activation,
+                    topk_ids,
+                    topk_weights,
+                    plan=pad_plan,
+                    gather=gather,
+                    experts=experts,
+                    comm=comm,
+                )
+                candidate = layer._compute_external_routing_ffn(
+                    activation,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                )
             record.report.add(
                 compare_routed(
                     reference,
@@ -509,11 +621,29 @@ def verify_layer(
                 ),
             )
 
-    # The verdict comes from what actually ran, on every rank. A skipped mandatory case
-    # is a failure, not an absence of news.
-    summary = summarize(plan, list(record.report.results), record.skipped)
-    if summary.failed:
-        record.skipped.extend(summary.reasons)
+    # The verdict needs every rank's result, not just this one's. A local pass says
+    # nothing about a rank that failed or never ran, so the named results are exchanged
+    # before anything is decided.
+    entries = [
+        (result.case, result.passed) for result in record.report.results
+    ]
+    gathered_entries = [None] * dp_size
+    dist.all_gather_object(
+        gathered_entries,
+        (dp_rank, entries),
+        group=moe_config.dp_group.cpu_group,
+    )
+    flattened: list[tuple[int, str, bool]] = []
+    for vote in gathered_entries:
+        rank, per_rank = vote
+        for case, passed in per_rank:
+            flattened.append((rank, case, passed))
+    record.summary = summarize(
+        plan,
+        flattened,
+        record.skipped,
+        list(range(dp_size)),
+    )
 
 
 @dataclass(frozen=True)
@@ -558,6 +688,8 @@ __all__ = [
     "VerificationRecord",
     "agree_plan",
     "build_plan",
+    "case_forward_context",
+    "decide_together",
     "precheck",
     "summarize",
     "verify_layer",
