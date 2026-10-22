@@ -279,6 +279,11 @@ class AFDA2FTransferPayload:
         topk_weights: Optional routing weights paired with ``topk_ids``, shaped
             ``(tokens, topk)`` as ``float32``. The two are present together or
             not at all.
+        activation_scale: Optional MX block scale for a pre-quantized activation,
+            shaped ``(tokens, ceil(hidden_size / 32))`` as ``float8_e8m0fnu``.
+            Present only when the transport carried an MXFP8 activation. The
+            consumer keeps the quantized activation and this scale together so the
+            MoE does not have to dequantize and requantize it.
     """
 
     hidden_states: torch.Tensor
@@ -287,6 +292,7 @@ class AFDA2FTransferPayload:
     input_ids: torch.Tensor | None = None
     topk_ids: torch.Tensor | None = None
     topk_weights: torch.Tensor | None = None
+    activation_scale: torch.Tensor | None = None
 
 
 @dataclass(slots=True)

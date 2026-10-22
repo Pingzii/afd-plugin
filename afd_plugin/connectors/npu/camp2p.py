@@ -953,12 +953,20 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         custom_states.x_active_mask = outputs[4]
         custom_states.cam_p2p_ep_name = self.hccl_comm_name1
         received_activation = outputs[0]
+        received_activation_scale: torch.Tensor | None = None
         if self.quant_mode == _A2E_QUANT_MODE_MXFP8:
             # Only the transport is quantized: restore the model dtype here and
             # let every stage after the receive keep the layout and dtype it has
             # in BF16 mode. The router reads the activation itself and the shared
             # experts quantize their own input, so both need a model-dtype tensor
             # regardless, and the MoE then quantizes it for its GMM as usual.
+            #
+            # The scale is kept alongside the restored activation so a consumer that
+            # can take the quantized form later does not have to recover it. Today
+            # nothing reads it: this step still dequantizes, and dropping the scale
+            # here is what made an MXFP8 transport indistinguishable from a working
+            # pass-through.
+            received_activation_scale = outputs[5]
             received_activation = mx_dequantize_a2e_activation(
                 received_activation, outputs[5]
             )
@@ -990,6 +998,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             input_ids=received_ids,
             topk_ids=received_topk_ids,
             topk_weights=received_topk_weights,
+            activation_scale=received_activation_scale,
         )
 
     def send_ffn_output(
