@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 _PATCHES_APPLIED = False
+_WORKER_HOOKS_APPLIED = False
 
 
 def apply_afd_ascend_config_patch_if_needed() -> None:
@@ -124,9 +125,17 @@ def apply_afd_worker_runtime_hooks(vllm_config: VllmConfig) -> None:
     installed there exists in the front-end and the engine core, and is absent from
     the process that actually runs the forward.
 
+    Idempotent per process. Installing the ALLGATHER pin twice is harmless but prints
+    its evidence line each time, so a repeated call would make the log ambiguous about
+    how many processes hold the pin.
+
     Called from each worker's ``init_device``, which is before any model load,
     warm-up or forward, and after ``vllm_config`` is available.
     """
+
+    global _WORKER_HOOKS_APPLIED
+    if _WORKER_HOOKS_APPLIED:
+        return
 
     from afd_plugin.compat.npu.debug_moe_comm_probe import install_moe_comm_probe
     from afd_plugin.compat.patches.npu.force_allgather import (
@@ -135,6 +144,7 @@ def apply_afd_worker_runtime_hooks(vllm_config: VllmConfig) -> None:
 
     install_moe_comm_probe()
     apply_afd_force_allgather_patch_if_needed(vllm_config)
+    _WORKER_HOOKS_APPLIED = True
 
 
 __all__ = [

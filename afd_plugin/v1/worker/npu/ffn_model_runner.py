@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 from afd_plugin.compat.npu import (
+    apply_afd_worker_runtime_hooks,
     ascend_forward_context,
     fail_if_unsupported_npu_afd_features,
 )
@@ -259,6 +260,12 @@ class AFDNPUFFNModelRunner:
         is_profile: bool = False,
     ) -> torch.Tensor | None:
         assert self.model is not None
+        # Safety net for the process this runner lives in: the worker's init_device
+        # already installs these, but the forward is the point where the MoE
+        # communication method is actually selected, so a run that reached here with
+        # the pin missing would silently take upstream's path. The call is guarded, so
+        # this is a no-op once init_device has run.
+        apply_afd_worker_runtime_hooks(self.vllm_config)
         if update_connector_state:
             assert self.connector.control_plane, (
                 "Only DP metadata control plane supports ",
