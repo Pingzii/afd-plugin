@@ -23,9 +23,6 @@ from afd_plugin.verification.external_routing_consumer import (
     precheck,
     summarize,
 )
-from afd_plugin.verification.external_routing_consumer import (
-    SUPPORTED_COMM_METHODS as _SUPPORTED_COMM_METHODS,
-)
 from afd_plugin.verification.external_routing_ffn import ComparisonResult
 
 DP_SIZE = 4
@@ -216,21 +213,25 @@ def test_an_unknown_comm_method_is_refused():
     assert "AlltoAllCommImpl" in reason
 
 
-@pytest.mark.parametrize("comm_type_name", sorted(_SUPPORTED_COMM_METHODS))
-def test_each_wired_comm_method_passes_the_topology_check(comm_type_name):
-    """ALLGATHER and MC2 share the consumer flow, so both have to be accepted."""
+def test_mc2_is_refused_by_the_verification_entry():
+    """The consumer accepts MC2; the reference does not, so a comparison cannot run.
 
-    assert (
-        precheck(
-            comm_type_name=comm_type_name,
-            dp_size=DP_SIZE,
-            tp_size=1,
-            pcp_size=1,
-            sequence_parallel=False,
-            captured=True,
-        )
-        is None
+    Allowing it here would have compared an ALLGATHER reference against an MC2
+    candidate: different sharding rules, so any difference would be attributed to the
+    code under test instead of to the mismatch.
+    """
+
+    reason = precheck(
+        comm_type_name="MC2CommImpl",
+        dp_size=DP_SIZE,
+        tp_size=1,
+        pcp_size=1,
+        sequence_parallel=False,
+        captured=True,
     )
+
+    assert reason is not None
+    assert "MC2" in reason
 
 
 @pytest.mark.parametrize(

@@ -38,7 +38,7 @@ class _AllGatherCommImpl:
 
 
 class _Mc2CommImpl:
-    """Marker type the consumer must reject."""
+    """Marker type for the other wired communication method."""
 
 
 class _PrepareFinalize:
@@ -49,8 +49,8 @@ class _PrepareFinalize:
         self.prepare_calls = 0
 
 
-class _Comm(_AllGatherCommImpl):
-    """Records the call order and serves the aligned routing."""
+class _CommBehaviour:
+    """The flow both wired methods share: record, serve aligned routing, apply."""
 
     def __init__(self, *, fail_in: str | None = None) -> None:
         self.prepare_finalize = _PrepareFinalize()
@@ -84,6 +84,10 @@ class _Comm(_AllGatherCommImpl):
         if self.fail_in == "finalize":
             raise RuntimeError("finalize exploded")
         return hidden_states
+
+
+class _Comm(_CommBehaviour, _AllGatherCommImpl):
+    """The ALLGATHER case: same behaviour, ALLGATHER marker."""
 
 
 def _experts(comm: _Comm):
@@ -127,7 +131,10 @@ def _install_vllm_ascend(monkeypatch, comm):
         moe_comm_method=comm,
     )
     method_module = ModuleType("vllm_ascend.ops.fused_moe.moe_comm_method")
+    # Both wired methods have to exist: the consumer imports them to test membership,
+    # so a fake without MC2CommImpl fails at import rather than at the assertion.
     method_module.AllGatherCommImpl = _AllGatherCommImpl
+    method_module.MC2CommImpl = _Mc2CommImpl
     monkeypatch.setitem(
         sys.modules,
         "vllm_ascend.ops.fused_moe.moe_comm_method",
@@ -215,15 +222,65 @@ def test_a_later_call_does_not_inherit_the_previous_routing(monkeypatch):
     assert healthy.prepare_finalize.afd_external_routing is None
 
 
-def test_mc2_is_rejected_instead_of_taking_the_allgather_route(monkeypatch):
+def test_an_unwired_comm_method_is_rejected(monkeypatch):
+    """MC2 is wired; the all-to-all paths are not, and must not be guessed at."""
+
     comm = SimpleNamespace(prepare_finalize=_PrepareFinalize())
     _install_vllm_ascend(monkeypatch, comm)
     layer = _layer(comm, _experts(_Comm()))
     topk_ids, topk_weights = _raw_routing()
 
-    with pytest.raises(RuntimeError, match="only wired for the ALLGATHER"):
+    with pytest.raises(RuntimeError, match="ALLGATHER and MC2"):
         layer._compute_external_routing_ffn(
             torch.zeros(2, HIDDEN),
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
+
+
+class _Mc2Comm(_CommBehaviour, _Mc2CommImpl):
+    """The MC2 case: same behaviour, MC2 marker, so only the reduce decision differs."""
+
+
+@pytest.mark.parametrize("comm_type", [_Comm, _Mc2Comm])
+def test_both_wired_comm_methods_run_the_same_flow(monkeypatch, comm_type):
+    """MC2 shares the consumer flow, so it must apply and finalize the same way."""
+
+    comm = comm_type()
+    _install_vllm_ascend(monkeypatch, comm)
+    experts = _experts(comm)
+    layer = _layer(comm, experts)
+    topk_ids, topk_weights = _raw_routing()
+
+    output = layer._compute_external_routing_ffn(
+        torch.zeros(2, HIDDEN),
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+
+    assert comm.events == ["prepare", "apply", "finalize"]
+    assert torch.equal(comm.applied["topk_ids"], torch.full_like(topk_ids, ALIGNED_ID))
+    assert torch.equal(output, torch.ones(2, HIDDEN))
+    assert experts.ascend_pertoken_scale is None
+    assert experts.ascend_mc2_mask is None
+    assert comm.prepare_finalize.afd_external_routing is None
+
+
+@pytest.mark.parametrize("comm_type", [_Comm, _Mc2Comm])
+def test_both_wired_comm_methods_clear_state_after_a_failure(monkeypatch, comm_type):
+    comm = comm_type(fail_in="apply")
+    _install_vllm_ascend(monkeypatch, comm)
+    experts = _experts(comm)
+    layer = _layer(comm, experts)
+    topk_ids, topk_weights = _raw_routing()
+
+    with pytest.raises(RuntimeError, match="apply exploded"):
+        layer._compute_external_routing_ffn(
+            torch.zeros(2, HIDDEN),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+
+    assert experts.ascend_pertoken_scale is None
+    assert experts.ascend_mc2_mask is None
+    assert comm.prepare_finalize.afd_external_routing is None
