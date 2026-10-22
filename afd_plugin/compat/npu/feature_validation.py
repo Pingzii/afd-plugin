@@ -197,8 +197,6 @@ def _fail_if_unsupported_sync_attention_gate(
     the feature.
     """
 
-    from afd_plugin.envs import a2e_quant_mode_name
-
     parallel = vllm_config.parallel_config
     if bool(parallel.enable_dbo) or bool(parallel.use_ubatching):
         raise RuntimeError(
