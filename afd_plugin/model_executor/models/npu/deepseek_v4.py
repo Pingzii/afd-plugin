@@ -643,6 +643,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
 
         from afd_plugin.compat.npu.debug_moe_comm_probe import (
             report_consumer_comm_method,
+            report_mxfp8_passthrough,
         )
         from afd_plugin.connectors.npu.external_routing import (
             AFDExternalRoutingInputs,
@@ -698,6 +699,14 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                     f"pass-through; got {hidden_states.dtype}",
                 )
             require_matching_activation_scale(hidden_states, activation_scale)
+            # Recorded before prepare, so the shapes are this rank's local row count
+            # rather than the gathered total. Once per process, metadata only.
+            report_mxfp8_passthrough(
+                comm_method=comm_method,
+                layer_idx=self.layer_idx,
+                activation=hidden_states,
+                scale=activation_scale,
+            )
 
         # The ALLGATHER prepare patch is installed once during runtime start-up, not
         # here: re-installing it per layer forward only repeats work, since the patch

@@ -35,6 +35,7 @@ PROBE_ENV_VAR = "AFD_DEBUG_MOE_COMM"
 _REPORTED: set[tuple[int, str]] = set()
 _INSTALLED = False
 _CONSUMED: set[str] = set()
+_PASSTHROUGH_REPORTED = False
 
 
 def report_consumer_comm_method(comm_method: object) -> None:
@@ -60,6 +61,52 @@ def report_consumer_comm_method(comm_method: object) -> None:
         "[AFD-P1] "
         f"pid={os.getpid()} "
         f"consumer_comm_method={name}",
+        flush=True,
+    )
+
+
+def report_mxfp8_passthrough(
+    *,
+    comm_method: object,
+    layer_idx: int,
+    activation: object,
+    scale: object,
+) -> None:
+    """Report the quantized activation a worker is about to hand to the MoE.
+
+    Printed once per process: the point is to prove on a first device run that the
+    pass-through is what actually reaches the consumer, not to trace every layer. The
+    shapes are the local row count before prepare, not the gathered total, because that
+    is what this side owns.
+
+    Metadata only: dtype, shape and device are read from the tensors. Printing a value
+    would need a host copy, which synchronizes the stream and perturbs the very timings
+    a later perf run measures.
+
+    No-op unless the probe is enabled.
+    """
+
+    if os.environ.get(PROBE_ENV_VAR) != "1":
+        return
+
+    global _PASSTHROUGH_REPORTED
+    if _PASSTHROUGH_REPORTED:
+        return
+    _PASSTHROUGH_REPORTED = True
+
+    def describe(tensor: object) -> str:
+        if tensor is None:
+            return "None"
+        return (
+            f"dtype={tensor.dtype} shape={tuple(tensor.shape)} device={tensor.device}"
+        )
+
+    print(
+        "[AFD-MXFP8] "
+        f"pid={os.getpid()} layer={layer_idx} "
+        f"comm={type(comm_method).__name__} "
+        f"activation({describe(activation)}) "
+        f"scale({describe(scale)})",
         flush=True,
     )
 
@@ -121,4 +168,5 @@ __all__ = [
     "PROBE_ENV_VAR",
     "install_moe_comm_probe",
     "report_consumer_comm_method",
+    "report_mxfp8_passthrough",
 ]
