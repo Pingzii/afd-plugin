@@ -86,6 +86,7 @@ def apply_afd_force_allgather_patch_if_needed(
     """
 
     if not _force_allgather_requested(vllm_config):
+        _report_not_requested(vllm_config)
         return False
 
     from vllm_ascend import ascend_forward_context
@@ -111,6 +112,35 @@ def _force_allgather_requested(vllm_config: VllmConfig | None) -> bool:
     return coerce_extra_bool(
         extra_config.get(_FORCE_ALLGATHER_FIELD, False),
         field_name=_FORCE_ALLGATHER_FIELD,
+    )
+
+
+def _report_not_requested(vllm_config: VllmConfig | None) -> None:
+    """Say why the pin is not being installed, when the probe is enabled.
+
+    A process that never prints the install line is indistinguishable from a process
+    that was asked for the pin but could not read the switch. That distinction decides
+    whether the problem is the config reaching this process or the rebind itself, so
+    the reason is printed rather than guessed from an absent line.
+    """
+
+    if os.environ.get("AFD_DEBUG_MOE_COMM") != "1":
+        return
+
+    afd_config = parse_optional_afd_config(vllm_config, validate=False)
+    if afd_config is None:
+        reason = "no AFD config"
+    elif afd_config.connector != CAMP2P_CONNECTOR:
+        reason = f"connector is {afd_config.connector!r}, not {CAMP2P_CONNECTOR!r}"
+    else:
+        extra_config = connector_extra_config_from_source(vllm_config)
+        reason = (
+            f"{_FORCE_ALLGATHER_FIELD} is {extra_config.get(_FORCE_ALLGATHER_FIELD)!r} "
+            f"in connector_extra_config {dict(extra_config)!r}"
+        )
+    print(
+        f"[AFD-ALLGATHER-SKIP] pid={os.getpid()} not installing: {reason}",
+        flush=True,
     )
 
 
