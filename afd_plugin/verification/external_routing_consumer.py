@@ -235,6 +235,11 @@ def case_forward_context(max_rows: int):
     would pad to whatever the entry context happened to hold, and a case larger than
     that would ask for negative padding on one rank while the others had already
     entered the collective.
+
+    This only overwrites the padding target of a context that already exists. It does
+    not make a context, so it is a fallback for callers that cannot build one; a caller
+    that can should pass a ``context_factory`` to :func:`verify_layer` instead, because
+    a field being present is not the same as the rest of the context being valid.
     """
 
     from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -335,6 +340,10 @@ class VerificationRecord:
     report: CaseReport = field(default_factory=CaseReport)
     skipped: list[str] = field(default_factory=list)
     summary: OutcomeSummary | None = None
+    # Set when the refusal came from the topology check rather than from a run that
+    # could not complete. The two map to different exit codes, and folding them together
+    # would report "unsupported setup" as "never ran".
+    topology_refusal: bool = False
 
     @property
     def passed(self) -> bool:
@@ -488,6 +497,7 @@ def verify_layer(
     pcp_size: int = 1,
     seed: int = 0,
     tolerance=None,
+    context_factory=None,
 ) -> None:
     """Compare both paths for one decoder layer and record every case.
 
@@ -541,6 +551,10 @@ def verify_layer(
         if reason is None:
             reason = str(error)
 
+    # Recorded separately: a topology refusal is a different outcome from a run that
+    # could not complete, and the two must not share an exit code.
+    topology_refusal = reason is not None
+
     import torch.distributed as dist
 
     def exchange(vote):
@@ -559,6 +573,7 @@ def verify_layer(
     )
     if refusal is not None:
         record.skipped.append(refusal)
+        record.topology_refusal = topology_refusal
         return
     assert plan is not None, "decide_together accepted a run without a plan"
 
@@ -595,7 +610,11 @@ def verify_layer(
                 device=device,
                 seed=seed,
             )
-            with case_forward_context(max_rows):
+            with (
+                context_factory(case_rows, max_rows)
+                if context_factory is not None
+                else case_forward_context(max_rows)
+            ):
                 reference = _run_reference(
                     layer,
                     activation,
