@@ -955,21 +955,25 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         received_activation = outputs[0]
         received_activation_scale: torch.Tensor | None = None
         if self.quant_mode == _A2E_QUANT_MODE_MXFP8:
-            # Only the transport is quantized: restore the model dtype here and
-            # let every stage after the receive keep the layout and dtype it has
-            # in BF16 mode. The router reads the activation itself and the shared
-            # experts quantize their own input, so both need a model-dtype tensor
-            # regardless, and the MoE then quantizes it for its GMM as usual.
-            #
-            # The scale is kept alongside the restored activation, but the two are
-            # not a pair: this step already dequantized, so the scale describes the
-            # activation that arrived, not what is in ``received_activation``. It is
-            # reported so a later change can keep both, and it must not be handed to
-            # an expert path that skips quantization when a scale is present.
-            received_activation_scale = outputs[5]
-            received_activation = mx_dequantize_a2e_activation(
-                received_activation, outputs[5]
-            )
+            if recv_routing:
+                # Direct pass-through: the Attention side already computed the
+                # routing, so nothing on this side reads the activation except the
+                # MoE, and the MoE can take the quantized form together with its
+                # scale. Dequantizing here only to have the MoE quantize again is the
+                # pair this path exists to remove.
+                #
+                # The two values are only ever set together: an FP8 activation
+                # without its scale (or the reverse) is not a usable pair, and the
+                # consumer rejects that rather than guessing.
+                received_activation_scale = outputs[5]
+            else:
+                # The router and the shared experts still need a model-dtype tensor:
+                # the router reads the activation itself and the shared experts
+                # quantize their own input. Restoring the model dtype keeps every
+                # stage after the receive exactly as it is in BF16 mode.
+                received_activation = mx_dequantize_a2e_activation(
+                    received_activation, outputs[5]
+                )
         # The ids slot is only written in the operator's ids mode, so the mode has
         # to match the sending rank's ``compute_gate``. It is declared here by the
         # receiving FFN rank through ``recv_input_ids`` or ``recv_routing`` rather

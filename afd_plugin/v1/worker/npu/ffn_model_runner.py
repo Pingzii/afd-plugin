@@ -359,6 +359,10 @@ class AFDNPUFFNModelRunner:
                     if recv_routing:
                         ffn_kwargs["topk_ids"] = payload.topk_ids
                         ffn_kwargs["topk_weights"] = payload.topk_weights
+                        # Only the direct path keeps the activation quantized, and it
+                        # always carries the matching scale. On the other paths the
+                        # receive already restored the model dtype and this is None.
+                        ffn_kwargs["activation_scale"] = payload.activation_scale
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,

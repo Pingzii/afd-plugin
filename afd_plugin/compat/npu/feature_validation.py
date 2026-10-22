@@ -183,16 +183,21 @@ def _fail_if_unsupported_sync_attention_gate(
 ) -> None:
     """Restrict the sync Attention-side gate prototype to what it supports today.
 
-    The gate move has only been wired for BF16 transport on the sync connector. The
-    gate plus MXFP8 transport additionally needs the MC2 dispatcher to accept a
-    pre-quantized activation and its E8M0 scale, which is not verified on a device
-    yet; allowing it would produce wrong numerics rather than an error.
+    The gate move is wired for the ALLGATHER MoE path, in both BF16 and MXFP8
+    transport. MXFP8 is allowed here because the FFN side now keeps the quantized
+    activation together with its E8M0 scale and hands both to the MoE, which reads the
+    scale to skip its own quantization. The all-to-all paths shard and restack
+    differently and are not wired, so a topology that selects one of them is refused
+    instead of silently taking an ALLGATHER-shaped route. A5 is the only target the
+    transport contract is defined for.
 
     DBO and ubatching are rejected rather than merely unused: the sync shell does not
     call the DBO yield, so enabling DBO here would interleave microbatches against a
     transport that never yields. Not calling the yield is not the same as forbidding
     the feature.
     """
+
+    from afd_plugin.envs import a2e_quant_mode_name
 
     parallel = vllm_config.parallel_config
     if bool(parallel.enable_dbo) or bool(parallel.use_ubatching):
@@ -209,19 +214,18 @@ def _fail_if_unsupported_sync_attention_gate(
         raise RuntimeError(
             "Attention-side gate is only supported for the DeepSeek V4 target",
         )
+    if int(parallel.tensor_parallel_size) != 1:
+        raise RuntimeError(
+            "Attention-side gate is only wired for tensor_parallel_size 1; got "
+            f"{parallel.tensor_parallel_size}. Routing rows would need the same TP "
+            "sharding as the activation, which is not written.",
+        )
     from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
-    from afd_plugin.envs import A2E_QUANT_MODE_MXFP8
 
     if not isinstance(extra_info, CAMP2PExtraInfo):
         raise TypeError(
             "CAMP2pAFDConnector requires CAMP2PExtraInfo, got "
             f"{type(extra_info).__name__}",
-        )
-    if extra_info.quant_mode == A2E_QUANT_MODE_MXFP8:
-        raise RuntimeError(
-            "Attention-side gate with A2E MXFP8 transport is not verified yet: "
-            "the FFN side must pass a pre-quantized activation and its E8M0 scale "
-            "through the MC2 dispatcher first. Use quant_mode=0.",
         )
 
 

@@ -538,6 +538,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         group_list_type: int = 1,
         topk_ids: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
+        activation_scale: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | AFDF2ATransferPayload:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
@@ -566,6 +567,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
+                activation_scale=activation_scale,
             )
 
         if self.compute_gate_on_attention:
@@ -610,6 +612,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         *,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        activation_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the FFN on routing the Attention side computed.
 
@@ -658,16 +661,35 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 "differently and are not verified yet.",
             )
 
+        # The activation and its scale are a pair or nothing. A quantized activation
+        # without its scale cannot be interpreted, and a scale without a quantized
+        # activation would make the MoE skip quantizing a model-dtype tensor. The
+        # constructor also rejects a malformed scale.
+        activation_is_quantized = hidden_states.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
+        if activation_is_quantized != (activation_scale is not None):
+            raise RuntimeError(
+                "DSV4 external routing needs the quantized activation and its scale "
+                f"together; got activation={hidden_states.dtype}, "
+                f"scale={'present' if activation_scale is not None else 'absent'}",
+            )
+
         # The ALLGATHER prepare patch is installed once during runtime start-up, not
         # here: re-installing it per layer forward only repeats work, since the patch
         # already behaves exactly like upstream when no routing was published.
 
         # The prepare patch reads the routing from this attribute and writes the
-        # padded/gathered version back, so the two must be the same object.
+        # padded/gathered version back, so the two must be the same object. It also
+        # pads and gathers the scale by the same rows, and publishes it as the
+        # prepare output's pertoken scale, which is what the MoE reads to skip its
+        # own quantization.
         prepare_finalize = comm_method.prepare_finalize
         prepare_finalize.afd_external_routing = AFDExternalRoutingInputs(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            scale=activation_scale,
         )
         try:
             prepare_output = comm_method.prepare(
