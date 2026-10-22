@@ -293,12 +293,19 @@ def verify_layer(
         for scaling in SCALING_CASES:
             # Both paths must run on the experts' device; a CPU activation compared
             # against an NPU result would fail for the wrong reason.
+            #
+            # The activation gets its own generator, seeded the same way as the
+            # routing. Seeding only the routing would reproduce the indices while the
+            # activations changed between runs, which looks like a numerical
+            # difference. Drawing on CPU keeps the local generator off the production
+            # global RNG and avoids depending on a device generator existing.
+            activation_generator = torch.Generator(device="cpu").manual_seed(seed)
             activation = torch.randn(
                 case_rows,
                 hidden_size,
                 dtype=torch.bfloat16,
-                device=device,
-            )
+                generator=activation_generator,
+            ).to(device)
             topk_ids, topk_weights = _routing_for(
                 experts,
                 activation,

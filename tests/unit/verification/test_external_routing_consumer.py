@@ -25,6 +25,10 @@ from afd_plugin.verification.external_routing_consumer import (  # noqa: E402
 
 TOP_K = 2
 
+# A value no rank-N marker can produce (those stay below 1000), so the two halves of a
+# concatenation are never confusable.
+_RANK0_MARK = 90000
+
 
 def _marked(rows: int, rank: int):
     """Routing whose ids and weights both identify the rank and the row."""
@@ -83,10 +87,44 @@ def test_rank_markers_stay_in_rank_order_after_concatenation():
     """A collective that mixed ranks would put a later rank's marker first."""
 
     def gather(tensor: torch.Tensor) -> torch.Tensor:
-        from_rank_zero = torch.full_like(tensor, 100)
+        # Rank 0's marker is far outside any rank-1 value, so the two halves of the
+        # concatenation can never be confused for one another.
+        from_rank_zero = torch.full_like(tensor, _RANK0_MARK)
         return torch.cat([from_rank_zero, tensor], dim=0)
 
-    ids, weights = _marked(rows=1, rank=1)
+    ids, weights = _marked(rows=2, rank=1)
+
+    gathered_ids, gathered_weights = _align_routing_independently(
+        ids,
+        weights,
+        pad_size=0,
+        gather=gather,
+    )
+
+    assert gathered_ids.shape[0] == 4
+    # Compare whole rows, not one column: a swap between the two halves keeps any
+    # single repeated value in place and would slip through.
+    assert torch.equal(gathered_ids[:2], torch.full_like(ids, _RANK0_MARK))
+    assert torch.equal(gathered_ids[2:], ids)
+    assert torch.equal(gathered_weights[2:], weights)
+    assert not torch.equal(gathered_weights[:2], gathered_weights[2:])
+
+
+def _swap_rows(gathered: torch.Tensor) -> torch.Tensor:
+    """Reorder the two ranks, the defect the marker test has to catch."""
+
+    half = gathered.shape[0] // 2
+    return torch.cat([gathered[half:], gathered[:half]], dim=0)
+
+
+def test_the_rank_marker_test_fails_when_the_collective_reorders_rows():
+    """A mutation check: the previous assertion must not survive a row swap."""
+
+    def gather(tensor: torch.Tensor) -> torch.Tensor:
+        from_rank_zero = torch.full_like(tensor, _RANK0_MARK)
+        return _swap_rows(torch.cat([from_rank_zero, tensor], dim=0))
+
+    ids, weights = _marked(rows=2, rank=1)
 
     gathered_ids, _ = _align_routing_independently(
         ids,
@@ -95,9 +133,7 @@ def test_rank_markers_stay_in_rank_order_after_concatenation():
         gather=gather,
     )
 
-    assert gathered_ids.shape[0] == 2
-    assert int(gathered_ids[0, 0]) == 100
-    assert int(gathered_ids[1, 0]) == int(ids[0, 0])
+    assert not torch.equal(gathered_ids[2:], ids)
 
 
 @pytest.mark.parametrize("pad_size", [-1, -8])
