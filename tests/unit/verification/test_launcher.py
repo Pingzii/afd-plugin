@@ -43,19 +43,24 @@ class _Model:
         return tuple(self._indices)
 
 
-def _payload(*, exit_code, plan="same", versions=None):
+def _payload(*, exit_code, rank=0, plan="same", versions=None, run_id="run-1"):
     return {
+        "run_id": run_id,
+        "rank": rank,
         "exit_code": exit_code,
         "plan_signature": plan,
-        "versions": versions or {"vllm": "a", "afd-plugin": "b"},
+        "versions": versions or {"vllm": "a", "afd-plugin": "b", "vllm-ascend": "c"},
         "reasons": [] if exit_code == EXIT_PASS else [f"exit {exit_code}"],
     }
 
 
-def _write_all(directory: Path, payload, *, ranks=DP_SIZE):
+def _write_all(directory: Path, payload, *, ranks=DP_SIZE, **overrides):
     for rank in range(ranks):
+        merged = dict(payload)
+        merged["rank"] = rank
+        merged.update(overrides)
         (directory / f"rank{rank}.json").write_text(
-            json.dumps(payload),
+            json.dumps(merged),
             encoding="utf-8",
         )
 
@@ -141,7 +146,7 @@ def test_disagreeing_plans_fail_the_aggregation(tmp_path):
     for rank in range(DP_SIZE):
         plan = "same" if rank else "different"
         (tmp_path / f"rank{rank}.json").write_text(
-            json.dumps(_payload(exit_code=EXIT_PASS, plan=plan)),
+            json.dumps(_payload(exit_code=EXIT_PASS, rank=rank, plan=plan)),
             encoding="utf-8",
         )
 
@@ -153,9 +158,17 @@ def test_disagreeing_plans_fail_the_aggregation(tmp_path):
 
 def test_disagreeing_versions_fail_the_aggregation(tmp_path):
     for rank in range(DP_SIZE):
-        versions = {"vllm": "a"} if rank else {"vllm": "z"}
+        # Complete version sets that differ in one value, so the disagreement check is
+        # what fires rather than the missing-field check.
+        versions = {
+            "afd-plugin": "a",
+            "vllm": "a" if rank else "z",
+            "vllm-ascend": "c",
+        }
         (tmp_path / f"rank{rank}.json").write_text(
-            json.dumps(_payload(exit_code=EXIT_PASS, versions=versions)),
+            json.dumps(
+                _payload(exit_code=EXIT_PASS, rank=rank, versions=versions),
+            ),
             encoding="utf-8",
         )
 
@@ -169,7 +182,7 @@ def test_one_rank_failing_fails_the_aggregation(tmp_path):
     for rank in range(DP_SIZE):
         code = EXIT_MISMATCH if rank == 2 else EXIT_PASS
         (tmp_path / f"rank{rank}.json").write_text(
-            json.dumps(_payload(exit_code=code)),
+            json.dumps(_payload(exit_code=code, rank=rank)),
             encoding="utf-8",
         )
 
@@ -177,6 +190,45 @@ def test_one_rank_failing_fails_the_aggregation(tmp_path):
 
     assert overall == EXIT_MISMATCH
     assert reasons
+
+
+def test_a_result_from_another_run_is_not_counted(tmp_path):
+    """A leftover file from an earlier run must not complete this run's set."""
+
+    _write_all(tmp_path, _payload(exit_code=EXIT_PASS), run_id="old-run")
+
+    code, reasons = aggregate(tmp_path, DP_SIZE, expected_run_id="new-run")
+
+    assert code == EXIT_ORGANIZATION
+    assert any("belongs to run" in reason for reason in reasons)
+
+
+def test_a_result_missing_versions_is_not_counted(tmp_path):
+    for rank in range(DP_SIZE):
+        payload = _payload(exit_code=EXIT_PASS, rank=rank)
+        payload["versions"] = {}
+        (tmp_path / f"rank{rank}.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+
+    code, reasons = aggregate(tmp_path, DP_SIZE)
+
+    assert code == EXIT_ORGANIZATION
+    assert any("missing versions" in reason for reason in reasons)
+
+
+def test_a_file_whose_rank_disagrees_with_its_name_is_refused(tmp_path):
+    for rank in range(DP_SIZE):
+        (tmp_path / f"rank{rank}.json").write_text(
+            json.dumps(_payload(exit_code=EXIT_PASS, rank=0)),
+            encoding="utf-8",
+        )
+
+    code, reasons = aggregate(tmp_path, DP_SIZE)
+
+    assert code == EXIT_ORGANIZATION
+    assert any("claims rank" in reason for reason in reasons)
 
 
 def test_a_timeout_is_never_a_pass(tmp_path):

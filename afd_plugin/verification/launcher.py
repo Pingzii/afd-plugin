@@ -67,6 +67,18 @@ def select_layer(model, requested: int | None) -> int:
     return requested
 
 
+def plan_signature(plan) -> str:
+    """Return a canonical, hashable form of the plan for persistence.
+
+    ``VerificationPlan.signature()`` returns nested tuples, which JSON turns into nested
+    lists. Comparing those as set elements raises an unhashable-type error the moment a
+    real run writes them, so the persisted form is a JSON string with sorted keys: stable
+    across ranks, hashable, and readable in the file.
+    """
+
+    return json.dumps(plan.signature(), sort_keys=True, default=list)
+
+
 def exit_code_for(record) -> int:
     """Map a verdict onto this entry point's exit codes."""
 
@@ -79,17 +91,30 @@ def exit_code_for(record) -> int:
     return EXIT_MISMATCH if record.summary.failed else EXIT_PASS
 
 
+REQUIRED_VERSIONS = ("afd-plugin", "vllm", "vllm-ascend")
+
+# Every result file has to say which run it belongs to. Without this, a file left over
+# from an earlier run in the same directory would count toward this run's verdict.
+REQUIRED_FIELDS = ("run_id", "rank", "exit_code", "plan_signature", "versions")
+
+
 def write_result(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def aggregate(output_dir: Path, dp_size: int) -> tuple[int, list[str]]:
+def aggregate(
+    output_dir: Path,
+    dp_size: int,
+    *,
+    expected_run_id: str | None = None,
+) -> tuple[int, list[str]]:
     """Read every rank's file and decide the run's verdict.
 
     Reading files needs no collective, so the summary can also be produced offline. A
-    missing file, disagreeing plans, disagreeing versions or disagreeing per-rank
-    outcomes all fail the run: a subset of ranks agreeing on anything is not a result.
+    missing file, a file from another run, a missing field, disagreeing plans,
+    disagreeing versions or disagreeing per-rank outcomes all fail the run: a subset of
+    ranks agreeing on anything is not a result.
     """
 
     reasons: list[str] = []
@@ -99,20 +124,39 @@ def aggregate(output_dir: Path, dp_size: int) -> tuple[int, list[str]]:
         if not path.exists():
             reasons.append(f"rank {rank} produced no result at {path}")
             continue
-        payloads.append(json.loads(path.read_text(encoding="utf-8")))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        missing = [field for field in REQUIRED_FIELDS if field not in payload]
+        if missing:
+            reasons.append(f"rank {rank} result is missing {missing}")
+            continue
+        if int(payload["rank"]) != rank:
+            reasons.append(
+                f"rank {rank} result claims rank {payload['rank']}; the file name and "
+                "its contents have to agree",
+            )
+            continue
+        if expected_run_id is not None and payload["run_id"] != expected_run_id:
+            reasons.append(
+                f"rank {rank} result belongs to run {payload['run_id']!r}, "
+                f"not {expected_run_id!r}",
+            )
+            continue
+        absent = [name for name in REQUIRED_VERSIONS if name not in payload["versions"]]
+        if absent:
+            reasons.append(f"rank {rank} result is missing versions {absent}")
+            continue
+        payloads.append(payload)
     if reasons:
         return EXIT_ORGANIZATION, reasons
 
-    signatures = {payload.get("plan_signature") for payload in payloads}
+    signatures = {payload["plan_signature"] for payload in payloads}
     if len(signatures) != 1:
-        reasons.append(
-            f"the ranks reported different plans: {sorted(map(str, signatures))}",
-        )
-    versions = {json.dumps(payload.get("versions"), sort_keys=True) for payload in payloads}
+        reasons.append(f"the ranks reported different plans: {sorted(signatures)}")
+    versions = {json.dumps(payload["versions"], sort_keys=True) for payload in payloads}
     if len(versions) != 1:
         reasons.append("the ranks reported different versions")
 
-    codes = {int(payload.get("exit_code", EXIT_ORGANIZATION)) for payload in payloads}
+    codes = {int(payload["exit_code"]) for payload in payloads}
     for payload in payloads:
         reasons.extend(payload.get("reasons", []))
     if len(codes) != 1:
@@ -133,8 +177,11 @@ __all__ = [
     "EXIT_ORGANIZATION",
     "EXIT_PASS",
     "EXIT_UNSUPPORTED",
+    "REQUIRED_FIELDS",
+    "REQUIRED_VERSIONS",
     "aggregate",
     "exit_code_for",
+    "plan_signature",
     "resolve_output_dir",
     "resolve_run_id",
     "select_layer",
