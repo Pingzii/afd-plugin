@@ -640,6 +640,9 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             AllGatherCommImpl,
             MC2CommImpl,
         )
+        from vllm_ascend.ops.fused_moe.moe_utils import (
+            maybe_normalize_mxfp_scale_layout,
+        )
 
         from afd_plugin.compat.npu.debug_moe_comm_probe import (
             report_consumer_comm_method,
@@ -738,7 +741,18 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                     "prepare patch did not run",
                 )
             # The scale and mask belong to the experts module, which apply reads back.
-            routed_experts.ascend_pertoken_scale = prepare_output.pertoken_scale
+            #
+            # The MX scale the transport carries is two-dimensional, one row per token.
+            # A5's kernels want it as ``(rows, cols // 2, 2)``, and the native DP path
+            # never has to make that conversion here because it leaves the scale unset
+            # and lets the quant method produce it. Supplying the scale ourselves means
+            # normalizing it at this point, which is where the quant method would have
+            # done it. The helper returns a non-2D scale unchanged, so passing an
+            # already-normalized one is harmless.
+            pertoken_scale = prepare_output.pertoken_scale
+            if pertoken_scale is not None:
+                pertoken_scale = maybe_normalize_mxfp_scale_layout(pertoken_scale)
+            routed_experts.ascend_pertoken_scale = pertoken_scale
             routed_experts.ascend_mc2_mask = prepare_output.mc2_mask
             try:
                 fused = routed_experts.quant_method.apply(
