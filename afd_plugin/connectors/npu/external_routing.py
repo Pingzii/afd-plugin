@@ -35,6 +35,10 @@ import torch
 # filling a tensor with the *float* 127 would round to 2**7 and store byte 134.
 SCALE_PAD_BYTE: Final[int] = 127
 
+# MX block size the A2E MXFP8 contract is defined against: one E8M0 exponent per 32
+# activation values, so a scale row has ceil(hidden_size / 32) columns.
+MX_BLOCK_SIZE: Final[int] = 32
+
 # Expert indices reach the MoE kernels as 32-bit, and gather/combine treat them as
 # integers. Listing the accepted dtypes explicitly also rejects bool and complex,
 # which ``is_floating_point()`` alone would let through.
@@ -207,4 +211,48 @@ def _split_scale(scale: torch.Tensor, split) -> torch.Tensor:
     return split(scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
 
 
-__all__ = ["AFDExternalRoutingInputs", "SCALE_PAD_BYTE"]
+def require_matching_activation_scale(
+    activation: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    """Reject a scale that does not describe this activation.
+
+    Row count, block-column count and device all have to line up, because the MoE uses
+    the scale to skip its own quantization: a scale of the wrong width is read as a
+    different block layout, and one on another device is an operator error deep inside
+    the collective. Checking here turns either into a message at the consumer.
+
+    ``AFDExternalRoutingInputs`` validates the scale's dtype and that it has one row per
+    token; it cannot check the column count, because it never sees the activation.
+    """
+
+    if activation.dim() != 2 or scale.dim() != 2:
+        raise RuntimeError(
+            "external routing expects a two-dimensional activation and scale; got "
+            f"activation {tuple(activation.shape)} and scale {tuple(scale.shape)}",
+        )
+    expected_columns = -(-int(activation.shape[1]) // MX_BLOCK_SIZE)
+    if int(scale.shape[1]) != expected_columns:
+        raise RuntimeError(
+            "external routing scale does not match the activation width: "
+            f"{int(activation.shape[1])} values need {expected_columns} blocks of "
+            f"{MX_BLOCK_SIZE}, got {int(scale.shape[1])}",
+        )
+    if int(scale.shape[0]) != int(activation.shape[0]):
+        raise RuntimeError(
+            "external routing needs one scale row per activation row; got "
+            f"{int(scale.shape[0])} rows for {int(activation.shape[0])}",
+        )
+    if scale.device != activation.device:
+        raise RuntimeError(
+            "external routing needs the scale on the activation's device; got "
+            f"{scale.device} and {activation.device}",
+        )
+
+
+__all__ = [
+    "AFDExternalRoutingInputs",
+    "MX_BLOCK_SIZE",
+    "SCALE_PAD_BYTE",
+    "require_matching_activation_scale",
+]

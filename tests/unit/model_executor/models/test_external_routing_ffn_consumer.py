@@ -66,15 +66,19 @@ class _CommBehaviour:
         stash = self.prepare_finalize.afd_external_routing
         assert stash is not None, "the consumer must publish routing before prepare"
         # Deliberately different from the transport values: anything downstream that
-        # kept using the raw routing is now visible in the result.
+        # kept using the raw routing is now visible in the result. The scale travels
+        # with the routing, as the real patch publishes it.
         self.prepare_finalize.afd_external_routing = type(stash)(
             topk_ids=torch.full_like(stash.topk_ids, ALIGNED_ID),
             topk_weights=stash.topk_weights,
+            scale=stash.scale,
         )
         return SimpleNamespace(
             hidden_states=hidden_states,
             mc2_mask=None,
-            pertoken_scale=None,
+            # The real patch publishes the stash's scale here, and the consumer installs
+            # it on the experts for the MoE to read.
+            pertoken_scale=stash.scale,
             padded_hidden_states_shape=hidden_states.shape,
         )
 
@@ -98,15 +102,19 @@ def _experts(comm: _Comm):
             raise RuntimeError("apply exploded")
         comm.applied["topk_ids"] = topk_ids
         comm.applied["topk_weights"] = topk_weights
+        # What the MoE would read to decide whether to quantize its input. Recording
+        # it here is how a test sees the scale the consumer installed.
+        comm.applied["pertoken_scale"] = experts.ascend_pertoken_scale
         return SimpleNamespace(routed_out=x + 1.0)
 
-    return SimpleNamespace(
+    experts = SimpleNamespace(
         moe_config=SimpleNamespace(is_sequence_parallel=False),
         quant_type="quant",
         quant_method=SimpleNamespace(apply=apply),
         ascend_pertoken_scale="leaked",
         ascend_mc2_mask="leaked",
     )
+    return experts
 
 
 def _layer(comm, experts):
@@ -284,3 +292,131 @@ def test_both_wired_comm_methods_clear_state_after_a_failure(monkeypatch, comm_t
     assert experts.ascend_pertoken_scale is None
     assert experts.ascend_mc2_mask is None
     assert comm.prepare_finalize.afd_external_routing is None
+
+
+def _fp8_activation(rows: int = 2):
+    return torch.zeros((rows, HIDDEN), dtype=torch.float8_e4m3fn)
+
+
+def _mx_scale(rows: int = 2, columns: int = -(-HIDDEN // 32)):
+    return torch.zeros((rows, columns), dtype=torch.float8_e8m0fnu)
+
+
+def test_a_quantized_activation_passes_through_on_allgather(monkeypatch):
+    """The direct path: the MoE receives the FP8 activation and its scale together."""
+
+    comm = _Comm()
+    _install_vllm_ascend(monkeypatch, comm)
+    experts = _experts(comm)
+    layer = _layer(comm, experts)
+    topk_ids, topk_weights = _raw_routing()
+    scale = _mx_scale()
+
+    layer._compute_external_routing_ffn(
+        _fp8_activation(),
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        activation_scale=scale,
+    )
+
+    assert comm.events == ["prepare", "apply", "finalize"]
+    # The scale published to the MoE is the one the transport carried.
+    assert comm.applied["pertoken_scale"] is scale
+
+
+def test_a_quantized_activation_is_refused_on_mc2(monkeypatch):
+    """MC2 has never been given an FP8 activation; refusing here beats failing inside."""
+
+    comm = _Mc2Comm()
+    _install_vllm_ascend(monkeypatch, comm)
+    layer = _layer(comm, _experts(comm))
+    topk_ids, topk_weights = _raw_routing()
+
+    with pytest.raises(RuntimeError, match="only wired for the ALLGATHER"):
+        layer._compute_external_routing_ffn(
+            _fp8_activation(),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            activation_scale=_mx_scale(),
+        )
+
+    assert comm.events == []
+
+
+def test_bf16_on_mc2_is_still_allowed(monkeypatch):
+    comm = _Mc2Comm()
+    _install_vllm_ascend(monkeypatch, comm)
+    layer = _layer(comm, _experts(comm))
+    topk_ids, topk_weights = _raw_routing()
+
+    layer._compute_external_routing_ffn(
+        torch.zeros(2, HIDDEN),
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+
+    assert comm.events == ["prepare", "apply", "finalize"]
+
+
+def test_a_quantized_activation_without_a_scale_is_refused(monkeypatch):
+    comm = _Comm()
+    _install_vllm_ascend(monkeypatch, comm)
+    layer = _layer(comm, _experts(comm))
+    topk_ids, topk_weights = _raw_routing()
+
+    with pytest.raises(RuntimeError, match="together"):
+        layer._compute_external_routing_ffn(
+            _fp8_activation(),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+
+
+def test_a_scale_on_a_model_dtype_activation_is_refused(monkeypatch):
+    """Otherwise the MoE would skip quantizing a tensor that is not quantized."""
+
+    comm = _Comm()
+    _install_vllm_ascend(monkeypatch, comm)
+    layer = _layer(comm, _experts(comm))
+    topk_ids, topk_weights = _raw_routing()
+
+    with pytest.raises(RuntimeError, match="together"):
+        layer._compute_external_routing_ffn(
+            torch.zeros(2, HIDDEN),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            activation_scale=_mx_scale(),
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e5m2])
+def test_a_non_target_fp8_dtype_is_refused(monkeypatch, dtype):
+    """The weight path is defined for E4M3; E5M2 must not ride the same route."""
+
+    comm = _Comm()
+    _install_vllm_ascend(monkeypatch, comm)
+    layer = _layer(comm, _experts(comm))
+    topk_ids, topk_weights = _raw_routing()
+
+    with pytest.raises(RuntimeError, match="E4M3"):
+        layer._compute_external_routing_ffn(
+            torch.zeros((2, HIDDEN), dtype=dtype),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            activation_scale=_mx_scale(),
+        )
+
+
+def test_a_scale_of_the_wrong_width_is_refused(monkeypatch):
+    comm = _Comm()
+    _install_vllm_ascend(monkeypatch, comm)
+    layer = _layer(comm, _experts(comm))
+    topk_ids, topk_weights = _raw_routing()
+
+    with pytest.raises(RuntimeError, match="does not match the activation width"):
+        layer._compute_external_routing_ffn(
+            _fp8_activation(),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            activation_scale=_mx_scale(columns=64),
+        )

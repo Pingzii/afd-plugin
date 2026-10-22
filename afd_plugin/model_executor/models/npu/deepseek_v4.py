@@ -646,6 +646,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         )
         from afd_plugin.connectors.npu.external_routing import (
             AFDExternalRoutingInputs,
+            require_matching_activation_scale,
         )
 
         routed_experts = _routed_experts_of(self.mlp)
@@ -675,6 +676,28 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 f"together; got activation={hidden_states.dtype}, "
                 f"scale={'present' if activation_scale is not None else 'absent'}",
             )
+
+        if activation_scale is not None:
+            # A pre-quantized activation is only wired for ALLGATHER. BF16 keeps
+            # working on MC2, where the receive restores the model dtype; letting the
+            # quantized form reach MC2 would send it through a prepare and dispatch
+            # that have never been given an FP8 activation, and the failure would
+            # surface inside the collective rather than here.
+            if not isinstance(comm_method, AllGatherCommImpl):
+                raise RuntimeError(
+                    "DSV4 a pre-quantized activation is only wired for the ALLGATHER "
+                    f"MoE path; got {type(comm_method).__name__}. Enable force_allgather "
+                    "or use quant_mode=0.",
+                )
+            # Only the target format is accepted. E5M2 would silently take the same
+            # route while the weight path is defined for E4M3, so it is rejected
+            # instead of being carried into the operator.
+            if hidden_states.dtype is not torch.float8_e4m3fn:
+                raise RuntimeError(
+                    "DSV4 external routing expects an E4M3 activation for the MXFP8 "
+                    f"pass-through; got {hidden_states.dtype}",
+                )
+            require_matching_activation_scale(hidden_states, activation_scale)
 
         # The ALLGATHER prepare patch is installed once during runtime start-up, not
         # here: re-installing it per layer forward only repeats work, since the patch

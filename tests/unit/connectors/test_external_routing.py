@@ -227,3 +227,65 @@ def test_split_rows_without_scale_keeps_scale_absent(inputs_type):
     taken = inputs.split_rows(lambda tensor: tensor[[0]])
     assert taken.scale is None
     assert taken.token_count == 1
+
+def _activation(rows: int, hidden: int):
+    return torch.zeros((rows, hidden), dtype=torch.float8_e4m3fn)
+
+
+def _mx_scale(rows: int, columns: int):
+    return torch.zeros((rows, columns), dtype=torch.float8_e8m0fnu)
+
+
+def test_a_matching_activation_and_scale_are_accepted(routing_module):
+    """One E8M0 exponent per 32 values: 4096 values need 128 columns."""
+
+    routing_module.require_matching_activation_scale(
+        _activation(rows=5, hidden=4096),
+        _mx_scale(rows=5, columns=128),
+    )
+
+
+@pytest.mark.parametrize(
+    ("hidden", "columns"),
+    [(4096, 128), (1, 1), (32, 1), (33, 2)],
+)
+def test_the_block_count_follows_the_activation_width(
+    routing_module,
+    hidden,
+    columns,
+):
+    routing_module.require_matching_activation_scale(
+        _activation(rows=2, hidden=hidden),
+        _mx_scale(rows=2, columns=columns),
+    )
+
+
+def test_a_scale_of_the_wrong_width_is_rejected(routing_module):
+    """The MoE reads the scale by block layout; a wrong width is a different layout."""
+
+    with pytest.raises(RuntimeError, match="does not match the activation width"):
+        routing_module.require_matching_activation_scale(
+            _activation(rows=5, hidden=4096),
+            _mx_scale(rows=5, columns=127),
+        )
+
+
+def test_a_scale_with_the_wrong_row_count_is_rejected(routing_module):
+    with pytest.raises(RuntimeError, match="one scale row per activation row"):
+        routing_module.require_matching_activation_scale(
+            _activation(rows=5, hidden=4096),
+            _mx_scale(rows=4, columns=128),
+        )
+
+
+@pytest.mark.parametrize("which", ["activation", "scale"])
+def test_a_three_dimensional_operand_is_rejected(routing_module, which):
+    activation = _activation(rows=3, hidden=64)
+    scale = _mx_scale(rows=3, columns=2)
+    if which == "activation":
+        activation = activation.unsqueeze(-1)
+    else:
+        scale = scale.unsqueeze(-1)
+
+    with pytest.raises(RuntimeError, match="two-dimensional"):
+        routing_module.require_matching_activation_scale(activation, scale)
