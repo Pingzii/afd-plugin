@@ -105,7 +105,17 @@ def _experts(comm: _Comm):
         # What the MoE would read to decide whether to quantize its input. Recording
         # it here is how a test sees the scale the consumer installed.
         comm.applied["pertoken_scale"] = experts.ascend_pertoken_scale
-        return SimpleNamespace(routed_out=x + 1.0)
+        # A marker of the right shape, built without arithmetic on ``x``: adding to an
+        # FP8 activation is not implemented on every backend, and the value here only
+        # has to be identifiable in the assertion.
+        return SimpleNamespace(
+            routed_out=torch.ones(
+                x.shape[0],
+                x.shape[1],
+                dtype=torch.float32,
+                device=x.device,
+            ),
+        )
 
     experts = SimpleNamespace(
         moe_config=SimpleNamespace(is_sequence_parallel=False),
