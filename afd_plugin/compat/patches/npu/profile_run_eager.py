@@ -6,13 +6,13 @@
 Upstream source: vllm_ascend/worker/v2/model_runner.py (8d4409d),
 ``NPUModelRunner.profile_run``.
 
-Patch reason: the profile pass runs with ``in_profile_run=True`` so that MoE
-load is spread over every expert instead of whatever the startup inputs happen
-to hit. Only the extra MC2 dummy run is wrapped in ``disable_compilation``; the
-standard ``super().profile_run()`` that follows is not, so it can be the first
-call to compile the Attention model. Compilation traces ``in_profile_run`` as a
-constant, and the compiled wrapper does not re-trace when the flag goes back to
-False, so the balanced expert ids stay substituted for real requests and
+Patch reason: the profile pass runs with ``in_profile_run=True`` so that MoE load
+is spread over every expert instead of whatever the startup inputs happen to hit.
+Only the extra MC2 dummy run is wrapped in ``disable_compilation``; the standard
+``super().profile_run()`` that follows is not, so it can be the first call to
+compile the Attention model. Compilation traces ``in_profile_run`` as a constant,
+and the compiled wrapper carries no guard and does not re-trace when the flag goes
+back to False, so the balanced expert ids stay substituted for real requests and
 override the live routing.
 
 Patch functionality: hold compilation off for the whole profile pass. The
@@ -20,18 +20,62 @@ balanced routing then stays an eager-only behaviour, and the first compile
 happens on the formal warmup, where the flag is already False.
 
 Signature: matches upstream; no added parameters.
+
+The vLLM-Ascend names are resolved on first use rather than at import time. The
+patch is installed inside a worker process and needs those modules, but keeping
+the import out of module scope lets a CPU-only host import this module and run the
+guard's behaviour against stand-ins.
 """
 
 from __future__ import annotations
 
-from vllm_ascend.ascend_forward_context import (
-    MoECommType,
-    get_mc2_tokens_capacity,
-    override_mrv2_in_profile_run,
-    select_moe_comm_method,
-)
-from vllm_ascend.worker.utils import disable_compilation
-from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+from types import ModuleType
+from typing import Any
+
+# Filled by ``_ensure_upstream_imports`` on first use, or by a test that supplies
+# its own stand-ins. Never reset once set.
+NPUModelRunner: Any = None
+disable_compilation: Any = None
+get_mc2_tokens_capacity: Any = None
+override_mrv2_in_profile_run: Any = None
+select_moe_comm_method: Any = None
+MoECommType: Any = None
+
+
+def _ensure_upstream_imports() -> None:
+    """Resolve the vLLM-Ascend names once, leaving supplied stand-ins alone."""
+
+    global NPUModelRunner, disable_compilation, get_mc2_tokens_capacity
+    global override_mrv2_in_profile_run, select_moe_comm_method, MoECommType
+
+    if NPUModelRunner is not None:
+        return
+
+    from vllm_ascend.ascend_forward_context import (
+        MoECommType as upstream_moe_comm_type,
+    )
+    from vllm_ascend.ascend_forward_context import (
+        get_mc2_tokens_capacity as upstream_get_mc2_tokens_capacity,
+    )
+    from vllm_ascend.ascend_forward_context import (
+        override_mrv2_in_profile_run as upstream_override_mrv2_in_profile_run,
+    )
+    from vllm_ascend.ascend_forward_context import (
+        select_moe_comm_method as upstream_select_moe_comm_method,
+    )
+    from vllm_ascend.worker.utils import (
+        disable_compilation as upstream_disable_compilation,
+    )
+    from vllm_ascend.worker.v2.model_runner import (
+        NPUModelRunner as upstream_model_runner,
+    )
+
+    MoECommType = upstream_moe_comm_type
+    get_mc2_tokens_capacity = upstream_get_mc2_tokens_capacity
+    override_mrv2_in_profile_run = upstream_override_mrv2_in_profile_run
+    select_moe_comm_method = upstream_select_moe_comm_method
+    disable_compilation = upstream_disable_compilation
+    NPUModelRunner = upstream_model_runner
 
 
 # Patch reason: see the module docstring. The AFD difference is the guard around
@@ -39,6 +83,8 @@ from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 # Patch functionality: forward with compilation disabled for the whole pass.
 # Signature: matches upstream; no added parameters.
 def profile_run(self) -> None:
+    _ensure_upstream_imports()
+
     # ### PATCH START: keep the profile pass out of compilation
     with disable_compilation(self.get_model()):
         # ### PATCH END: keep the profile pass out of compilation
@@ -64,10 +110,36 @@ def profile_run(self) -> None:
 def apply_profile_run_eager_patch() -> bool:
     """Install the patch once. Returns whether it is installed."""
 
+    _ensure_upstream_imports()
     if NPUModelRunner.profile_run is profile_run:
         return True
     NPUModelRunner.profile_run = profile_run
     return True
 
 
-__all__ = ["apply_profile_run_eager_patch", "profile_run"]
+def _for_testing_reset() -> None:
+    """Drop resolved upstream objects. Only tests use this."""
+
+    global NPUModelRunner, disable_compilation, get_mc2_tokens_capacity
+    global override_mrv2_in_profile_run, select_moe_comm_method, MoECommType
+
+    NPUModelRunner = None
+    disable_compilation = None
+    get_mc2_tokens_capacity = None
+    override_mrv2_in_profile_run = None
+    select_moe_comm_method = None
+    MoECommType = None
+
+
+__all__ = [
+    "MoECommType",
+    "NPUModelRunner",
+    "apply_profile_run_eager_patch",
+    "disable_compilation",
+    "get_mc2_tokens_capacity",
+    "override_mrv2_in_profile_run",
+    "profile_run",
+    "select_moe_comm_method",
+]
+
+_ = ModuleType  # keep the import meaningful for type-only readers
