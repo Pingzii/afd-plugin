@@ -100,6 +100,9 @@ def apply_afd_ascend_patches_if_needed() -> None:
     from afd_plugin.compat.patches.npu.mla_graph import (
         apply_afd_mla_graph_patch,
     )
+    from afd_plugin.compat.patches.npu.profile_run_eager import (
+        apply_profile_run_eager_patch,
+    )
 
     apply_afd_ascend_config_patch_if_needed()
     if not apply_afd_mla_graph_patch():
@@ -113,6 +116,10 @@ def apply_afd_ascend_patches_if_needed() -> None:
     # and the guard above keeps it to one install per process.
     apply_afd_external_routing_prepare_patch()
     apply_afd_external_routing_mc2_prepare_patch()
+    # The profile pass substitutes balanced expert ids, and compilation would trace
+    # that substitution into the graph the real requests replay. Installed with the
+    # rest so it is in place before the runner profiles.
+    apply_profile_run_eager_patch()
     _PATCHES_APPLIED = True
 
 

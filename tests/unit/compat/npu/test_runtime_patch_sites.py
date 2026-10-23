@@ -26,6 +26,9 @@ _ROUTING_PATCH_MODULES = (
     "afd_plugin.compat.patches.npu.external_routing_mc2_prepare",
 )
 
+_PROFILE_PATCH_MODULE = "afd_plugin.compat.patches.npu.profile_run_eager"
+_PROFILE_PATCH_INSTALLER = "apply_profile_run_eager_patch"
+
 
 def _install_fake_patch_modules(monkeypatch, calls: list[str]):
     """Replace every patch module the runtime entry points import."""
@@ -53,6 +56,7 @@ def _install_fake_patch_modules(monkeypatch, calls: list[str]):
         "afd_plugin.compat.patches.npu.external_routing_mc2_prepare": (
             "apply_afd_external_routing_mc2_prepare_patch"
         ),
+        _PROFILE_PATCH_MODULE: _PROFILE_PATCH_INSTALLER,
     }
     for name, function in fakes.items():
         monkeypatch.setitem(sys.modules, name, _module(name, function))
@@ -97,3 +101,11 @@ def test_worker_stage_installs_only_once(fresh_runtime):
 
     assert fresh_runtime.count("apply_afd_external_routing_prepare_patch") == 1
     assert fresh_runtime.count("apply_afd_external_routing_mc2_prepare_patch") == 1
+
+
+def test_worker_stage_installs_the_profile_patch(fresh_runtime):
+    """The profile pass must be guarded before any runner gets to profile."""
+
+    runtime.apply_afd_ascend_patches_if_needed()
+
+    assert fresh_runtime.count(_PROFILE_PATCH_INSTALLER) == 1

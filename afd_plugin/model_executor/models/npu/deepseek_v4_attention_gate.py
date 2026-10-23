@@ -67,7 +67,13 @@ def compute_attention_gate_topk(
         )
     else:
         topk_weights, topk_ids = _compute_standard_topk(moe, router_logits)
-    if _EXTRA_CTX.in_profile_run:
+    # Profile-only balancing must not be traced into the compiled graph. This module
+    # is compiled once behind TorchCompileWithNoGuardsWrapper
+    # (vllm/compilation/wrapper.py:47), which drops every guard and never retraces, so
+    # a specialization on in_profile_run would keep overwriting the live topk_ids for
+    # the rest of the process. is_compiling() is False for the eager profile forward
+    # and True while tracing, which is the split this needs.
+    if _EXTRA_CTX.in_profile_run and not torch.compiler.is_compiling():
         from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
             _force_balanced_topk_ids,
         )

@@ -132,8 +132,13 @@ def compute_gate_topk(
         router=gate_router,
     )
     # This proxy bypasses AscendRoutedExperts, which balances dummy profile
-    # routing. Reuse the logical-ID layout without changing live routing.
-    if force_balanced_topk_ids_enabled() or _EXTRA_CTX.in_profile_run:
+    # routing. Reuse the logical-ID layout without changing live routing. The
+    # profile flag alone must not be traced into the compiled graph -- see
+    # deepseek_v4_attention_gate.compute_attention_gate_topk -- while the explicit
+    # override is a process-wide constant and may be specialized on.
+    if force_balanced_topk_ids_enabled() or (
+        _EXTRA_CTX.in_profile_run and not torch.compiler.is_compiling()
+    ):
         topk_ids = _force_balanced_topk_ids(
             topk_ids,
             num_logical_experts=router_logits.shape[1],
