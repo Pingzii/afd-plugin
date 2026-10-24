@@ -1587,8 +1587,15 @@ def _register_camp2p_custom_ops() -> None:
         world_rank: int,
         aiv_num: int,
     ) -> torch.Tensor:
-        """Return the reference tensor while PyTorch inspects the receive."""
-        return ref_tensor
+        """Describe the receive's output to PyTorch without sharing its storage.
+
+        The real operator allocates a fresh output. Returning ``ref_tensor`` would
+        tell the compiler the output aliases its input, which it does not, and a
+        graph built on that claim may plan one buffer where the operator writes
+        another. Only the shape is needed here, so it is allocated the way the
+        operator allocates it.
+        """
+        return torch.empty_like(ref_tensor)
 
     send_annotations = {
         "hidden_states": torch.Tensor,
