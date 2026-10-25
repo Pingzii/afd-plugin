@@ -64,9 +64,8 @@ def fail_if_unsupported_npu_afd_features(
 
     if afd_config.compute_gate_on_attention:
         # The sync Attention-side gate prototype is deliberately narrow: one
-        # connector, the target model, one communication path, and for the quantized
-        # transport only eager execution. What each restriction excludes and why is
-        # documented on the check itself.
+        # connector, the target model, one communication path. What each restriction
+        # excludes and why is documented on the check itself.
         _fail_if_unsupported_sync_attention_gate(
             vllm_config,
             afd_config,
@@ -219,23 +218,11 @@ def _fail_if_unsupported_sync_attention_gate(
             "sharding as the activation, which is not written.",
         )
     from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
-    from afd_plugin.envs import A2E_QUANT_MODE_MXFP8
 
     if not isinstance(extra_info, CAMP2PExtraInfo):
         raise TypeError(
             "CAMP2pAFDConnector requires CAMP2PExtraInfo, got "
             f"{type(extra_info).__name__}",
-        )
-    if extra_info.quant_mode == A2E_QUANT_MODE_MXFP8 and not bool(
-        vllm_config.model_config.enforce_eager
-    ):
-        # Only the quantized-transport path is restricted. The BF16 gate-on-A path has
-        # relied on graph capture and is left alone: tightening it here would reject a
-        # configuration that already works.
-        raise RuntimeError(
-            "Attention-side gate with A2E MXFP8 transport is only verified in eager "
-            "mode; the pre-quantized activation has not been exercised under graph "
-            "capture. Use --enforce-eager, or quant_mode=0.",
         )
 
 
