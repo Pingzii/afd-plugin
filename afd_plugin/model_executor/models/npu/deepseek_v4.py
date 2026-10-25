@@ -743,14 +743,22 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             # The scale and mask belong to the experts module, which apply reads back.
             #
             # The MX scale the transport carries is two-dimensional, one row per token.
-            # A5's kernels want it as ``(rows, cols // 2, 2)``, and the native DP path
-            # never has to make that conversion here because it leaves the scale unset
-            # and lets the quant method produce it. Supplying the scale ourselves means
-            # normalizing it at this point, which is where the quant method would have
-            # done it. The helper returns a non-2D scale unchanged, so passing an
-            # already-normalized one is harmless.
+            # What consumes it fixes the layout, and the paths do not agree:
+            #
+            #   ALLGATHER  the fused GMM path wants ``(rows, cols // 2, 2)``, which is
+            #              what the quant method would have produced had it quantized
+            #              the activation itself.
+            #   MC2        the dispatcher's pre-quantized contract takes the scale
+            #              two-dimensionally, so normalising here would hand it the
+            #              wrong shape.
+            #   BF16       no scale at all.
+            #
+            # The condition names ALLGATHER rather than testing for "not MC2": a path
+            # added later should have to state its layout instead of inheriting one.
+            # MC2 with a pre-quantized activation is still refused earlier in this
+            # method, so that branch is a contract note until the dispatcher is wired.
             pertoken_scale = prepare_output.pertoken_scale
-            if pertoken_scale is not None:
+            if pertoken_scale is not None and isinstance(comm_method, AllGatherCommImpl):
                 pertoken_scale = maybe_normalize_mxfp_scale_layout(pertoken_scale)
             routed_experts.ascend_pertoken_scale = pertoken_scale
             routed_experts.ascend_mc2_mask = prepare_output.mc2_mask
