@@ -754,8 +754,8 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             #
             # The condition names ALLGATHER rather than testing for "not MC2": a path
             # added later should have to state its layout instead of inheriting one.
-            # MC2 with a pre-quantized activation is still refused earlier in this
-            # method, so that branch is a contract note until the dispatcher is wired.
+            # MC2 keeps the scale two-dimensional, which is what the dispatcher's
+            # pre-quantized contract takes.
             pertoken_scale = prepare_output.pertoken_scale
             if pertoken_scale is not None and isinstance(comm_method, AllGatherCommImpl):
                 pertoken_scale = maybe_normalize_mxfp_scale_layout(pertoken_scale)

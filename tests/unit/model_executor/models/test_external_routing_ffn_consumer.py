@@ -259,6 +259,10 @@ def test_an_unwired_comm_method_is_rejected(monkeypatch):
         )
 
 
+class _AlltoAllComm(_CommBehaviour):
+    """Neither wired path: the consumer's rejection case for the all-to-all family."""
+
+
 class _Mc2Comm(_CommBehaviour, _Mc2CommImpl):
     """The MC2 case: same behaviour, MC2 marker, so only the reduce decision differs."""
 
@@ -337,15 +341,43 @@ def test_a_quantized_activation_passes_through_on_allgather(monkeypatch):
     assert comm.applied["pertoken_scale"] is scale
 
 
-def test_a_quantized_activation_is_refused_on_mc2(monkeypatch):
-    """MC2 has never been given an FP8 activation; refusing here beats failing inside."""
+def test_a_quantized_activation_is_consumed_on_mc2(monkeypatch):
+    """MC2 takes the pre-quantized activation through the same three stages."""
 
     comm = _Mc2Comm()
+    _install_vllm_ascend(monkeypatch, comm)
+    experts = _experts(comm)
+    layer = _layer(comm, experts)
+    topk_ids, topk_weights = _raw_routing()
+    scale = _mx_scale()
+
+    layer._compute_external_routing_ffn(
+        _fp8_activation(),
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        activation_scale=scale,
+    )
+
+    assert comm.events == ["prepare", "apply", "finalize"]
+    # The dispatcher's contract takes the scale two-dimensionally, so this path must
+    # hand it through unchanged rather than in the layout the GMM path wants.
+    assert comm.applied["pertoken_scale"] is scale
+    # The per-token state belongs to the experts module and is cleared afterwards,
+    # whether or not the call completed.
+    assert experts.ascend_pertoken_scale is None
+    assert experts.ascend_mc2_mask is None
+    assert comm.prepare_finalize.afd_external_routing is None
+
+
+def test_a_quantized_activation_is_refused_on_an_all_to_all_path(monkeypatch):
+    """The all-to-all paths restack differently and have never been given one."""
+
+    comm = _AlltoAllComm()
     _install_vllm_ascend(monkeypatch, comm)
     layer = _layer(comm, _experts(comm))
     topk_ids, topk_weights = _raw_routing()
 
-    with pytest.raises(RuntimeError, match="only wired for the ALLGATHER"):
+    with pytest.raises(RuntimeError, match="all-to-all paths"):
         layer._compute_external_routing_ffn(
             _fp8_activation(),
             topk_ids=topk_ids,

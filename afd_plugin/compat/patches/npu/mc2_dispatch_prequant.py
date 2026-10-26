@@ -234,9 +234,10 @@ def apply_afd_mc2_dispatch_prequant_patch() -> bool:
     if current is get_dispatch_mc2_kwargs:
         return True
     # Comparing against a captured reference cannot catch a replacement that already
-    # happened when the reference was taken, so the installed function's own identity
-    # is checked instead: anything whose qualname is not upstream's method body means
-    # this patch no longer sits on the code it was written against.
+    # happened when the reference was taken. The installed function's qualname is
+    # checked instead. This is a name check, not an identity check: a wrapper that
+    # keeps upstream's qualified name would still pass, so it catches the ordinary
+    # case of another patch having taken the method and nothing more.
     expected_qualname = f"{TokenDispatcherWithMC2.__qualname__}.get_dispatch_mc2_kwargs"
     if getattr(current, "__qualname__", None) != expected_qualname:
         raise RuntimeError(
