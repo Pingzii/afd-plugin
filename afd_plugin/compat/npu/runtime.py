@@ -97,6 +97,9 @@ def apply_afd_ascend_patches_if_needed() -> None:
     from afd_plugin.compat.patches.npu.external_routing_prepare import (
         apply_afd_external_routing_prepare_patch,
     )
+    from afd_plugin.compat.patches.npu.mc2_dispatch_prequant import (
+        apply_afd_mc2_dispatch_prequant_patch,
+    )
     from afd_plugin.compat.patches.npu.mla_graph import (
         apply_afd_mla_graph_patch,
     )
@@ -116,6 +119,11 @@ def apply_afd_ascend_patches_if_needed() -> None:
     # and the guard above keeps it to one install per process.
     apply_afd_external_routing_prepare_patch()
     apply_afd_external_routing_mc2_prepare_patch()
+    # MC2's dispatch must forward the scale the Attention side sent instead of
+    # quantizing the activation a second time. Installed here for the same reason as
+    # the routing patches: it needs the MoE internals, and it has to be in place
+    # before the first forward.
+    apply_afd_mc2_dispatch_prequant_patch()
     # The profile pass substitutes balanced expert ids, and compilation would trace
     # that substitution into the graph the real requests replay. Installed with the
     # rest so it is in place before the runner profiles.

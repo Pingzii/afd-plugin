@@ -29,6 +29,9 @@ _ROUTING_PATCH_MODULES = (
 _PROFILE_PATCH_MODULE = "afd_plugin.compat.patches.npu.profile_run_eager"
 _PROFILE_PATCH_INSTALLER = "apply_profile_run_eager_patch"
 
+_MC2_DISPATCH_PATCH_MODULE = "afd_plugin.compat.patches.npu.mc2_dispatch_prequant"
+_MC2_DISPATCH_PATCH_INSTALLER = "apply_afd_mc2_dispatch_prequant_patch"
+
 
 def _install_fake_patch_modules(monkeypatch, calls: list[str]):
     """Replace every patch module the runtime entry points import."""
@@ -57,6 +60,7 @@ def _install_fake_patch_modules(monkeypatch, calls: list[str]):
             "apply_afd_external_routing_mc2_prepare_patch"
         ),
         _PROFILE_PATCH_MODULE: _PROFILE_PATCH_INSTALLER,
+        _MC2_DISPATCH_PATCH_MODULE: _MC2_DISPATCH_PATCH_INSTALLER,
     }
     for name, function in fakes.items():
         monkeypatch.setitem(sys.modules, name, _module(name, function))
