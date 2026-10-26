@@ -682,16 +682,15 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             )
 
         if activation_scale is not None:
-            # A pre-quantized activation is only wired for ALLGATHER. BF16 keeps
-            # working on MC2, where the receive restores the model dtype; letting the
-            # quantized form reach MC2 would send it through a prepare and dispatch
-            # that have never been given an FP8 activation, and the failure would
-            # surface inside the collective rather than here.
-            if not isinstance(comm_method, AllGatherCommImpl):
+            # A pre-quantized activation is wired for ALLGATHER and MC2. The all-to-all
+            # paths shard and restack differently and have never been given one, so a
+            # topology that selects one of them is refused here rather than failing
+            # inside the collective.
+            if not isinstance(comm_method, (AllGatherCommImpl, MC2CommImpl)):
                 raise RuntimeError(
-                    "DSV4 a pre-quantized activation is only wired for the ALLGATHER "
-                    f"MoE path; got {type(comm_method).__name__}. Enable force_allgather "
-                    "or use quant_mode=0.",
+                    "DSV4 a pre-quantized activation is not wired for the "
+                    f"{type(comm_method).__name__} MoE path; the all-to-all paths "
+                    "restack differently. Use quant_mode=0 or force_allgather.",
                 )
             # Only the target format is accepted. E5M2 would silently take the same
             # route while the weight path is defined for E4M3, so it is rejected

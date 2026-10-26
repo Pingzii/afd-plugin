@@ -40,14 +40,12 @@ import torch
 TokenDispatcherWithMC2: Any = None
 _get_expert_token_nums_type: Any = None
 
-_ORIGINAL_GET_DISPATCH_MC2_KWARGS: Any = None
 
 
 def _ensure_upstream_imports() -> None:
     """Resolve the vLLM-Ascend names once, leaving supplied stand-ins alone."""
 
     global TokenDispatcherWithMC2, _get_expert_token_nums_type
-    global _ORIGINAL_GET_DISPATCH_MC2_KWARGS
 
     if TokenDispatcherWithMC2 is not None:
         return
@@ -61,18 +59,62 @@ def _ensure_upstream_imports() -> None:
 
     TokenDispatcherWithMC2 = upstream_dispatcher
     _get_expert_token_nums_type = upstream_nums_type
-    _ORIGINAL_GET_DISPATCH_MC2_KWARGS = upstream_dispatcher.get_dispatch_mc2_kwargs
 
 
 def _for_testing_reset() -> None:
     """Drop resolved upstream objects. Only tests use this."""
 
     global TokenDispatcherWithMC2, _get_expert_token_nums_type
-    global _ORIGINAL_GET_DISPATCH_MC2_KWARGS
 
     TokenDispatcherWithMC2 = None
     _get_expert_token_nums_type = None
-    _ORIGINAL_GET_DISPATCH_MC2_KWARGS = None
+
+
+# The only pre-quantized combination the device smoke established, so the only one
+# this patch accepts. Anything else keeps upstream's behaviour rather than being
+# reinterpreted as already-quantized: a model-dtype activation with some other
+# scale would otherwise be passed to the operator as if its scale described it.
+PREQUANT_ACTIVATION_DTYPES = (torch.float8_e4m3fn,)
+PREQUANT_SCALE_DTYPE = torch.float8_e8m0fnu
+PREQUANT_QUANT_MODE = 0
+
+
+def _require_prequant_contract(token_dispatch_input: Any, routing_scale: Any) -> None:
+    """Reject a scale that does not describe this activation.
+
+    The check runs before the dispatch kwargs are built so a mis-specified scale
+    fails here, naming what was wrong, instead of surfacing as a shape error inside
+    the operator or as silently wrong values.
+    """
+
+    quant = token_dispatch_input.quant
+    if not quant.is_mxfp:
+        raise RuntimeError(
+            "AFD MC2 pre-quantized dispatch expects an MXFP quant feature; got "
+            f"is_mxfp={quant.is_mxfp}",
+        )
+    if routing_scale.dim() != 2:
+        raise RuntimeError(
+            "AFD MC2 pre-quantized dispatch expects a two-dimensional scale; got "
+            f"{tuple(routing_scale.shape)}",
+        )
+    if routing_scale.dtype is not PREQUANT_SCALE_DTYPE:
+        raise RuntimeError(
+            "AFD MC2 pre-quantized dispatch expects an E8M0 scale; got "
+            f"{routing_scale.dtype}",
+        )
+    if token_dispatch_input.hidden_states.dtype not in PREQUANT_ACTIVATION_DTYPES:
+        raise RuntimeError(
+            "AFD MC2 pre-quantized dispatch expects an E4M3 activation; got "
+            f"{token_dispatch_input.hidden_states.dtype}",
+        )
+    mxfp = quant.mxfp
+    act_quant_type = None if mxfp is None else mxfp.act_quant_type
+    if act_quant_type is not None and act_quant_type not in PREQUANT_ACTIVATION_DTYPES:
+        raise RuntimeError(
+            "AFD MC2 pre-quantized dispatch expects an E4M3 activation type; got "
+            f"{act_quant_type}",
+        )
 
 
 # Upstream source: vllm_ascend/ops/fused_moe/token_dispatcher.py (8d4409d),
@@ -114,9 +156,18 @@ def get_dispatch_mc2_kwargs(
         quant_mode = 0
     # ### PATCH START: a scale from the Attention side means no quantization here
     # quant_mode 0 states the activation is already quantized, so the operator reads
-    # the scale instead of producing one.
+    # the scale instead of producing one. An explicit communication quant mode that
+    # disagrees is a configuration conflict, not something to silently overrule: the
+    # caller asked for one quantisation scheme and the routing carries another.
     if routing_scale is not None:
-        quant_mode = 0
+        if comm_quant_mode is not None and int(comm_quant_mode) != PREQUANT_QUANT_MODE:
+            raise RuntimeError(
+                "AFD MC2 pre-quantized dispatch: comm_quant_mode="
+                f"{comm_quant_mode} conflicts with a pre-quantized activation, which "
+                f"requires quant_mode={PREQUANT_QUANT_MODE}",
+            )
+        _require_prequant_contract(token_dispatch_input, routing_scale)
+        quant_mode = PREQUANT_QUANT_MODE
     # ### PATCH END: a scale from the Attention side means no quantization here
     self.moe_expert_num = len(expert_map) + global_redundant_expert_num
     expert_token_nums_type = _get_expert_token_nums_type(token_dispatch_input)
@@ -179,17 +230,19 @@ def apply_afd_mc2_dispatch_prequant_patch() -> bool:
     """Install the patch once. Returns whether it is installed."""
 
     _ensure_upstream_imports()
-    if TokenDispatcherWithMC2.get_dispatch_mc2_kwargs is get_dispatch_mc2_kwargs:
+    current = TokenDispatcherWithMC2.get_dispatch_mc2_kwargs
+    if current is get_dispatch_mc2_kwargs:
         return True
-    # The multi-patch and all-to-all dispatchers share this method's shape but not
-    # its routing contract, so only the MC2 dispatcher is replaced.
-    if (
-        TokenDispatcherWithMC2.get_dispatch_mc2_kwargs
-        is not _ORIGINAL_GET_DISPATCH_MC2_KWARGS
-    ):
+    # Comparing against a captured reference cannot catch a replacement that already
+    # happened when the reference was taken, so the installed function's own identity
+    # is checked instead: anything whose qualname is not upstream's method body means
+    # this patch no longer sits on the code it was written against.
+    expected_qualname = f"{TokenDispatcherWithMC2.__qualname__}.get_dispatch_mc2_kwargs"
+    if getattr(current, "__qualname__", None) != expected_qualname:
         raise RuntimeError(
             "AFD MC2 dispatch patch: get_dispatch_mc2_kwargs is already replaced by "
-            "something else, so the upstream body this patch copies may not match",
+            f"{getattr(current, '__qualname__', current)!r}, so the upstream body this "
+            "patch copies may not match",
         )
     TokenDispatcherWithMC2.get_dispatch_mc2_kwargs = get_dispatch_mc2_kwargs
     return True
