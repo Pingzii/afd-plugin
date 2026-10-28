@@ -115,10 +115,10 @@ def apply_afd_ascend_patches_if_needed() -> None:
     # runs from the worker constructor, before any model load, warm-up or forward,
     # and the guard above keeps it to one install per process.
     #
-    # Neither return value is a failure signal. The ALLGATHER installer answers False
-    # for a second install that reused the first capture, and the MC2 installer is
-    # idempotent by assignment. An unusable target raises instead, and that must
-    # abort initialization rather than be caught here.
+    # Both installers are idempotent: the ALLGATHER one returns early when the class
+    # attribute already holds it, and the MC2 one assigns the same function again. An
+    # unusable target raises instead, and that must abort initialization rather than
+    # be caught here.
     apply_afd_external_routing_prepare_patch()
     apply_afd_external_routing_mc2_prepare_patch()
     _PATCHES_APPLIED = True
