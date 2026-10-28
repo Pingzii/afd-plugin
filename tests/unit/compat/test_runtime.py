@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
+import functools
 import sys
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
@@ -140,14 +141,23 @@ def isolate_ascend_config_installer(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def isolate_profile_run_eager_installer(monkeypatch):
-    # The profile-run patch resolves vLLM-Ascend worker modules that a CPU host
-    # does not have. These tests exercise the other installers; the profile patch
-    # has its own coverage in tests/unit/compat/patches/npu/.
-    module_name = "afd_plugin.compat.patches.npu.profile_run_eager"
-    profile_run_eager = ModuleType(module_name)
-    profile_run_eager.__dict__["apply_profile_run_eager_patch"] = lambda: True
-    monkeypatch.setitem(sys.modules, module_name, profile_run_eager)
+def isolate_worker_installers(monkeypatch):
+    # These installers resolve vLLM-Ascend worker modules that a CPU host does not
+    # have. These tests exercise the installer wiring; each patch has its own
+    # coverage next to it.
+    installed: list[str] = []
+    for stem, attribute in (
+        ("profile_run_eager", "apply_profile_run_eager_patch"),
+        ("external_routing_prepare", "apply_afd_external_routing_prepare_patch"),
+        (
+            "external_routing_mc2_prepare",
+            "apply_afd_external_routing_mc2_prepare_patch",
+        ),
+    ):
+        module = ModuleType(f"afd_plugin.compat.patches.npu.{stem}")
+        module.__dict__[attribute] = functools.partial(installed.append, stem)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    return installed
 
 
 @pytest.mark.usefixtures("isolate_ascend_config_installer")
@@ -389,3 +399,61 @@ def test_npu_patch_installer_installs_profile_run_eager(monkeypatch):
     ascend_runtime.apply_afd_ascend_patches_if_needed()
 
     assert installed == [True]
+
+
+def _install_with_stubbed_neighbours(monkeypatch):
+    from afd_plugin.compat.patches.npu import mla_graph
+
+    monkeypatch.setattr(
+        ascend_runtime, "apply_afd_ascend_config_patch_if_needed", lambda: None
+    )
+    monkeypatch.setattr(mla_graph, "apply_afd_mla_graph_patch", lambda: True)
+    monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
+
+
+def test_npu_patch_installer_installs_both_routing_prepares(
+    monkeypatch, isolate_worker_installers
+):
+    """Both MoE prepare paths must be replaced before the first forward."""
+
+    _install_with_stubbed_neighbours(monkeypatch)
+
+    ascend_runtime.apply_afd_ascend_patches_if_needed()
+
+    assert "external_routing_prepare" in isolate_worker_installers
+    assert "external_routing_mc2_prepare" in isolate_worker_installers
+
+
+def test_npu_patch_installer_runs_each_routing_prepare_once(
+    monkeypatch, isolate_worker_installers
+):
+    """A second initialization in the same process must not reinstall them."""
+
+    _install_with_stubbed_neighbours(monkeypatch)
+
+    ascend_runtime.apply_afd_ascend_patches_if_needed()
+    ascend_runtime.apply_afd_ascend_patches_if_needed()
+
+    for stem in ("external_routing_prepare", "external_routing_mc2_prepare"):
+        assert isolate_worker_installers.count(stem) == 1
+
+
+def test_a_failing_routing_install_aborts_initialization(
+    monkeypatch, isolate_worker_installers
+):
+    """An unusable prepare target must surface, not leave the run half-patched."""
+
+    _install_with_stubbed_neighbours(monkeypatch)
+    module = sys.modules["afd_plugin.compat.patches.npu.external_routing_prepare"]
+
+    def explode() -> bool:
+        raise RuntimeError("ALLGATHER prepare target is unusable")
+
+    monkeypatch.setattr(module, "apply_afd_external_routing_prepare_patch", explode)
+
+    with pytest.raises(RuntimeError, match="ALLGATHER prepare target is unusable"):
+        ascend_runtime.apply_afd_ascend_patches_if_needed()
+
+    assert ascend_runtime._PATCHES_APPLIED is False
+    # The failure stops the sequence; the MC2 prepare is not attempted after it.
+    assert "external_routing_mc2_prepare" not in isolate_worker_installers
