@@ -8,9 +8,9 @@ upstream modules it imports at call time. The routing payload itself is the real
 type, loaded from its file.
 
 What this covers: the prepared (padded/gathered/split) routing reaches ``apply``, the
-ALLGATHER and MC2 paths differ only in whether finalize reduces across ranks, and a
-failure in prepare or apply leaves no per-call state behind. A failure inside finalize
-is not covered here.
+ALLGATHER and MC2 paths differ only in whether finalize reduces across ranks, a failure
+in prepare, apply or finalize leaves no per-call state behind, and a later call starts
+from its own routing rather than the previous call's.
 
 Native model construction, the real operators and graph execution stay with the
 green-zone suite.
@@ -89,6 +89,7 @@ class _Recorder:
         self.finalize_kwargs = None
         self.prepare_error = None
         self.apply_error = None
+        self.finalize_error = None
 
     def build(self, comm_base, *, padded_rows: int = 3, mc2_mask=None):
         recorder = self
@@ -117,6 +118,8 @@ class _Recorder:
                 )
 
             def finalize(self, **kwargs):
+                if recorder.finalize_error is not None:
+                    raise recorder.finalize_error
                 recorder.finalize_kwargs = kwargs
                 return torch.zeros(1, 4)
 
@@ -305,3 +308,58 @@ def test_mc2_mask_is_cleared_when_apply_fails(consumer):
     # The mask was non-empty before the failure, so only the cleanup can clear it.
     assert routed_experts.ascend_mc2_mask is None
     assert routed_experts.ascend_pertoken_scale is None
+
+
+def test_a_failed_finalize_leaves_no_per_call_state(consumer):
+    """finalize runs outside the inner cleanup, so the outer one has to cover it."""
+
+    recorder, consumer_fn, AllGather, _, context_module = consumer
+    routed_experts = recorder.routed_experts()
+    subject = types.SimpleNamespace(mlp=routed_experts)
+    comm = recorder.build(AllGather, padded_rows=3)
+    recorder.finalize_error = RuntimeError("finalize exploded")
+    context_module._EXTRA_CTX.moe_comm_method = comm
+    topk_ids, topk_weights = _routing_rows()
+
+    with pytest.raises(RuntimeError, match="finalize exploded"):
+        consumer_fn(
+            subject,
+            torch.zeros(2, 4),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+
+    assert comm.prepare_finalize.afd_external_routing is None
+    assert routed_experts.ascend_pertoken_scale is None
+    assert routed_experts.ascend_mc2_mask is None
+
+
+def test_a_later_call_uses_its_own_routing(consumer):
+    """A second forward must publish its own pair instead of reusing the first."""
+
+    recorder, consumer_fn, AllGather, _, context_module = consumer
+    routed_experts = recorder.routed_experts()
+    subject = types.SimpleNamespace(mlp=routed_experts)
+    comm = recorder.build(AllGather, padded_rows=2)
+    context_module._EXTRA_CTX.moe_comm_method = comm
+
+    first_ids, first_weights = _routing_rows()
+    consumer_fn(
+        subject,
+        torch.zeros(2, 4),
+        topk_ids=first_ids,
+        topk_weights=first_weights,
+    )
+    assert recorder.apply_kwargs["topk_ids"][:2].tolist() == first_ids.tolist()
+
+    second_ids = first_ids + 50
+    second_weights = first_weights + 5
+    consumer_fn(
+        subject,
+        torch.zeros(2, 4),
+        topk_ids=second_ids,
+        topk_weights=second_weights,
+    )
+
+    assert recorder.apply_kwargs["topk_ids"][:2].tolist() == second_ids.tolist()
+    assert recorder.apply_kwargs["topk_weights"][:2].tolist() == second_weights.tolist()
