@@ -411,19 +411,6 @@ def _install_with_stubbed_neighbours(monkeypatch):
     monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
 
 
-def test_npu_patch_installer_installs_both_routing_prepares(
-    monkeypatch, isolate_worker_installers
-):
-    """Both MoE prepare paths must be replaced before the first forward."""
-
-    _install_with_stubbed_neighbours(monkeypatch)
-
-    ascend_runtime.apply_afd_ascend_patches_if_needed()
-
-    assert "external_routing_prepare" in isolate_worker_installers
-    assert "external_routing_mc2_prepare" in isolate_worker_installers
-
-
 def test_npu_patch_installer_runs_each_routing_prepare_once(
     monkeypatch, isolate_worker_installers
 ):

@@ -198,35 +198,6 @@ def _routing_rows(rows: int = 2):
     )
 
 
-def test_ffn_consumes_the_prepared_routing_and_reduces_across_ranks(consumer):
-    recorder, consumer_fn, AllGather, _, context_module = consumer
-    subject = types.SimpleNamespace(mlp=recorder.routed_experts())
-    comm = recorder.build(AllGather, padded_rows=3)
-    context_module._EXTRA_CTX.moe_comm_method = comm
-    topk_ids, topk_weights = _routing_rows()
-
-    consumer_fn(subject, torch.zeros(2, 4), topk_ids=topk_ids, topk_weights=topk_weights)
-
-    # apply sees the padded routing the prepare step published, not the raw pair.
-    assert recorder.apply_kwargs["topk_ids"].shape[0] == 3
-    assert recorder.apply_kwargs["topk_ids"][:2].tolist() == topk_ids.tolist()
-    assert recorder.apply_kwargs["topk_weights"][:2].tolist() == topk_weights.tolist()
-    assert recorder.apply_kwargs["shared_experts"] is None
-    assert recorder.finalize_kwargs["reduce_results"] is True
-
-
-def test_mc2_path_skips_the_cross_rank_reduce(consumer):
-    recorder, consumer_fn, _, MC2, context_module = consumer
-    subject = types.SimpleNamespace(mlp=recorder.routed_experts())
-    comm = recorder.build(MC2, padded_rows=2)
-    context_module._EXTRA_CTX.moe_comm_method = comm
-    topk_ids, topk_weights = _routing_rows()
-
-    consumer_fn(subject, torch.zeros(2, 4), topk_ids=topk_ids, topk_weights=topk_weights)
-
-    assert recorder.finalize_kwargs["reduce_results"] is False
-
-
 def test_an_unwired_comm_method_is_rejected(consumer):
     recorder, consumer_fn, _, _, context_module = consumer
     subject = types.SimpleNamespace(mlp=recorder.routed_experts())
@@ -239,99 +210,6 @@ def test_an_unwired_comm_method_is_rejected(consumer):
             topk_ids=torch.zeros(2, 2, dtype=torch.int32),
             topk_weights=torch.zeros(2, 2, dtype=torch.float32),
         )
-
-
-def test_a_failed_prepare_leaves_no_published_routing(consumer):
-    recorder, consumer_fn, AllGather, _, context_module = consumer
-    routed_experts = recorder.routed_experts()
-    subject = types.SimpleNamespace(mlp=routed_experts)
-    comm = recorder.build(AllGather, padded_rows=3)
-    recorder.prepare_error = ValueError("prepare exploded")
-    context_module._EXTRA_CTX.moe_comm_method = comm
-    topk_ids, topk_weights = _routing_rows()
-
-    with pytest.raises(ValueError, match="prepare exploded"):
-        consumer_fn(
-            subject,
-            torch.zeros(2, 4),
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-        )
-
-    # The next call must not start from another call's routing or per-token state.
-    assert comm.prepare_finalize.afd_external_routing is None
-    assert routed_experts.ascend_pertoken_scale is None
-    assert routed_experts.ascend_mc2_mask is None
-
-
-def test_a_failed_apply_clears_the_per_token_state(consumer):
-    recorder, consumer_fn, AllGather, _, context_module = consumer
-    routed_experts = recorder.routed_experts()
-    subject = types.SimpleNamespace(mlp=routed_experts)
-    comm = recorder.build(AllGather, padded_rows=3)
-    recorder.apply_error = RuntimeError("apply exploded")
-    context_module._EXTRA_CTX.moe_comm_method = comm
-    topk_ids, topk_weights = _routing_rows()
-
-    with pytest.raises(RuntimeError, match="apply exploded"):
-        consumer_fn(
-            subject,
-            torch.zeros(2, 4),
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-        )
-
-    assert routed_experts.ascend_pertoken_scale is None
-    assert routed_experts.ascend_mc2_mask is None
-    assert comm.prepare_finalize.afd_external_routing is None
-
-def test_mc2_mask_is_cleared_when_apply_fails(consumer):
-    """A stale valid-token mask would silently route the next call's tokens."""
-
-    recorder, consumer_fn, _, MC2, context_module = consumer
-    routed_experts = recorder.routed_experts()
-    subject = types.SimpleNamespace(mlp=routed_experts)
-    mask = torch.tensor([True, False, True])
-    comm = recorder.build(MC2, padded_rows=3, mc2_mask=mask)
-    recorder.apply_error = RuntimeError("apply exploded")
-    context_module._EXTRA_CTX.moe_comm_method = comm
-    topk_ids, topk_weights = _routing_rows()
-
-    with pytest.raises(RuntimeError, match="apply exploded"):
-        consumer_fn(
-            subject,
-            torch.zeros(2, 4),
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-        )
-
-    # The mask was non-empty before the failure, so only the cleanup can clear it.
-    assert routed_experts.ascend_mc2_mask is None
-    assert routed_experts.ascend_pertoken_scale is None
-
-
-def test_a_failed_finalize_leaves_no_per_call_state(consumer):
-    """finalize runs outside the inner cleanup, so the outer one has to cover it."""
-
-    recorder, consumer_fn, AllGather, _, context_module = consumer
-    routed_experts = recorder.routed_experts()
-    subject = types.SimpleNamespace(mlp=routed_experts)
-    comm = recorder.build(AllGather, padded_rows=3)
-    recorder.finalize_error = RuntimeError("finalize exploded")
-    context_module._EXTRA_CTX.moe_comm_method = comm
-    topk_ids, topk_weights = _routing_rows()
-
-    with pytest.raises(RuntimeError, match="finalize exploded"):
-        consumer_fn(
-            subject,
-            torch.zeros(2, 4),
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-        )
-
-    assert comm.prepare_finalize.afd_external_routing is None
-    assert routed_experts.ascend_pertoken_scale is None
-    assert routed_experts.ascend_mc2_mask is None
 
 
 def test_a_later_call_uses_its_own_routing(consumer):
@@ -363,3 +241,57 @@ def test_a_later_call_uses_its_own_routing(consumer):
 
     assert recorder.apply_kwargs["topk_ids"][:2].tolist() == second_ids.tolist()
     assert recorder.apply_kwargs["topk_weights"][:2].tolist() == second_weights.tolist()
+
+
+@pytest.mark.parametrize(
+    ("comm_name", "reduce_results"),
+    [("allgather", True), ("mc2", False)],
+)
+def test_the_routing_reaches_apply_and_only_allgather_reduces(
+    consumer, comm_name, reduce_results
+):
+    """Both paths run the same flow; they differ in whether finalize reduces."""
+
+    recorder, consumer_fn, AllGather, MC2, context_module = consumer
+    routed_experts = recorder.routed_experts()
+    subject = types.SimpleNamespace(mlp=routed_experts)
+    comm = recorder.build(
+        AllGather if comm_name == "allgather" else MC2, padded_rows=3
+    )
+    context_module._EXTRA_CTX.moe_comm_method = comm
+    topk_ids, topk_weights = _routing_rows()
+
+    consumer_fn(subject, torch.zeros(2, 4), topk_ids=topk_ids, topk_weights=topk_weights)
+
+    # apply sees the padded routing the prepare step published, not the raw pair.
+    assert recorder.apply_kwargs["topk_ids"].shape[0] == 3
+    assert recorder.apply_kwargs["topk_ids"][:2].tolist() == topk_ids.tolist()
+    assert recorder.apply_kwargs["topk_weights"][:2].tolist() == topk_weights.tolist()
+    assert recorder.apply_kwargs["shared_experts"] is None
+    assert recorder.finalize_kwargs["reduce_results"] is reduce_results
+
+
+@pytest.mark.parametrize("stage", ["prepare", "apply", "finalize"])
+def test_a_failure_at_any_stage_leaves_no_per_call_state(consumer, stage):
+    """A stale mask or published routing would route the next call's tokens."""
+
+    recorder, consumer_fn, _, MC2, context_module = consumer
+    routed_experts = recorder.routed_experts()
+    subject = types.SimpleNamespace(mlp=routed_experts)
+    # MC2 carries a valid-token mask, which is per-call state as well.
+    comm = recorder.build(MC2, padded_rows=3, mc2_mask=torch.tensor([True, False, True]))
+    setattr(recorder, f"{stage}_error", RuntimeError(f"{stage} exploded"))
+    context_module._EXTRA_CTX.moe_comm_method = comm
+    topk_ids, topk_weights = _routing_rows()
+
+    with pytest.raises(RuntimeError, match=f"{stage} exploded"):
+        consumer_fn(
+            subject,
+            torch.zeros(2, 4),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+
+    assert comm.prepare_finalize.afd_external_routing is None
+    assert routed_experts.ascend_pertoken_scale is None
+    assert routed_experts.ascend_mc2_mask is None

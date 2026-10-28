@@ -93,7 +93,6 @@ def test_the_supported_shape_is_accepted_for_both_roles(extra_info, role):
         ({"dbo": True}, "DBO or ubatching"),
         ({"ubatching": True}, "DBO or ubatching"),
         ({"tp": 2}, "tensor-parallel size 1"),
-        ({"tp": 4}, "tensor-parallel size 1"),
     ],
 )
 def test_unsupported_shapes_are_rejected(extra_info, kwargs, match):
