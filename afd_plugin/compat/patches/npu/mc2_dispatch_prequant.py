@@ -18,9 +18,13 @@ Patch functionality: when the routing carries a scale, pass it through and set
 Every other configuration keeps upstream's behaviour exactly: no scale means
 ``scales`` stays ``None`` and the quant mode is resolved as before.
 
-The device smoke in ``tests/npu/mc2_prequant_smoke.py`` established that the
+The contract comes from a device smoke that this branch does not carry: the script
+(``tests/npu/mc2_prequant_smoke.py``) and its runner landed with the pre-quantized
+dispatch work, commit ``1096b53`` on the experiment branch. What it established: the
 installed operator accepts FP8 activations with a two-dimensional E8M0 scale at
-``quant_mode=0`` and returns a scale of the same shape next to the activation.
+``quant_mode=0`` and returns a scale of the same shape next to the activation. The
+branch that owns this patch has not repeated that run, so the acceptance above is a
+recorded result rather than a current measurement.
 Where that output goes downstream is upstream's existing path: ``token_dispatch``
 unpacks it as ``dynamic_scale`` and the MXFP quant method normalizes its layout
 when it consumes it, so nothing here converts it.
