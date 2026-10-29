@@ -275,11 +275,22 @@ class AFDA2FTransferPayload:
         input_ids: Optional token-aligned identifiers required by the remote
             FFN implementation.
         topk_ids: Optional expert indices selected by an Attention-side gate,
-            shaped ``(tokens, topk)``. Present instead of ``input_ids`` when the
-            Attention role transported its gate result over the ids channel.
-        topk_weights: Optional routing weights paired with ``topk_ids``, same
-            shape. The FFN side consumes them as the gate weights, so any
-            model-level routed scaling is already folded in.
+            shaped ``(tokens, topk)`` as ``int32``.
+        topk_weights: Optional routing weights paired with ``topk_ids``, shaped
+            ``(tokens, topk)`` as ``float32``. The two are present together or
+            not at all.
+        activation_scale: Optional MX block scale for a pre-quantized activation,
+            shaped ``(tokens, ceil(hidden_size / 32))`` as ``float8_e8m0fnu``.
+            Present only when the transport carried an MXFP8 activation.
+
+            **Transitional state -- not a usable pair yet.** When this is set,
+            ``hidden_states`` has already been dequantized back to the model dtype,
+            so the two fields do not describe one tensor: the scale belongs to the
+            quantized activation that was received, not to what is in
+            ``hidden_states``. Do not hand this scale to a MoE that skips input
+            quantization when a scale is present: it would treat the dequantized
+            tensor as pre-quantized. Making them a real pair means also keeping the
+            FP8 activation, which the receive does not do today.
     """
 
     hidden_states: torch.Tensor
@@ -288,6 +299,7 @@ class AFDA2FTransferPayload:
     input_ids: torch.Tensor | None = None
     topk_ids: torch.Tensor | None = None
     topk_weights: torch.Tensor | None = None
+    activation_scale: torch.Tensor | None = None
 
 
 @dataclass(slots=True)

@@ -154,3 +154,77 @@ def test_non_float_weights_are_rejected(inputs_type):
             topk_ids=torch.zeros(2, 2, dtype=torch.int32),
             topk_weights=torch.zeros(2, 2, dtype=torch.int32),
         )
+
+# --- quantized transport: the E8M0 scale that rides beside the activation ---
+
+_SCALE_COLUMNS = 8  # ceil(hidden / 32) for the stand-in shape
+_E8M0_NEUTRAL_BYTE = 127  # 2**0, the neutral exponent for a zeroed activation row
+
+
+def _scale_bytes(rows: int, rank: int = 0) -> torch.Tensor:
+    """Exponent bytes carrying rank and position, so an ordering bug changes them."""
+
+    base = rank * 100 + 30
+    values = torch.arange(base, base + rows * _SCALE_COLUMNS, dtype=torch.int32)
+    return values.to(torch.uint8).reshape(rows, _SCALE_COLUMNS)
+
+
+def _scale(rows: int, rank: int = 0) -> torch.Tensor:
+    return _scale_bytes(rows, rank).view(torch.float8_e8m0fnu)
+
+
+def _quantized(inputs_type, rows: int, rank: int = 0):
+    plain = _inputs(inputs_type, rows, rank)
+    return inputs_type(
+        topk_ids=plain.topk_ids,
+        topk_weights=plain.topk_weights,
+        scale=_scale(rows, rank),
+    )
+
+
+def _two_rank_scale_gather(tensor):
+    """The ids gather's stand-in, in byte space: rank 1 carries offset exponents."""
+
+    return torch.cat([tensor, (tensor.to(torch.int16) + 10).to(torch.uint8)], dim=0)
+
+
+def test_scale_padding_appends_the_neutral_exponent(inputs_type):
+    """Padding happens in byte space, where neutral is 127, not zero.
+
+    A zero byte would scale the padded activation row by 2**-127 instead of leaving it at
+    zero; the two are only equivalent if the padding row is exactly zero *and* the consumer
+    multiplies, which is not what the operators guarantee.
+    """
+
+    padded = _quantized(inputs_type, 2).padded(3)
+
+    assert padded.scale.shape == (5, _SCALE_COLUMNS)
+    assert padded.scale.view(torch.uint8)[:2].tolist() == _scale_bytes(2).tolist()
+    assert padded.scale.view(torch.uint8)[2:].tolist() == [
+        [_E8M0_NEUTRAL_BYTE] * _SCALE_COLUMNS
+    ] * 3
+
+
+def test_scale_gathering_keeps_rank_order(inputs_type):
+    gathered = _quantized(inputs_type, 2).gathered(_two_rank_scale_gather)
+
+    first = _scale_bytes(2, rank=0)
+    second = (first.to(torch.int16) + 10).to(torch.uint8)
+    assert gathered.scale.view(torch.uint8).tolist() == torch.cat([first, second]).tolist()
+
+
+def test_scale_split_takes_one_rank_slice(inputs_type):
+    taken = _quantized(inputs_type, 4).split_rows(
+        lambda tensor: torch.tensor_split(tensor, 2, dim=0)[1]
+    )
+
+    assert taken.scale.view(torch.uint8).tolist() == _scale_bytes(4)[2:].tolist()
+
+
+def test_scale_row_count_must_match_the_tokens(inputs_type):
+    with pytest.raises(ValueError, match="one row per token"):
+        inputs_type(
+            topk_ids=torch.zeros(2, 2, dtype=torch.int32),
+            topk_weights=torch.zeros(2, 2, dtype=torch.float32),
+            scale=_scale(3),
+        )
