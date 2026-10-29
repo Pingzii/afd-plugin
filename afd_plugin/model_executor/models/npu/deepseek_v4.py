@@ -538,6 +538,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         group_list_type: int = 1,
         topk_ids: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
+        activation_scale: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | AFDF2ATransferPayload:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
@@ -566,6 +567,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
+                activation_scale=activation_scale,
             )
 
         if self.compute_gate_on_attention:
@@ -610,6 +612,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         *,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        activation_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the FFN on routing the Attention side computed.
 
@@ -638,8 +641,13 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             MC2CommImpl,
         )
 
+        from vllm_ascend.ops.fused_moe.moe_utils import (
+            maybe_normalize_mxfp_scale_layout,
+        )
+
         from afd_plugin.connectors.npu.external_routing import (
             AFDExternalRoutingInputs,
+            require_matching_activation_scale,
         )
 
         routed_experts = _routed_experts_of(self.mlp)
@@ -651,6 +659,30 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                 "differently and are not verified yet.",
             )
 
+        # The activation and its scale are a pair or nothing. A quantized activation without
+        # its scale cannot be interpreted, and a scale without a quantized activation would
+        # make the MoE skip quantizing a model-dtype tensor. The constructor also rejects a
+        # malformed scale.
+        activation_is_quantized = hidden_states.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
+        if activation_is_quantized != (activation_scale is not None):
+            raise RuntimeError(
+                "DSV4 external routing needs the quantized activation and its scale "
+                f"together; got activation={hidden_states.dtype}, "
+                f"scale={'present' if activation_scale is not None else 'absent'}",
+            )
+        if activation_scale is not None:
+            # Only the target format is accepted. E5M2 would silently take the same route
+            # while the weight path is defined for E4M3.
+            if hidden_states.dtype is not torch.float8_e4m3fn:
+                raise RuntimeError(
+                    "DSV4 external routing expects an E4M3 activation for the MXFP8 "
+                    f"pass-through; got {hidden_states.dtype}",
+                )
+            require_matching_activation_scale(hidden_states, activation_scale)
+
         # The ALLGATHER prepare patch is installed once during runtime start-up, not
         # here: re-installing it per layer forward only repeats work, since the patch
         # already behaves exactly like upstream when no routing was published.
@@ -658,9 +690,12 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
         # The prepare patch reads the routing from this attribute and writes the
         # padded/gathered version back, so the two must be the same object.
         prepare_finalize = comm_method.prepare_finalize
+        # The scale travels with the routing so the prepare patch pads, gathers or shards
+        # it by exactly the same rule as the activation rows it belongs to.
         prepare_finalize.afd_external_routing = AFDExternalRoutingInputs(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            scale=activation_scale,
         )
         try:
             prepare_output = comm_method.prepare(
@@ -677,7 +712,21 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
                     "prepare patch did not run",
                 )
             # The scale and mask belong to the experts module, which apply reads back.
-            routed_experts.ascend_pertoken_scale = prepare_output.pertoken_scale
+            # What consumes it fixes the layout, and the paths do not agree:
+            #
+            #   ALLGATHER  the fused GMM path wants ``(rows, cols // 2, 2)``, which is what
+            #              the quant method would have produced had it quantized here.
+            #   MC2        the dispatcher's pre-quantized contract takes the scale
+            #              two-dimensionally, so normalising here would hand it the wrong
+            #              shape.
+            #   BF16       no scale at all.
+            #
+            # The condition names ALLGATHER rather than testing for "not MC2": a path added
+            # later should have to state its layout instead of inheriting one.
+            pertoken_scale = prepare_output.pertoken_scale
+            if pertoken_scale is not None and isinstance(comm_method, AllGatherCommImpl):
+                pertoken_scale = maybe_normalize_mxfp_scale_layout(pertoken_scale)
+            routed_experts.ascend_pertoken_scale = pertoken_scale
             routed_experts.ascend_mc2_mask = prepare_output.mc2_mask
             try:
                 fused = routed_experts.quant_method.apply(

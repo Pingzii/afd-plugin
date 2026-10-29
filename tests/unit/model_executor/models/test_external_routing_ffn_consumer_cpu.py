@@ -51,7 +51,7 @@ def _load_routing_inputs():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.AFDExternalRoutingInputs
+    return module
 
 
 def _compile_consumer(inputs_type):
@@ -109,10 +109,24 @@ class _Recorder:
                 self.prepare_finalize.afd_external_routing = published.padded(
                     padded_rows - published.token_count,
                 )
+                aligned = self.prepare_finalize.afd_external_routing
+                received = kwargs["hidden_states"]
+                missing = padded_rows - received.shape[0]
+                prepared = (
+                    received
+                    if missing <= 0
+                    else torch.cat(
+                        (
+                            received,
+                            received.new_zeros((missing, received.shape[1])),
+                        ),
+                    )
+                )
                 return types.SimpleNamespace(
-                    hidden_states=torch.zeros(padded_rows, 4),
-                    # BF16 carries no activation scale; the mask is MC2's own state.
-                    pertoken_scale=None,
+                    hidden_states=prepared,
+                    # Derived from what prepare received: if the consumer never put the scale
+                    # on the routing, this stays None and the assertions below fail.
+                    pertoken_scale=aligned.scale,
                     mc2_mask=self.mc2_mask,
                     padded_hidden_states_shape=None,
                 )
@@ -134,6 +148,9 @@ class _Recorder:
                 if recorder.apply_error is not None:
                     raise recorder.apply_error
                 recorder.apply_kwargs = kwargs
+                # The consumer clears this in its finally, so capture it here.
+                scale = getattr(kwargs.get("layer"), "ascend_pertoken_scale", None)
+                recorder.applied_scale = None if scale is None else scale.clone()
                 return types.SimpleNamespace(routed_out=torch.zeros(1, 4))
 
         return types.SimpleNamespace(
@@ -147,7 +164,8 @@ class _Recorder:
 
 @pytest.fixture
 def consumer(monkeypatch):
-    inputs_type = _load_routing_inputs()
+    routing_source = _load_routing_inputs()
+    inputs_type = routing_source.AFDExternalRoutingInputs
     recorder = _Recorder(inputs_type)
 
     class AllGatherCommImpl:
@@ -173,12 +191,28 @@ def consumer(monkeypatch):
         "vllm_ascend.ops.fused_moe.moe_comm_method",
         comm_module,
     )
+    moe_utils = types.ModuleType("vllm_ascend.ops.fused_moe.moe_utils")
+
+    def maybe_normalize_mxfp_scale_layout(scale):
+        """Upstream's 2-D -> ``(rows, cols // 2, 2)`` conversion, as the kernels want."""
+
+        if scale.dim() != 2:
+            return scale
+        return scale.view(scale.shape[0], scale.shape[1] // 2, 2)
+
+    moe_utils.maybe_normalize_mxfp_scale_layout = maybe_normalize_mxfp_scale_layout
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.ops.fused_moe.moe_utils", moe_utils
+    )
     monkeypatch.setitem(sys.modules, "vllm_ascend.ascend_forward_context", context_module)
 
     # The real payload type, registered so the consumer's deferred import finds it
     # without importing the connectors package (which pulls vLLM in).
     routing_module = types.ModuleType("afd_plugin.connectors.npu.external_routing")
     routing_module.AFDExternalRoutingInputs = inputs_type
+    routing_module.require_matching_activation_scale = (
+        routing_source.require_matching_activation_scale
+    )
     for name in ("afd_plugin", "afd_plugin.connectors", "afd_plugin.connectors.npu"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     monkeypatch.setitem(
@@ -295,3 +329,66 @@ def test_a_failure_at_any_stage_leaves_no_per_call_state(consumer, stage):
     assert comm.prepare_finalize.afd_external_routing is None
     assert routed_experts.ascend_pertoken_scale is None
     assert routed_experts.ascend_mc2_mask is None
+
+_HIDDEN = 64  # 64 / 32 = 2 blocks, so a two-column scale is the right width
+
+
+def _counted_scale(rows: int, columns: int = 2) -> torch.Tensor:
+    """Bytes that encode row and column, so a re-layout that reorders them is visible."""
+
+    values = [[10 * (row + 1) + column for column in range(columns)] for row in range(rows)]
+    return torch.tensor(values, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_shape"),
+    [("allgather", (2, 1, 2)), ("mc2", (2, 2))],
+)
+def test_the_scale_layout_follows_the_moe_path(consumer, path, expected_shape):
+    """ALLGATHER's GMM takes three dimensions; MC2's dispatcher takes two."""
+
+    recorder, consumer_fn, AllGather, MC2, context_module = consumer
+    subject = types.SimpleNamespace(mlp=recorder.routed_experts())
+    comm_cls = AllGather if path == "allgather" else MC2
+    context_module._EXTRA_CTX.moe_comm_method = recorder.build(comm_cls, padded_rows=2)
+    ids, weights = _routing_rows()
+
+    consumer_fn(
+        subject,
+        torch.zeros(2, _HIDDEN, dtype=torch.float8_e4m3fn),
+        topk_ids=ids,
+        topk_weights=weights,
+        activation_scale=_counted_scale(2),
+    )
+
+    observed = recorder.applied_scale
+    assert observed is not None, "the experts must see the transported scale"
+    assert tuple(observed.shape) == expected_shape
+    # Bytes, not just the count: a re-layout that dropped, duplicated or reordered a block
+    # still has four values.
+    assert observed.view(torch.uint8).reshape(-1).tolist() == [10, 11, 20, 21]
+
+    prepared = recorder.apply_kwargs["x"]
+    assert prepared.dtype == torch.float8_e4m3fn, "the experts receive the quantized form"
+    assert prepared.shape == (2, _HIDDEN)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "with_scale", "match"),
+    [
+        (torch.float8_e4m3fn, False, "together"),
+        (torch.bfloat16, True, "together"),
+        (torch.float8_e5m2, True, "E4M3"),
+    ],
+)
+def test_a_mismatched_activation_and_scale_are_rejected(consumer, dtype, with_scale, match):
+    recorder, consumer_fn, AllGather, _, context_module = consumer
+    subject = types.SimpleNamespace(mlp=recorder.routed_experts())
+    context_module._EXTRA_CTX.moe_comm_method = recorder.build(AllGather, padded_rows=2)
+    ids, weights = _routing_rows()
+    kwargs: dict[str, object] = {"topk_ids": ids, "topk_weights": weights}
+    if with_scale:
+        kwargs["activation_scale"] = _counted_scale(2)
+
+    with pytest.raises(RuntimeError, match=match):
+        consumer_fn(subject, torch.zeros(2, _HIDDEN, dtype=dtype), **kwargs)

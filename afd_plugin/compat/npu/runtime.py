@@ -90,6 +90,9 @@ def apply_afd_ascend_patches_if_needed() -> None:
     if _PATCHES_APPLIED:
         return
 
+    from afd_plugin.compat.patches.npu.mc2_dispatch_prequant import (
+        apply_afd_mc2_dispatch_prequant_patch,
+    )
     from afd_plugin.compat.patches.npu.external_routing_mc2_prepare import (
         apply_afd_external_routing_mc2_prepare_patch,
     )
@@ -121,6 +124,9 @@ def apply_afd_ascend_patches_if_needed() -> None:
     # be caught here.
     apply_afd_external_routing_prepare_patch()
     apply_afd_external_routing_mc2_prepare_patch()
+    # The dispatcher reads the scale the prepare patch published; installing it here keeps
+    # the two halves of the pre-quantized MC2 path in one place.
+    apply_afd_mc2_dispatch_prequant_patch()
     _PATCHES_APPLIED = True
 
 

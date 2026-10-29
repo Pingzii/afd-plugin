@@ -157,17 +157,20 @@ def prepare(
                 )
             # ### PATCH END: shard the routing with the activation
 
-    # ### PATCH START: publish the prepared routing
+    # ### PATCH START: publish the prepared routing and its scale
     if external is not None:
         self.afd_external_routing = external
-    # ### PATCH END: publish the prepared routing
+    pertoken_scale = None if external is None else external.scale
+    # ### PATCH END: publish the prepared routing and its scale
 
     return MoEPrepareOutput(
         hidden_states=hidden_states,
         router_logits=router_logits,
         mc2_mask=mc2_mask,
         padded_hidden_states_shape=padded_hidden_states_shape,
-        pertoken_scale=None,
+        # ### PATCH START: carry the Attention-side scale instead of None
+        pertoken_scale=pertoken_scale,
+        # ### PATCH END: carry the Attention-side scale instead of None
     )
 
 

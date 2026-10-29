@@ -248,3 +248,31 @@ def test_routing_with_a_different_token_count_is_rejected(monkeypatch):
             hidden_states=torch.zeros(2, HIDDEN),
             router_logits=None,
         )
+
+def test_prepare_returns_the_padded_scale_for_the_experts(monkeypatch):
+    """The padded scale is what ``prepare_output.pertoken_scale`` has to carry."""
+
+    _, context = _install_fake_upstream(monkeypatch)
+    patch = _load_patch_module(monkeypatch)
+    context.padded_num_tokens = 3
+    inputs_type = _routing_inputs_type()
+    scale = torch.tensor([[100], [110]], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    subject = _subject(
+        external=inputs_type(
+            topk_ids=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+            topk_weights=torch.full((2, TOP_K), 0.5, dtype=torch.float32),
+            scale=scale,
+        )
+    )
+
+    output = patch.prepare(
+        subject,
+        hidden_states=torch.zeros(2, HIDDEN, dtype=torch.float8_e4m3fn),
+        router_logits=None,
+    )
+
+    assert output.hidden_states.dtype == torch.float8_e4m3fn
+    carried = output.pertoken_scale
+    assert carried is not None, "the padded scale is what the experts read"
+    assert carried.dtype == torch.float8_e8m0fnu
+    assert carried.view(torch.uint8).tolist() == [[100], [110], [127]]

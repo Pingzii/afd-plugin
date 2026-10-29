@@ -267,3 +267,90 @@ def test_routing_with_a_different_token_count_is_rejected(monkeypatch):
 
     # The check runs before any collective, so nothing was gathered.
     assert dp_group.calls == []
+
+class _RankDistinctDpGroup(_FakeDpGroup):
+    """Collective whose ranks carry different bytes, so rank order is observable.
+
+    The default stand-in repeats one shard, which cannot distinguish a correct gather from one
+    that dropped a rank or reordered them.
+    """
+
+    def all_gather(self, tensor, dim):
+        assert dim == 0
+        self.calls.append(tuple(tensor.shape))
+        shards = [tensor]
+        for rank in range(1, self.dp_size):
+            # Float8 tensors have no arithmetic, so the tag is written through the byte view.
+            shifted = tensor.clone()
+            if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu):
+                bytes_ = shifted.view(torch.uint8)
+                bytes_[:, 0] = bytes_[:, 0] + rank * 100
+                shifted = bytes_.view(tensor.dtype)
+            else:
+                shifted[:, 0] = shifted[:, 0] + rank * 100
+            shards.append(shifted)
+        return torch.cat(shards, dim=0)
+
+
+def _quantized_payload(inputs_type, rows, byte_rows):
+    ids = torch.arange(rows * TOP_K, dtype=torch.int32).reshape(rows, TOP_K)
+    weights = torch.full((rows, TOP_K), 0.5, dtype=torch.float32)
+    scale = torch.tensor(byte_rows, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    return inputs_type(topk_ids=ids, topk_weights=weights, scale=scale)
+
+
+def test_scale_padding_uses_neutral_bytes_for_an_fp8_activation(monkeypatch):
+    """Padding holds for the dtype the transport actually carries, FP8 included."""
+
+    _, context = _install_fake_upstream(monkeypatch)
+    patch = _load_patch_module(monkeypatch)
+    context.max_tokens_across_dp = 3
+    inputs_type = _routing_inputs_type()
+    # Padding only happens on the DP branch, so the gather runs too. This stand-in repeats
+    # one shard, which is enough here: the assertion is about the padded byte, not rank order.
+    subject = _prepared_self(
+        _FakeDpGroup(dp_size=2),
+        _quantized_payload(inputs_type, 2, [[100], [110]]),
+    )
+
+    hidden_states = torch.zeros(2, HIDDEN, dtype=torch.float8_e4m3fn)
+    output = patch.prepare_with_dp_group(
+        subject,
+        hidden_states=hidden_states,
+        router_logits=None,
+    )
+
+    assert output.hidden_states.dtype == torch.float8_e4m3fn
+    carried = output.pertoken_scale
+    assert carried is not None
+    assert carried.shape[0] == output.hidden_states.shape[0] == 6
+    # Per rank: two real rows, then the padded row carrying the neutral exponent.
+    assert carried.view(torch.uint8).tolist() == [[100], [110], [127]] * 2
+
+
+def test_scale_gathering_keeps_rank_order(monkeypatch):
+    """Rank 0's rows first, then rank 1's, for the scale as well as the activation."""
+
+    _, context = _install_fake_upstream(monkeypatch)
+    patch = _load_patch_module(monkeypatch)
+    context.max_tokens_across_dp = 1
+    inputs_type = _routing_inputs_type()
+    dp_group = _RankDistinctDpGroup(dp_size=2)
+    subject = _prepared_self(
+        dp_group,
+        _quantized_payload(inputs_type, 1, [[100]]),
+    )
+
+    output = patch.prepare_with_dp_group(
+        subject,
+        hidden_states=torch.zeros(1, HIDDEN, dtype=torch.float8_e4m3fn),
+        router_logits=None,
+    )
+
+    carried = output.pertoken_scale
+    assert carried is not None
+    assert carried.view(torch.uint8).tolist() == [[100], [200]]
+    assert output.hidden_states.shape[0] == 2
+    # Activation, ids, weights and the scale each took the gather; the (1, 1) shape is the
+    # scale's, so it did not skip the collective the activation went through.
+    assert (1, 1) in dp_group.calls

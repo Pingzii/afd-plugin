@@ -153,6 +153,7 @@ def isolate_worker_installers(monkeypatch):
             "external_routing_mc2_prepare",
             "apply_afd_external_routing_mc2_prepare_patch",
         ),
+        ("mc2_dispatch_prequant", "apply_afd_mc2_dispatch_prequant_patch"),
     ):
         module = ModuleType(f"afd_plugin.compat.patches.npu.{stem}")
         module.__dict__[attribute] = functools.partial(installed.append, stem)
@@ -421,7 +422,11 @@ def test_npu_patch_installer_runs_each_routing_prepare_once(
     ascend_runtime.apply_afd_ascend_patches_if_needed()
     ascend_runtime.apply_afd_ascend_patches_if_needed()
 
-    for stem in ("external_routing_prepare", "external_routing_mc2_prepare"):
+    for stem in (
+        "external_routing_prepare",
+        "external_routing_mc2_prepare",
+        "mc2_dispatch_prequant",
+    ):
         assert isolate_worker_installers.count(stem) == 1
 
 
