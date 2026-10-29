@@ -281,16 +281,10 @@ class AFDA2FTransferPayload:
             not at all.
         activation_scale: Optional MX block scale for a pre-quantized activation,
             shaped ``(tokens, ceil(hidden_size / 32))`` as ``float8_e8m0fnu``.
-            Present only when the transport carried an MXFP8 activation.
-
-            **Transitional state -- not a usable pair yet.** When this is set,
-            ``hidden_states`` has already been dequantized back to the model dtype,
-            so the two fields do not describe one tensor: the scale belongs to the
-            quantized activation that was received, not to what is in
-            ``hidden_states``. Do not hand this scale to a MoE that skips input
-            quantization when a scale is present: it would treat the dequantized
-            tensor as pre-quantized. Making them a real pair means also keeping the
-            FP8 activation, which the receive does not do today.
+            Present only when the transport carried an MXFP8 activation, and then
+            ``hidden_states`` is that same activation in E4M3: the two fields describe one
+            tensor and travel together, so a consumer receives a usable pair and does not
+            dequantize on the way in.
     """
 
     hidden_states: torch.Tensor
