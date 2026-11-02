@@ -54,10 +54,12 @@ def balance_op(monkeypatch):
         ):
             monkeypatch.setitem(sys.modules, name, module)
 
+        import afd_plugin.compat.npu as afd_npu_package
+
         module_name = "afd_plugin.compat.npu.routing_ids"
-        package = sys.modules.get("afd_plugin.compat.npu")
+        package = afd_npu_package
         saved_module = sys.modules.get(module_name)
-        had_package_attr = package is not None and hasattr(package, "routing_ids")
+        had_package_attr = hasattr(package, "routing_ids")
         saved_package_attr = getattr(package, "routing_ids", None)
 
         def restore():
@@ -65,7 +67,7 @@ def balance_op(monkeypatch):
                 sys.modules.pop(module_name, None)
             else:
                 sys.modules[module_name] = saved_module
-            if package is not None:
+            if True:
                 if had_package_attr:
                     setattr(package, "routing_ids", saved_package_attr)
                 else:
@@ -73,8 +75,7 @@ def balance_op(monkeypatch):
 
         stack.callback(restore)
         sys.modules.pop(module_name, None)
-        if package is not None:
-            package.__dict__.pop("routing_ids", None)
+        package.__dict__.pop("routing_ids", None)
 
         from afd_plugin.compat.npu import routing_ids
 
