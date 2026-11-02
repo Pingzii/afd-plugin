@@ -90,6 +90,12 @@ def apply_afd_ascend_patches_if_needed() -> None:
     if _PATCHES_APPLIED:
         return
 
+    # Registration-only import: defines torch.ops.vllm.afd_balance_routing_ids_
+    # so every spawned worker has the op before the first Attention-side gate
+    # runs. Kept out of the package __init__ to avoid pulling Ascend imports
+    # into ordinary module imports.
+    from afd_plugin.compat.npu import routing_ids  # noqa: F401
+
     from afd_plugin.compat.patches.npu.mc2_dispatch_prequant import (
         apply_afd_mc2_dispatch_prequant_patch,
     )
