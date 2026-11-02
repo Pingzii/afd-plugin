@@ -21,9 +21,7 @@ def afd_balance_routing_ids_(
     force_balance: bool,
 ) -> None:
     """Balance ``topk_ids`` in place, keeping the profile read inside the op."""
-    from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
-        _force_balanced_topk_ids,
-    )
+    from afd_plugin.routing_balance import _force_balanced_topk_ids
 
     if force_balance or _afd_in_profile_run():
         _force_balanced_topk_ids(topk_ids, num_logical_experts=num_experts)

@@ -423,21 +423,7 @@ def _gmmswigluquant_fusion_enabled() -> bool:
     return bool(getattr(fusion_config, "fusion_ops_gmmswigluquant", False))
 
 
-def _force_balanced_topk_ids(
-    topk_ids: torch.Tensor,
-    *,
-    num_logical_experts: int,
-) -> torch.Tensor:
-    balanced_topk_ids = torch.arange(
-        topk_ids.numel(),
-        device=topk_ids.device,
-        dtype=torch.int64,
-    ).reshape(topk_ids.shape)
-    balanced_topk_ids = balanced_topk_ids.remainder(num_logical_experts).to(
-        dtype=topk_ids.dtype,
-    )
-    topk_ids.copy_(balanced_topk_ids)
-    return topk_ids
+from afd_plugin.routing_balance import _force_balanced_topk_ids
 
 
 __all__ = [
