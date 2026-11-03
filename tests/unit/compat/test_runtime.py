@@ -155,7 +155,6 @@ def isolate_worker_installers(monkeypatch):
     # coverage next to it.
     installed: list[str] = []
     for stem, attribute in (
-        ("profile_run_eager", "apply_profile_run_eager_patch"),
         ("external_routing_prepare", "apply_afd_external_routing_prepare_patch"),
         (
             "external_routing_mc2_prepare",
@@ -389,25 +388,6 @@ def test_npu_patches_route_mla_graph_params_from_forward_context(monkeypatch):
     ascend_runtime.apply_afd_ascend_patches_if_needed()
     assert fake_mla.get_graph_params is patched_get_graph_params
 
-
-def test_npu_patch_installer_installs_profile_run_eager(monkeypatch):
-    from afd_plugin.compat.patches.npu import mla_graph
-
-    installed = []
-    monkeypatch.setattr(
-        sys.modules["afd_plugin.compat.patches.npu.profile_run_eager"],
-        "apply_profile_run_eager_patch",
-        lambda: installed.append(True) or True,
-    )
-    monkeypatch.setattr(
-        ascend_runtime, "apply_afd_ascend_config_patch_if_needed", lambda: None
-    )
-    monkeypatch.setattr(mla_graph, "apply_afd_mla_graph_patch", lambda: True)
-    monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
-
-    ascend_runtime.apply_afd_ascend_patches_if_needed()
-
-    assert installed == [True]
 
 
 def _install_with_stubbed_neighbours(monkeypatch):

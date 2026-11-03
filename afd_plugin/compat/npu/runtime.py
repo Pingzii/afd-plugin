@@ -108,16 +108,12 @@ def apply_afd_ascend_patches_if_needed() -> None:
     from afd_plugin.compat.patches.npu.mla_graph import (
         apply_afd_mla_graph_patch,
     )
-    from afd_plugin.compat.patches.npu.profile_run_eager import (
-        apply_profile_run_eager_patch,
-    )
 
     apply_afd_ascend_config_patch_if_needed()
     if not apply_afd_mla_graph_patch():
         raise RuntimeError(
             "AFD NPU MLA graph patch requires the vLLM-Ascend MLA resolver",
         )
-    apply_profile_run_eager_patch()
     # The routing patches replace the MoE prepare path, so they belong here rather
     # than in the config stage: importing them pulls vLLM-Ascend's MoE internals,
     # which a process that only builds and validates a config does not need. This
