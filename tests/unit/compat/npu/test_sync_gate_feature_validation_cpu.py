@@ -187,13 +187,13 @@ def _real_extra_info():
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = previous
-        # A module imported under the stubs keeps the stub callables alive; drop
-        # the ones this import created so a later test importing for real does
-        # not inherit them (the leak #568 describes).
+        # A module imported under the stubs keeps the stub callables alive -- the
+        # connector is one, but so is everything else the connector pulled in
+        # (``afd_plugin.connectors.metadata`` holds ``DPMetadata``). Drop every
+        # ``afd_plugin`` module this import created so a later test importing for
+        # real does not inherit them (the leak #568 describes).
         for name in set(sys.modules) - before:
-            if name.startswith(
-                ("afd_plugin.connectors.npu.camp2p", "afd_plugin.compat.npu")
-            ):
+            if name == "afd_plugin" or name.startswith("afd_plugin."):
                 sys.modules.pop(name, None)
 
     return CAMP2PExtraInfo
