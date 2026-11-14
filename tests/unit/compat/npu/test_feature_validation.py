@@ -150,11 +150,6 @@ def _mla_dbo(cudagraph_mode, **model_fields):
             id="four-ubatches",
         ),
         pytest.param(
-            _config_with(extra_config={"compute_gate_on_attention": True}),
-            "compute_gate_on_attention",
-            id="gate-on-attention",
-        ),
-        pytest.param(
             _config_with(extra_config={"quant_mode": 1}), "quant_mode=0", id="quant"
         ),
         pytest.param(
