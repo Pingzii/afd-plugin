@@ -22,6 +22,9 @@ import pytest
 
 from afd_plugin.compat.npu import feature_validation
 from afd_plugin.config import CAMP2P_CONNECTOR
+from tests.unit.fakes.stub_modules import (
+    drop_stub_bound_modules as _drop_stub_bound_modules,
+)
 
 _DSV4 = "deepseek_v4"
 
@@ -176,6 +179,9 @@ def _real_extra_info():
         vllm.utils = stubs["vllm.utils"]
         vllm.distributed = stubs["vllm.distributed"]
 
+    stub_objects = {
+        id(value) for stub in stubs.values() for value in vars(stub).values()
+    }
     saved = {name: sys.modules.get(name) for name in stubs}
     before = set(sys.modules)
     sys.modules.update(stubs)
@@ -189,12 +195,10 @@ def _real_extra_info():
                 sys.modules[name] = previous
         # A module imported under the stubs keeps the stub callables alive -- the
         # connector is one, but so is everything else the connector pulled in
-        # (``afd_plugin.connectors.metadata`` holds ``DPMetadata``). Drop every
-        # ``afd_plugin`` module this import created so a later test importing for
-        # real does not inherit them (the leak #568 describes).
-        for name in set(sys.modules) - before:
-            if name == "afd_plugin" or name.startswith("afd_plugin."):
-                sys.modules.pop(name, None)
+        # (``afd_plugin.connectors.metadata`` holds ``DPMetadata``), and the
+        # parent package keeps the child as an attribute. Drop both (the leak
+        # #568 describes).
+        _drop_stub_bound_modules(before, stub_objects)
 
     return CAMP2PExtraInfo
 
