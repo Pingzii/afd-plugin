@@ -123,17 +123,69 @@ def test_gate_on_ffn_keeps_its_previous_behaviour(extra_info):
 
 
 def _real_extra_info():
-    """The connector's own type; importing it needs vLLM.
+    """Return the real ``CAMP2PExtraInfo`` with only its imports stubbed.
 
-    ``camp2p`` pulls ``vllm.forward_context`` at module scope, so the real
-    class is only reachable where vLLM is installed. The validator cases
-    above use a stand-in and run everywhere; these two cover the class
-    itself and skip on a bare CPU host.
+    ``camp2p`` pulls ``vllm`` at module scope, so a bare CPU host cannot import
+    it. Stubbing the couple of runtime modules it touches keeps the class under
+    test -- the parsing and the validation -- instead of skipping the cases that
+    pin the connector-level contract.
     """
 
-    pytest.importorskip("torch")
-    pytest.importorskip("vllm")
-    from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
+    import sys
+    import types
+
+    stubs = {}
+
+    def module(name, package=False, **attrs):
+        stub = types.ModuleType(name)
+        if package:
+            stub.__path__ = []
+        for key, value in attrs.items():
+            setattr(stub, key, value)
+        stubs[name] = stub
+        return stub
+
+    def missing(name):
+        try:
+            __import__(name)
+        except ImportError:
+            return True
+        return False
+
+    if missing("vllm.forward_context"):
+        vllm = module("vllm", package=True)
+        module(
+            "vllm.forward_context",
+            DPMetadata=type("DPMetadata", (), {}),
+            get_forward_context=lambda: None,
+        )
+        module(
+            "vllm.logger",
+            init_logger=lambda *args: __import__("logging").getLogger("vllm"),
+        )
+        module("vllm.utils", package=True)
+        module(
+            "vllm.utils.torch_utils",
+            direct_register_custom_op=lambda **kwargs: None,
+            is_torch_equal_or_newer=lambda *args: True,
+        )
+        module("vllm.distributed", package=True)
+        module("vllm.distributed.parallel_state")
+        vllm.forward_context = stubs["vllm.forward_context"]
+        vllm.logger = stubs["vllm.logger"]
+        vllm.utils = stubs["vllm.utils"]
+        vllm.distributed = stubs["vllm.distributed"]
+
+    saved = {name: sys.modules.get(name) for name in stubs}
+    sys.modules.update(stubs)
+    try:
+        from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
 
     return CAMP2PExtraInfo
 
